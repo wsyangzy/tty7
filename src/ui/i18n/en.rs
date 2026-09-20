@@ -607,7 +607,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsAgentNotifications => "Agent notifications",
         L10nKey::SettingsAgentNotificationsDesc => {
-            "Desktop alerts when an agent finishes a task, requests permission, or needs input."
+            "Desktop alerts when an agent finishes a task, requests permission, or needs input. Unfocused includes other tabs or panes in this window."
         }
         L10nKey::SettingsNotifyThreshold => "Notify threshold",
         L10nKey::SettingsNotifyThresholdDesc => {
@@ -616,6 +616,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsWindow => "Window",
         L10nKey::NotifyModeNever => "Never",
         L10nKey::NotifyModeUnfocused => "When unfocused",
+        L10nKey::AgentNotifyModeUnfocused => "When pane unfocused",
         L10nKey::NotifyModeAlways => "Always",
         L10nKey::SettingsStartupNormal => "Normal",
         L10nKey::SettingsStartupMaximized => "Maximized",
@@ -1819,6 +1820,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::TrayAgentNeedsInput => "needs input",
         L10nKey::AgentStatusWorking => "Working",
         L10nKey::AgentStatusWaiting => "Needs input",
+        L10nKey::AgentStatusAttention => "New alert",
         L10nKey::AgentStatusDone => "Done",
         L10nKey::NotifyCommandFinished => "Command finished after {secs}s",
         L10nKey::NotifyCommandFinishedWithCommand => "{command} — finished after {secs}s",

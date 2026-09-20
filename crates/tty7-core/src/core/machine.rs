@@ -294,16 +294,10 @@ pub struct PaneRecord {
     pub cwd: Option<String>,
     #[serde(default)]
     pub title: String,
-    /// The title the terminal itself reports (OSC 0/2): a shell writes
-    /// `user@host:~/dir` from its integration, an agent overwrites it with what
-    /// it is working on. Distinct from `title` above, which is the foreground
-    /// process name.
-    ///
-    /// This is the name the window that owns the pane puts on its tab, so it is
-    /// also what anyone else has to read to agree with that window — the
-    /// switcher listing a workspace it does not own, `tty7 tab ls` across a
-    /// socket. `None` until the pane emits one; a pane that resets its title
-    /// clears it back.
+    /// The raw terminal title (OSC 0/2), distinct from the foreground process
+    /// name above. Any child process can change it; it is not an agent session
+    /// summary. The shared tab label uses it only for non-agent tabs. `None`
+    /// until the pane emits one; a title reset clears it back.
     #[serde(default)]
     pub osc_title: Option<String>,
     #[serde(default)]

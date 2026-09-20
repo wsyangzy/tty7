@@ -412,6 +412,14 @@ fn legacy_keystroke_to_bytes(ks: &gpui::Keystroke, flags: KeyFlags) -> Option<Ve
         "enter" => Some(b"\r"),
         "tab" => Some(b"\t"),
         "backspace" => Some(b"\x7f"),
+        // ConPTY can receive adjacent writes in one read. A bare Escape
+        // followed by text becomes Alt+text for native console readers, so an
+        // agent never sees its cancel key. Spell out the key event, as Ctrl+J
+        // already does above; VT readers still receive the same Escape byte.
+        // Negotiated kitty input has already taken its own path before this.
+        "escape" if flags.local_conpty && *m == gpui::Modifiers::default() => {
+            Some(b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_")
+        }
         "escape" => Some(b"\x1b"),
         _ => None,
     };
@@ -634,6 +642,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn escape_preserves_a_native_conpty_key_without_changing_kitty_or_remote_input() {
+        let escape = Keystroke::parse("escape").unwrap();
+        for local_conpty in [false, true] {
+            for mode in [
+                TermMode::empty(),
+                TermMode::DISAMBIGUATE_ESC_CODES,
+                TermMode::REPORT_ALL_KEYS_AS_ESC,
+            ] {
+                let flags = KeyFlags::from_mode_with_local_conpty(&mode, local_conpty);
+                let expected = if flags.kitty_active() {
+                    b"\x1b[27u".as_slice()
+                } else if local_conpty {
+                    b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_".as_slice()
+                } else {
+                    b"\x1b".as_slice()
+                };
+                assert_eq!(
+                    keystroke_to_bytes(&escape, flags).as_deref(),
+                    Some(expected)
+                );
+            }
+        }
+
+        let flags = KeyFlags::from_mode_with_local_conpty(&TermMode::empty(), true);
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("alt-escape").unwrap(), flags).as_deref(),
+            Some(b"\x1b\x1b".as_slice())
+        );
     }
 
     #[test]

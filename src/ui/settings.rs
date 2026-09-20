@@ -6608,7 +6608,7 @@ impl Tty7App {
             "wt-agent-notify",
             &[
                 t(L10nKey::NotifyModeNever),
-                t(L10nKey::NotifyModeUnfocused),
+                t(L10nKey::AgentNotifyModeUnfocused),
                 t(L10nKey::NotifyModeAlways),
             ],
             agent_notify_idx,

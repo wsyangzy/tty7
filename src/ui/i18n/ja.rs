@@ -616,13 +616,14 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsAgentNotifications => "Agent 通知",
         L10nKey::SettingsAgentNotificationsDesc => {
-            "Agent のタスク完了、権限確認、入力待ちをデスクトップ通知で知らせます。"
+            "Agent のタスク完了、権限確認、入力待ちをデスクトップ通知で知らせます。同じウィンドウの別タブやペインに移った場合も非フォーカスに含みます。"
         }
         L10nKey::SettingsNotifyThreshold => "通知閾値（秒）",
         L10nKey::SettingsNotifyThresholdDesc => "「長時間」とみなすのに必要なコマンドの実行時間",
         L10nKey::SettingsWindow => "ウィンドウ",
         L10nKey::NotifyModeNever => "通知しない",
         L10nKey::NotifyModeUnfocused => "非フォーカス時のみ",
+        L10nKey::AgentNotifyModeUnfocused => "ペインが非フォーカス時",
         L10nKey::NotifyModeAlways => "常に通知",
         L10nKey::SettingsStartupNormal => "通常サイズ",
         L10nKey::SettingsStartupMaximized => "最大化",
@@ -1896,6 +1897,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::TrayAgentNeedsInput => "入力が必要",
         L10nKey::AgentStatusWorking => "実行中",
         L10nKey::AgentStatusWaiting => "入力が必要",
+        L10nKey::AgentStatusAttention => "新しい通知",
         L10nKey::AgentStatusDone => "完了",
         L10nKey::NotifyCommandFinished => "コマンドが {secs} 秒で完了しました",
         L10nKey::NotifyCommandFinishedWithCommand => "{command} — {secs} 秒で完了しました",
