@@ -21,8 +21,8 @@ use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::reorder::{self, Reorder, Surface};
 use crate::ui::right_panel::RESIZE_HANDLE_WIDTH;
 use crate::ui::tab_strip::{
-    DragTab, REORDER_SLIDE_MS, abbreviate_home, elide_keep_edges, elide_label,
-    elide_path_keep_tail, measure_text, project_name, strip_host_prefix,
+    DragTab, REORDER_SLIDE_MS, abbreviate_home, cwd_label, elide_keep_edges, elide_label,
+    elide_path_keep_tail, measure_text, strip_host_prefix,
 };
 
 pub(crate) const MIN_SIDEBAR_WIDTH: f32 = 180.;
@@ -514,7 +514,9 @@ impl Tty7App {
                                 abbreviate_home(strip_host_prefix(title.trim()), home.as_deref())
                                     .into_owned()
                             }
-                            TabLabel::Cwd(cwd) => project_name(cwd),
+                            TabLabel::Cwd(cwd) => {
+                                cwd_label(cwd, home.as_deref(), cx.global::<Config>().tab_full_path)
+                            }
                             TabLabel::Agent(agent) => agent.display_name().to_string(),
                             // A tab holding a name got one above.
                             TabLabel::Named(name) => name.to_string(),
@@ -531,9 +533,9 @@ impl Tty7App {
                             (placeholder, None)
                         } else {
                             let full = match view.label() {
-                                TabLabel::Cwd(cwd) => SharedString::from(
-                                    abbreviate_home(cwd, home.as_deref()).into_owned(),
-                                ),
+                                TabLabel::Cwd(cwd) => {
+                                    SharedString::from(cwd_label(cwd, home.as_deref(), true))
+                                }
                                 _ => SharedString::from(raw.clone()),
                             };
                             (SharedString::from(raw), Some(full))

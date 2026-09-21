@@ -94,16 +94,27 @@ pub(crate) fn short_title(raw: &str, home: Option<&std::path::Path>) -> String {
     }
     let abbreviated = abbreviate_home(after_host, home);
     let path: &str = abbreviated.as_ref();
+    // Keep a drive root distinct from the drive-relative spelling `C:`.
+    if path.len() == 3
+        && path.as_bytes()[0].is_ascii_alphabetic()
+        && path.as_bytes()[1] == b':'
+        && matches!(path.as_bytes()[2], b'/' | b'\\')
+    {
+        return path.to_string();
+    }
 
     enum Kind {
         Home,
         Absolute,
+        Unc,
         Relative,
     }
     let (kind, body) = if let Some(rest) = path.strip_prefix("~/") {
         (Kind::Home, rest)
     } else if path == "~" {
         return "~".to_string();
+    } else if let Some(rest) = path.strip_prefix(r"\\") {
+        (Kind::Unc, rest)
     } else if let Some(rest) = path.strip_prefix('/') {
         (Kind::Absolute, rest)
     } else {
@@ -117,6 +128,7 @@ pub(crate) fn short_title(raw: &str, home: Option<&std::path::Path>) -> String {
         return match kind {
             Kind::Home => "~",
             Kind::Absolute => "/",
+            Kind::Unc => r"\\",
             Kind::Relative => "",
         }
         .to_string();
@@ -131,6 +143,7 @@ pub(crate) fn short_title(raw: &str, home: Option<&std::path::Path>) -> String {
         match kind {
             Kind::Home => format!("~{sep}{}", join_segments(&segments, sep)),
             Kind::Absolute => format!("/{}", join_segments(&segments, sep)),
+            Kind::Unc => format!("{sep}{sep}{}", join_segments(&segments, sep)),
             Kind::Relative => join_segments(&segments, sep),
         }
     };
@@ -143,11 +156,15 @@ pub(crate) fn short_title(raw: &str, home: Option<&std::path::Path>) -> String {
     label
 }
 
-/// The project name used when a tab is identified only by its working directory.
-pub(crate) fn project_name(raw: &str) -> String {
+/// Directory labels share one setting across the strip, sidebar and switcher.
+/// Keep roots intact: dropping the final separator from `C:\` turns it into a
+/// drive-relative path, while an all-separator root has no leaf to display.
+pub(crate) fn cwd_label(raw: &str, home: Option<&std::path::Path>, full_path: bool) -> String {
     let path = raw.trim();
+    if full_path {
+        return abbreviate_home(path, home).into_owned();
+    }
     let trimmed = path.trim_end_matches(['/', '\\']);
-    // A filesystem root has no project component; keep its spelling.
     let path = if trimmed.is_empty() || trimmed.ends_with(':') {
         path
     } else {
@@ -175,6 +192,7 @@ pub(crate) fn label_of(
     view: &crate::ui::machine_mirror::TabView,
     index: usize,
     home: Option<&std::path::Path>,
+    full_path: bool,
 ) -> String {
     use crate::ui::machine_mirror::TabLabel;
 
@@ -207,7 +225,8 @@ pub(crate) fn label_of(
         // disagreement in a new place.
         TabLabel::Osc(title) => shortened(title),
         TabLabel::Agent(agent) => agent.display_name().to_string(),
-        TabLabel::Cwd(cwd) => project_name(cwd),
+        TabLabel::Cwd(cwd) if full_path => shortened(cwd),
+        TabLabel::Cwd(cwd) => cwd_label(cwd, home, false),
         TabLabel::Process(title) => title.to_string(),
         TabLabel::Unknown => unnamed(),
     }
@@ -227,6 +246,7 @@ fn tooltip_of(
     view: &crate::ui::machine_mirror::TabView,
     index: usize,
     home: Option<&std::path::Path>,
+    full_path: bool,
 ) -> Option<SharedString> {
     use crate::ui::machine_mirror::TabLabel;
 
@@ -238,7 +258,7 @@ fn tooltip_of(
         _ => return None,
     };
     let full = abbreviate_home(raw.trim(), home);
-    if full.trim().is_empty() || full.as_ref() == label_of(view, index, home).as_str() {
+    if full.trim().is_empty() || full.as_ref() == label_of(view, index, home, full_path).as_str() {
         return None;
     }
     Some(SharedString::from(full.into_owned()))
@@ -1461,7 +1481,12 @@ impl Tty7App {
         cx: &App,
     ) -> Option<SharedString> {
         let (view, home) = tab.label_view(window, cx);
-        tooltip_of(&view, index, home.as_deref())
+        tooltip_of(
+            &view,
+            index,
+            home.as_deref(),
+            cx.global::<Config>().tab_full_path,
+        )
     }
 
     /// What this window puts on a tab of its own — the same ladder, through the
@@ -1475,7 +1500,12 @@ impl Tty7App {
         cx: &App,
     ) -> String {
         let (view, home) = tab.label_view(window, cx);
-        label_of(&view, index, home.as_deref())
+        label_of(
+            &view,
+            index,
+            home.as_deref(),
+            cx.global::<Config>().tab_full_path,
+        )
     }
 
     /// The New Tab control: one `+` that drops the list of everything it could
@@ -3018,7 +3048,7 @@ mod tests {
         tab.osc_title = Some("vim — main.rs".into());
         tab.cwd = Some("/Users/x/repo/tty7".into());
 
-        assert_eq!(label_of(&tab, 0, Some(home())), "build");
+        assert_eq!(label_of(&tab, 0, Some(home()), true), "build");
     }
 
     #[test]
@@ -3027,13 +3057,13 @@ mod tests {
         tab.osc_title = Some("vim — main.rs".into());
         tab.cwd = Some("/Users/x/repo/tty7".into());
 
-        assert_eq!(label_of(&tab, 0, Some(home())), "vim — main.rs");
+        assert_eq!(label_of(&tab, 0, Some(home()), true), "vim — main.rs");
 
         // Including the title an SSH pane answers to before the far shell has
         // said anything (#438): `label_view` hands that up here, so a window
         // full of them still reads as hosts rather than as directories.
         tab.osc_title = Some("prod-web".into());
-        assert_eq!(label_of(&tab, 0, Some(home())), "prod-web");
+        assert_eq!(label_of(&tab, 0, Some(home()), true), "prod-web");
     }
 
     /// #740: every shell tty7 ships integration for except PowerShell reports
@@ -3045,13 +3075,16 @@ mod tests {
         let mut tab = strip_tab();
         tab.cwd = Some("/Users/x/repo/tty7".into());
 
-        assert_eq!(label_of(&tab, 0, Some(home())), "tty7");
+        assert_eq!(label_of(&tab, 0, Some(home()), true), "~/repo/tty7");
         tab.cwd = Some("/Users/x/repo/tty7/crates/tty7-core/src".into());
-        assert_eq!(label_of(&tab, 0, Some(home())), "src");
+        assert_eq!(
+            label_of(&tab, 0, Some(home()), true),
+            "…/crates/tty7-core/src"
+        );
     }
 
     #[test]
-    fn agent_tabs_show_project_folder_names_unless_renamed() {
+    fn agent_tabs_show_project_paths_unless_renamed() {
         for agent in crate::core::cli_agent::CLIAgent::ALL {
             for cwd in [
                 r"D:\workspace\code\backend\tty7",
@@ -3064,35 +3097,49 @@ mod tests {
                 tab.cwd = Some(cwd.into());
                 for title in ["npm", "MEMORIES", "any terminal title"] {
                     tab.osc_title = Some(title.into());
-                    assert_eq!(label_of(&tab, 0, None), "tty7");
-                    assert_eq!(tooltip_of(&tab, 0, None).as_deref(), Some(cwd));
+                    assert_eq!(label_of(&tab, 0, None, true), super::short_title(cwd, None));
+                    if let Some(tooltip) = tooltip_of(&tab, 0, None, true) {
+                        assert_eq!(tooltip.as_ref(), cwd);
+                    }
                 }
                 tab.name = Some("my project".into());
-                assert_eq!(label_of(&tab, 0, None), "my project");
-                assert_eq!(tooltip_of(&tab, 0, None), None);
+                assert_eq!(label_of(&tab, 0, None, true), "my project");
+                assert_eq!(tooltip_of(&tab, 0, None, true), None);
                 tab.name = None;
-                assert_eq!(label_of(&tab, 0, None), "tty7");
+                assert_eq!(label_of(&tab, 0, None, true), super::short_title(cwd, None));
             }
         }
     }
 
-    /// The label names the project; hovering still exposes its directory.
+    #[test]
+    fn matching_directory_basenames_keep_their_project_context() {
+        for agent in [None, Some(crate::core::cli_agent::CLIAgent::Codex)] {
+            for (cwd, expected) in [("/Users/x/a/src", "~/a/src"), ("/Users/x/b/src", "~/b/src")] {
+                let mut tab = strip_tab();
+                tab.agent = agent;
+                tab.cwd = Some(cwd.into());
+                assert_eq!(label_of(&tab, 0, Some(home()), true), expected);
+                assert_eq!(tooltip_of(&tab, 0, Some(home()), true), None);
+            }
+        }
+    }
+
+    /// Hover adds the complete path only when its label needed shortening.
     #[test]
     fn a_tab_named_after_a_directory_says_nothing_more_on_hover_unless_it_was_cut() {
         let mut tab = strip_tab();
         tab.cwd = Some("/Users/x/repo".into());
 
-        assert_eq!(label_of(&tab, 0, Some(home())), "repo");
-        assert_eq!(
-            tooltip_of(&tab, 0, Some(home())).as_deref(),
-            Some("~/repo"),
-            "the tooltip identifies which project directory this is"
-        );
+        assert_eq!(label_of(&tab, 0, Some(home()), true), "~/repo");
+        assert_eq!(tooltip_of(&tab, 0, Some(home()), true), None);
 
         tab.cwd = Some("/Users/x/repo/crates/tty7-core/src".into());
-        assert_eq!(label_of(&tab, 0, Some(home())), "src");
         assert_eq!(
-            tooltip_of(&tab, 0, Some(home())).as_deref(),
+            label_of(&tab, 0, Some(home()), true),
+            "…/crates/tty7-core/src"
+        );
+        assert_eq!(
+            tooltip_of(&tab, 0, Some(home()), true).as_deref(),
             Some("~/repo/crates/tty7-core/src")
         );
 
@@ -3100,13 +3147,13 @@ mod tests {
         // guard was already getting wrong before a directory could reach it.
         let mut titled = strip_tab();
         titled.osc_title = Some("/Users/x/repo".into());
-        assert_eq!(tooltip_of(&titled, 0, Some(home())), None);
+        assert_eq!(tooltip_of(&titled, 0, Some(home()), true), None);
 
         // A shell integration's `user@host:` head is not in the label, so it
         // is still worth spelling out.
         titled.osc_title = Some("me@box:/Users/x/repo".into());
         assert_eq!(
-            tooltip_of(&titled, 0, Some(home())).as_deref(),
+            tooltip_of(&titled, 0, Some(home()), true).as_deref(),
             Some("me@box:/Users/x/repo")
         );
     }
@@ -3170,7 +3217,7 @@ mod tests {
             };
             assert_eq!(
                 strip,
-                label_of(&from_tree, index, home.as_deref()),
+                label_of(&from_tree, index, home.as_deref(), false),
                 "the two columns name the same tab the same way"
             );
 
@@ -3178,7 +3225,7 @@ mod tests {
                 app.tab_title_tooltip(tab, index, Some(window), cx)
                     .as_deref(),
                 Some("/work/repo"),
-                "hovering shows the full effective directory"
+                "hovering identifies the directory behind the folder name"
             );
         });
     }
@@ -3187,12 +3234,12 @@ mod tests {
     fn a_pane_with_nothing_to_say_falls_back_the_way_it_always_did() {
         // No title and no directory: the placeholder, exactly as before.
         let tab = strip_tab();
-        assert_eq!(label_of(&tab, 0, Some(home())), "tty7");
+        assert_eq!(label_of(&tab, 0, Some(home()), true), "tty7");
 
         // And a tab holding no live pane at all is still numbered.
         let mut empty = strip_tab();
         empty.title = String::new();
-        assert!(label_of(&empty, 2, Some(home())).contains('3'));
+        assert!(label_of(&empty, 2, Some(home()), true).contains('3'));
     }
 
     /// The rung under the shortener, which the two surfaces reach holding
@@ -3206,11 +3253,11 @@ mod tests {
         let mut strip = strip_tab();
         strip.osc_title = Some("user@host:".into());
         assert_ne!(
-            label_of(&strip, 0, Some(home())),
+            label_of(&strip, 0, Some(home()), true),
             crate::terminal::view::DEFAULT_TITLE
         );
         assert!(
-            label_of(&strip, 0, Some(home())).contains('1'),
+            label_of(&strip, 0, Some(home()), true).contains('1'),
             "the numbered placeholder, which is what the strip showed here \
              before it shared this renderer"
         );
@@ -3222,7 +3269,7 @@ mod tests {
             osc_title: Some("user@host:".into()),
             ..strip_tab()
         };
-        assert_eq!(label_of(&from_tree, 0, Some(home())), "zsh");
+        assert_eq!(label_of(&from_tree, 0, Some(home()), true), "zsh");
     }
 
     /// A path is spelled the way the machine it is on spells it, and which
@@ -3233,34 +3280,81 @@ mod tests {
     fn a_cwd_is_cut_in_its_own_spelling_whichever_client_is_reading_it() {
         let windows_home = Path::new(r"C:\Users\x");
 
-        // Windows and remote POSIX panes both use the directory's last segment.
+        // Preserve each host's path spelling and enough parent context.
         let mut win = strip_tab();
         win.cwd = Some(r"C:\Users\x\repo".into());
-        assert_eq!(label_of(&win, 0, Some(windows_home)), "repo");
+        assert_eq!(label_of(&win, 0, Some(windows_home), true), "~/repo");
         win.cwd = Some(r"D:\work\a\b\proj".into());
-        assert_eq!(label_of(&win, 0, Some(windows_home)), "proj");
+        assert_eq!(label_of(&win, 0, Some(windows_home), true), r"…\a\b\proj");
 
         // A remote pane's cwd is POSIX even when the client reading it is the
         // Windows one: no drive to hang it off, no `~` borrowed from this
         // machine's home, and no backslash anywhere in the answer.
         let mut remote = strip_tab();
         remote.cwd = Some("/srv/app".into());
-        assert_eq!(label_of(&remote, 0, Some(windows_home)), "app");
+        assert_eq!(label_of(&remote, 0, Some(windows_home), true), "/srv/app");
         remote.cwd = Some("/home/deploy/app".into());
         assert_eq!(
-            label_of(&remote, 0, Some(Path::new("/home/deploy"))),
-            "app",
-            "the project name does not depend on the client's home"
+            label_of(&remote, 0, Some(Path::new("/home/deploy")), true),
+            "~/app",
+            "the abbreviation uses the remote host's home"
         );
 
         // The root of a filesystem is a directory like any other: a tab
         // sitting in it says so, and says nothing more on hover.
         let mut root = strip_tab();
         root.cwd = Some("/".into());
-        assert_eq!(label_of(&root, 0, Some(home())), "/");
-        assert_eq!(tooltip_of(&root, 0, Some(home())), None);
+        assert_eq!(label_of(&root, 0, Some(home()), true), "/");
+        assert_eq!(tooltip_of(&root, 0, Some(home()), true), None);
         root.cwd = Some(r"C:\".into());
-        assert_eq!(label_of(&root, 0, None), r"C:\");
-        assert_eq!(tooltip_of(&root, 0, None), None);
+        assert_eq!(label_of(&root, 0, None, true), r"C:\");
+        assert_eq!(tooltip_of(&root, 0, None, true), None);
+        root.cwd = Some(r"\\server\share".into());
+        assert_eq!(label_of(&root, 0, None, true), r"\\server\share");
+        assert_eq!(tooltip_of(&root, 0, None, true), None);
+    }
+
+    #[test]
+    fn directory_labels_toggle_paths_without_changing_titles_or_roots() {
+        for agent in [None, Some(crate::core::cli_agent::CLIAgent::Codex)] {
+            let mut tab = strip_tab();
+            tab.agent = agent;
+            for (path, folder, full) in [
+                ("/Users/x/repo/", "repo", "~/repo/"),
+                ("/work/other/repo", "repo", "/work/other/repo"),
+                (r"C:\work\repo\", "repo", r"C:\work\repo\"),
+                (r"\\server\share\repo\", "repo", r"\\server\share\repo\"),
+                ("/", "/", "/"),
+                (r"C:\", r"C:\", r"C:\"),
+                (r"\\", r"\\", r"\\"),
+                (r"\\server\share", "share", r"\\server\share"),
+            ] {
+                tab.cwd = Some(path.into());
+                assert_eq!(cwd_label(path, Some(home()), false), folder);
+                assert_eq!(cwd_label(path, Some(home()), true), full);
+                assert_eq!(label_of(&tab, 0, Some(home()), false), folder);
+                let strip_full = full.trim_end_matches(['/', '\\']);
+                let strip_full = if strip_full.is_empty() || strip_full.ends_with(':') {
+                    full
+                } else {
+                    strip_full
+                };
+                assert_eq!(label_of(&tab, 0, Some(home()), true), strip_full);
+                assert_eq!(
+                    tooltip_of(&tab, 0, Some(home()), false).as_deref(),
+                    (folder != full).then_some(full)
+                );
+            }
+            tab.name = Some("my project".into());
+            for full_path in [false, true] {
+                assert_eq!(label_of(&tab, 0, None, full_path), "my project");
+            }
+        }
+        let mut shell = strip_tab();
+        shell.cwd = Some("/work/repo".into());
+        shell.osc_title = Some("build status".into());
+        for full_path in [false, true] {
+            assert_eq!(label_of(&shell, 0, None, full_path), "build status");
+        }
     }
 }

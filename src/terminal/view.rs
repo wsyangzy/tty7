@@ -367,7 +367,10 @@ pub struct TerminalView {
     /// local pathname can live on an unavailable network share.
     link_probes: super::link_probe::LinkProbeCache,
     link_epoch: u64,
-    pending_file_links: Vec<(FileLinkRequest, FileLinkAction)>,
+    pending_file_links: Vec<(FileLinkRequest, FileLinkAction, bool)>,
+    deferred_link_click: Option<(FileLinkRequest, LinkClickFallback)>,
+    link_mouse_down: bool,
+    link_mouse_consumed: bool,
     pending_loopback_urls: Vec<(LoopbackPlan, String)>,
     /// The repository the pane's directory sits in, once the host has been
     /// asked, and the directory that answer belongs to. A second root for
@@ -375,6 +378,7 @@ pub struct TerminalView {
     /// root while the shell sits in a member crate.
     link_repo_root: Option<(std::path::PathBuf, Option<std::path::PathBuf>)>,
     link_repo_root_pending: bool,
+    link_repo_root_retry_after: Option<std::time::Instant>,
     /// The verdict of `should_show_context_menu` for the most recent right
     /// mouse-down, latched so the menu builder — which gpui-component runs on a
     /// deferred callback, one turn after the click — can still see the
@@ -421,6 +425,7 @@ pub struct TerminalView {
     last_agent_status: Option<crate::core::cli_agent::AgentStatus>,
     last_agent_message: Option<String>,
     agent_bell_pending: bool,
+    agent_notice_history: AgentNoticeHistory,
     /// A terminal alert needs a visible badge even without a rich Waiting event.
     agent_attention_unread: bool,
     last_agent_session: (Option<String>, Option<Vec<String>>),
@@ -536,6 +541,8 @@ enum LinkAt {
     None,
 }
 
+type LinkClickFallback = Box<dyn FnOnce(&mut TerminalView, &mut Context<TerminalView>)>;
+
 #[derive(Clone, PartialEq, Eq)]
 struct FileLinkRequest {
     text: String,
@@ -554,7 +561,35 @@ fn explicit_file_candidate(
     candidate: &super::search::FileCandidate,
     style: super::search::PathStyle,
 ) -> bool {
-    candidate.looks_like_a_path(style) || candidate.line.is_some() || candidate.path.contains('.')
+    // A dot alone also describes numbers, versions and prose such as e.g.
+    // Keep bare filenames useful without turning those words into cold-cache
+    // file menus or failed-open notifications. Unusual extensions still work
+    // after a hover finds the file, just like extension-less filenames.
+    candidate.looks_like_a_path(style)
+        || candidate.line.is_some()
+        || candidate
+            .path
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| {
+                extension.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && extension.chars().all(|c| c.is_ascii_alphanumeric())
+                    && (extension.len() > 1
+                        || matches!(
+                            extension,
+                            "a" | "c"
+                                | "d"
+                                | "f"
+                                | "F"
+                                | "h"
+                                | "m"
+                                | "o"
+                                | "r"
+                                | "R"
+                                | "s"
+                                | "S"
+                                | "v"
+                        ))
+            })
 }
 
 /// What it takes to open one of a pane's loopback ports from this machine.
@@ -759,6 +794,122 @@ fn agent_attention_badge(unread: bool, requested: bool, pane_focused: bool) -> b
     !pane_focused && (unread || requested)
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum AgentNoticeSource {
+    Osc = 1,
+    Bell = 2,
+    Status = 4,
+    Process = 8,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AgentNoticeKind {
+    Explicit,
+    Attention,
+    Finished,
+}
+
+struct RecentAgentNotice {
+    sources: u8,
+    kind: AgentNoticeKind,
+    turns: Option<u64>,
+    waiting_message: Option<String>,
+    bodies: Vec<String>,
+    at: std::time::Instant,
+}
+
+#[derive(Default)]
+struct AgentNoticeHistory {
+    recent: std::collections::VecDeque<RecentAgentNotice>,
+    agent: Option<crate::core::cli_agent::CLIAgent>,
+    session_id: Option<String>,
+    launch_argv: Option<Vec<String>>,
+}
+
+impl AgentNoticeHistory {
+    fn observe_session(
+        &mut self,
+        agent: Option<crate::core::cli_agent::CLIAgent>,
+        session: Option<&crate::core::cli_agent::AgentSessionState>,
+    ) {
+        let session_id = session.and_then(|s| s.session_id.clone());
+        let launch_argv = session.and_then(|s| s.launch_argv.clone());
+        // Learning an identity after OSC output does not create a new session.
+        if (self.agent.is_some() && self.agent != agent)
+            || (self.session_id.is_some() && self.session_id != session_id)
+            || (self.launch_argv.is_some() && self.launch_argv != launch_argv)
+        {
+            self.recent.clear();
+        }
+        self.agent = agent;
+        self.session_id = session_id;
+        self.launch_argv = launch_argv;
+    }
+
+    fn accept(
+        &mut self,
+        source: AgentNoticeSource,
+        kind: AgentNoticeKind,
+        session: Option<&crate::core::cli_agent::AgentSessionState>,
+        body: &str,
+        now: std::time::Instant,
+    ) -> bool {
+        use crate::core::cli_agent::AgentStatus;
+        // ponytail: OSC/BEL carry no event IDs. Correlate one second of sources
+        // within a session; exact correlation across longer delays needs IDs.
+        const CORRELATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+        self.recent
+            .retain(|notice| now.duration_since(notice.at) < CORRELATION_WINDOW);
+        let turns = session.map(|s| s.turns);
+        let waiting_message = session
+            .filter(|s| s.status == AgentStatus::Waiting)
+            .and_then(|s| s.message.as_deref())
+            .map(|message| {
+                super::remote::sanitize_notification_text(message, super::remote::NOTIFY_BODY_MAX)
+            });
+        let body = super::remote::sanitize_notification_text(body, super::remote::NOTIFY_BODY_MAX);
+        let source = source as u8;
+        if let Some(notice) = self.recent.iter_mut().rev().find(|notice| {
+            let same_turn = notice.turns.is_none() || turns.is_none() || notice.turns == turns;
+            let same_question = notice.waiting_message.is_none()
+                || waiting_message.is_none()
+                || notice.waiting_message == waiting_message;
+            let compatible_kind = notice.kind == kind
+                || notice.kind == AgentNoticeKind::Explicit
+                || kind == AgentNoticeKind::Explicit;
+            same_turn
+                && same_question
+                && compatible_kind
+                && ((notice.sources & source == 0) || notice.bodies.contains(&body))
+        }) {
+            notice.sources |= source;
+            if !notice.bodies.contains(&body) {
+                notice.bodies.push(body);
+            }
+            if notice.kind == AgentNoticeKind::Explicit {
+                notice.kind = kind;
+            }
+            notice.turns = turns.or(notice.turns);
+            if waiting_message.is_some() {
+                notice.waiting_message = waiting_message;
+            }
+            return false;
+        }
+        if self.recent.len() == super::remote::MAX_TERMINAL_NOTIFICATIONS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(RecentAgentNotice {
+            sources: source,
+            kind,
+            turns,
+            waiting_message,
+            bodies: vec![body],
+            at: now,
+        });
+        true
+    }
+}
+
 /// The longest command line to put in a confirmation. The shell sends up to
 /// 512 bytes; a dialog asking whether to end your work should still read as a
 /// sentence.
@@ -821,14 +972,46 @@ impl TerminalView {
     }
 
     fn notify_agent_finished(
-        &self,
+        &mut self,
         agent: crate::core::cli_agent::CLIAgent,
         elapsed: std::time::Duration,
+        notify_allowed: bool,
         cx: &mut Context<Self>,
     ) {
         let secs = elapsed.as_secs().to_string();
         let body = t_fmt(L10nKey::NotifyAgentFinished, &[("secs", &secs)]);
-        self.notify_pane(Some(agent.display_name()), &body, cx);
+        self.notify_agent_event(
+            AgentNoticeSource::Process,
+            AgentNoticeKind::Finished,
+            Some(agent.display_name()),
+            &body,
+            notify_allowed,
+            cx,
+        );
+    }
+
+    fn notify_agent_event(
+        &mut self,
+        source: AgentNoticeSource,
+        kind: AgentNoticeKind,
+        lead: Option<&str>,
+        body: &str,
+        notify_allowed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let session = self.terminal.agent_session();
+        // Record suppressed events as consumed, too: changing focus or settings
+        // must not replay the same alert through its second notification source.
+        if self.agent_notice_history.accept(
+            source,
+            kind,
+            session.as_ref(),
+            body,
+            std::time::Instant::now(),
+        ) && notify_allowed
+        {
+            self.notify_pane(lead, body, cx);
+        }
     }
 
     /// Notify about this pane, with a title describing where it lives and a
@@ -1661,9 +1844,13 @@ impl TerminalView {
             link_probes: Default::default(),
             link_epoch: 0,
             pending_file_links: Vec::new(),
+            deferred_link_click: None,
+            link_mouse_down: false,
+            link_mouse_consumed: false,
             pending_loopback_urls: Vec::new(),
             link_repo_root: None,
             link_repo_root_pending: false,
+            link_repo_root_retry_after: None,
             context_menu_allowed: true,
             menu_link: None,
             scroll_debt: 0.,
@@ -1690,6 +1877,7 @@ impl TerminalView {
             last_agent_status: None,
             last_agent_message: None,
             agent_bell_pending: false,
+            agent_notice_history: AgentNoticeHistory::default(),
             agent_attention_unread: false,
             last_agent_session: (None, None),
             agent_turn_started: None,
@@ -1862,10 +2050,13 @@ impl TerminalView {
         if self.workspace != workspace {
             self.link_epoch = self.link_epoch.wrapping_add(1);
             self.pending_file_links.clear();
+            self.deferred_link_click = None;
+            self.link_mouse_consumed = false;
             self.pending_loopback_urls.clear();
             self.link_probes = Default::default();
             self.link_repo_root = None;
             self.link_repo_root_pending = false;
+            self.link_repo_root_retry_after = None;
             self.last_hover_cell = None;
             self.hovered_link = None;
             self.menu_link = None;
@@ -1922,6 +2113,8 @@ impl TerminalView {
         self.terminal
             .adopt_relink(stream, buffered, route, size, cell_w, cell_h)?;
         self.last_reported_focus = None;
+        self.agent_bell_pending = false;
+        self.agent_notice_history = AgentNoticeHistory::default();
         self.relink_abandoned = false;
         self.relink_inflight = false;
         self.title = self.default_title.clone();
@@ -1931,6 +2124,8 @@ impl TerminalView {
 
     pub fn detach_link(&mut self, cx: &mut Context<Self>) {
         self.terminal.detach_link();
+        self.agent_bell_pending = false;
+        self.agent_notice_history = AgentNoticeHistory::default();
         cx.notify();
     }
 
@@ -3750,16 +3945,14 @@ impl TerminalView {
             .global::<Config>()
             .notify_on_agent_event
             .allows(pane_focused);
-        // Consume disabled alerts too, so enabling notifications does not
-        // deliver old permission requests.
-        while let Some((title, body)) = self.terminal.take_agent_notification() {
-            self.agent_attention_unread |= !pane_focused;
-            cx.notify();
-            if agent_notify_allowed {
-                self.notify_pane(title.as_deref(), &body, cx);
-            }
-        }
+        self.agent_notice_history.observe_session(
+            self.terminal.foreground_agent(),
+            self.terminal.agent_session().as_ref(),
+        );
         if self.terminal.exited {
+            self.terminal.take_terminal_notifications();
+            self.agent_bell_pending = false;
+            self.agent_notice_history = AgentNoticeHistory::default();
             if std::mem::take(&mut self.agent_attention_unread) {
                 cx.notify();
             }
@@ -3814,8 +4007,8 @@ impl TerminalView {
                 let agent = self.running_agent.take();
                 self.running_since = None;
                 match agent {
-                    Some(agent) if !self.agent_was_rich && agent_notify_allowed => {
-                        self.notify_agent_finished(agent, elapsed, cx);
+                    Some(agent) if !self.agent_was_rich => {
+                        self.notify_agent_finished(agent, elapsed, agent_notify_allowed, cx);
                     }
                     None if notify_allowed => {
                         let threshold = std::time::Duration::from_secs(
@@ -3832,6 +4025,24 @@ impl TerminalView {
         }
 
         let turn_finished = self.poll_agent_status(agent_notify_allowed, window, cx);
+        // Drain one bounded batch. OSC has no trustworthy process identity, so
+        // shell programs and agents follow the same explicit-notification mode.
+        // Status goes first to prefer an actionable hook message over a generic
+        // OSC alert when both describe the same permission request.
+        for (title, body) in self.terminal.take_terminal_notifications() {
+            if self.agent().is_some() {
+                self.agent_attention_unread |= !pane_focused;
+                cx.notify();
+            }
+            self.notify_agent_event(
+                AgentNoticeSource::Osc,
+                AgentNoticeKind::Explicit,
+                title.as_deref(),
+                &body,
+                agent_notify_allowed,
+                cx,
+            );
+        }
 
         let session = self.terminal.agent_session();
         let tool_activity = match session.as_ref().map(|s| s.activity) {
@@ -4181,13 +4392,30 @@ impl TerminalView {
         {
             cx.notify();
         }
-        if attention_requested && notify_allowed {
+        if attention_requested {
+            let waiting_changed = session.as_ref().is_some_and(|s| {
+                s.rich
+                    && s.status == AgentStatus::Waiting
+                    && (self.last_agent_status != Some(AgentStatus::Waiting)
+                        || self.last_agent_message != s.message)
+            });
             let body = session
                 .as_ref()
                 .filter(|s| s.status == AgentStatus::Waiting)
                 .and_then(|s| s.message.clone())
                 .unwrap_or_else(|| t(L10nKey::AgentStatusAttention).to_string());
-            self.notify_pane(Some(agent_name), &body, cx);
+            self.notify_agent_event(
+                if waiting_changed {
+                    AgentNoticeSource::Status
+                } else {
+                    AgentNoticeSource::Bell
+                },
+                AgentNoticeKind::Attention,
+                Some(agent_name),
+                &body,
+                notify_allowed,
+                cx,
+            );
         }
         self.last_agent_message = session.as_ref().and_then(|s| s.message.clone());
         if adopted_baseline {
@@ -4254,7 +4482,6 @@ impl TerminalView {
             }
             Some(AgentStatus::Done)
                 if rich
-                    && notify_allowed
                     && matches!(
                         prev,
                         Some(AgentStatus::Working) | Some(AgentStatus::Waiting)
@@ -4267,7 +4494,14 @@ impl TerminalView {
                     }
                     None => t(L10nKey::NotifyTurnFinished).to_string(),
                 };
-                self.notify_pane(Some(agent_name), &body, cx);
+                self.notify_agent_event(
+                    AgentNoticeSource::Status,
+                    AgentNoticeKind::Finished,
+                    Some(agent_name),
+                    &body,
+                    notify_allowed,
+                    cx,
+                );
             }
             _ => {}
         }
@@ -5983,6 +6217,79 @@ impl TerminalView {
         )
     }
 
+    /// A modifier-click on an unknown word may be an extension-less filename.
+    /// Retain its normal mouse handling until the asynchronous answer arrives;
+    /// a drag can immediately take that handling back instead of waiting for IO.
+    pub(super) fn begin_link_click(&mut self, button: MouseButton) {
+        self.deferred_link_click = None;
+        if button == MouseButton::Left {
+            self.link_mouse_down = true;
+            self.link_mouse_consumed = false;
+        }
+    }
+
+    pub(super) fn finish_link_mouse_up(&mut self) -> bool {
+        self.link_mouse_down = false;
+        std::mem::take(&mut self.link_mouse_consumed) || self.deferred_link_click.is_some()
+    }
+
+    pub(super) fn resume_deferred_link_click(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, fallback)) = self.deferred_link_click.take() {
+            self.link_mouse_consumed = false;
+            fallback(self, cx);
+        }
+    }
+
+    pub(super) fn consume_link_mouse_down(&mut self) {
+        self.link_mouse_consumed = true;
+    }
+
+    pub(super) fn link_mouse_is_down(&self) -> bool {
+        self.link_mouse_down
+    }
+
+    pub(super) fn defer_file_click(
+        &mut self,
+        col: usize,
+        row: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        fallback: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) -> bool {
+        if !cx.global::<Config>().link_url || !self.cwd_is_on_host() {
+            return false;
+        }
+        let Some(GridLink::Text(text, _, click_idx)) = self.link_line_at(col, row) else {
+            return false;
+        };
+        let roots = self.link_roots(cx);
+        if super::search::unresolved_candidate(&text, click_idx, roots.style).is_none() {
+            return false;
+        }
+        let request = FileLinkRequest {
+            text,
+            click_idx,
+            roots,
+        };
+        let snapshot = request.text.clone();
+        // Do not replay a delayed click into output which has replaced its cell.
+        self.deferred_link_click = Some((
+            request.clone(),
+            Box::new(move |view, cx| {
+                if matches!(view.link_line_at(col, row), Some(GridLink::Text(ref text, _, at)) if text == &snapshot && at == click_idx)
+                {
+                    fallback(view, cx);
+                }
+            }),
+        ));
+        if self.resolve_file_link_inner(request, FileLinkAction::Open, true, window, cx) {
+            true
+        } else {
+            self.deferred_link_click = None;
+            false
+        }
+    }
+
     fn resolve_file_link(
         &mut self,
         request: FileLinkRequest,
@@ -5990,74 +6297,181 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.resolve_file_link_inner(request, action, false, window, cx)
+    }
+
+    fn resolve_file_link_inner(
+        &mut self,
+        request: FileLinkRequest,
+        action: FileLinkAction,
+        deferred: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if !cx.global::<Config>().link_url || !self.cwd_is_on_host() {
             return false;
         }
+        let candidate = super::search::unresolved_candidate(
+            &request.text,
+            request.click_idx,
+            request.roots.style,
+        );
+        let display_path = std::path::PathBuf::from(
+            candidate
+                .as_ref()
+                .map_or(request.text.as_str(), |c| c.path.as_str()),
+        );
         let Some(host) = self.host(cx) else {
+            if !deferred {
+                self.warn_file_open_failed(
+                    &display_path,
+                    &std::io::Error::from(std::io::ErrorKind::NotConnected),
+                    window,
+                    cx,
+                );
+            }
             return false;
         };
         let pending = (request.clone(), action);
-        if self.pending_file_links.contains(&pending) || self.pending_file_links.len() >= 8 {
+        if let Some((_, _, tentative)) = self
+            .pending_file_links
+            .iter_mut()
+            .find(|(queued, queued_action, _)| queued == &request && *queued_action == action)
+        {
+            // A second click may now have a cached hit. Promote the existing
+            // request instead of letting its old tentative callback discard it.
+            *tentative &= deferred;
             return true;
         }
-        self.pending_file_links.push(pending.clone());
+        if self.pending_file_links.len() >= 8 {
+            log::debug!("pane {}: file link request limit reached", self.pane_id);
+            if !deferred {
+                self.warn_file_open_failed(
+                    &display_path,
+                    &std::io::Error::from(std::io::ErrorKind::WouldBlock),
+                    window,
+                    cx,
+                );
+            }
+            return false;
+        }
+        self.pending_file_links
+            .push((request.clone(), action, deferred));
         let epoch = self.link_epoch;
-        let FileLinkRequest {
-            text,
-            click_idx,
-            roots,
-        } = request.clone();
-        // Keep the clicked text and roots, not screen coordinates: output or
-        // scrolling can replace that cell before a slow filesystem answers.
-        crate::ui::host_ops::HostOps::run_in(
+        let work = request.clone();
+        let deadline = std::time::Instant::now() + crate::ui::host_ops::LINK_OP_TIMEOUT;
+        crate::ui::host_ops::HostOps::run_link_in(
             host,
             window,
             cx,
             move |host| {
-                super::search::link_at(&text, click_idx, &roots, true, &mut |path, require_file| {
-                    match host.stat(path) {
-                        Ok(meta) if !require_file || !meta.is_dir => super::search::Probe::Hit {
-                            is_dir: meta.is_dir,
-                        },
-                        _ => super::search::Probe::Miss,
-                    }
-                })
+                super::link_probe::resolve_file(
+                    &work.text,
+                    work.click_idx,
+                    &work.roots,
+                    host,
+                    deadline,
+                )
             },
-            move |view, link, window, cx| {
+            move |view, result, window, cx| {
                 if view.link_epoch != epoch {
                     return;
                 }
-                view.pending_file_links.retain(|queued| queued != &pending);
-                if !cx.global::<Config>().link_url || !view.cwd_is_on_host() {
+                let Some(index) = view
+                    .pending_file_links
+                    .iter()
+                    .position(|(queued, action, _)| queued == &pending.0 && *action == pending.1)
+                else {
+                    return;
+                };
+                let (_, _, deferred) = view.pending_file_links.remove(index);
+                if deferred
+                    && !view
+                        .deferred_link_click
+                        .as_ref()
+                        .is_some_and(|(current, _)| current == &request)
+                {
                     return;
                 }
-                match link.map(|link| link.target) {
-                    Some(LinkTarget::File {
+                if !deferred
+                    && view
+                        .deferred_link_click
+                        .as_ref()
+                        .is_some_and(|(current, _)| current == &request)
+                {
+                    view.deferred_link_click = None;
+                }
+                if !cx.global::<Config>().link_url || !view.cwd_is_on_host() {
+                    if deferred {
+                        view.resume_deferred_link_click(cx);
+                    }
+                    return;
+                }
+                match result.map(|link| link.map(|link| link.target)) {
+                    Ok(Some(LinkTarget::File {
                         path,
                         line,
                         column,
                         is_dir,
-                    }) => match action {
-                        FileLinkAction::Open => {
-                            view.open_file_link(path, line, column, is_dir, window, cx)
+                    })) => {
+                        if view
+                            .deferred_link_click
+                            .as_ref()
+                            .is_some_and(|(current, _)| current == &request)
+                        {
+                            view.deferred_link_click = None;
                         }
-                        FileLinkAction::Reveal if view.host_id.is_local() => {
-                            if let Err(e) = reveal_file_path(&path) {
-                                view.warn_file_open_failed(&path, &e, window, cx);
+                        match action {
+                            FileLinkAction::Open => {
+                                view.open_file_link(path, line, column, is_dir, window, cx)
                             }
+                            FileLinkAction::Reveal if view.host_id.is_local() => {
+                                let target = path.clone();
+                                crate::ui::host_ops::HostOps::run_link_task_in(
+                                    view.host_id,
+                                    window,
+                                    cx,
+                                    move || reveal_file_path(&target),
+                                    move |view, result, window, cx| {
+                                        if view.link_epoch == epoch
+                                            && let Err(e) = result
+                                        {
+                                            view.warn_file_open_failed(&path, &e, window, cx);
+                                        }
+                                    },
+                                );
+                            }
+                            FileLinkAction::CopyPath => cx.write_to_clipboard(
+                                ClipboardItem::new_string(path.to_string_lossy().into_owned()),
+                            ),
+                            FileLinkAction::Reveal => view.warn_file_open_failed(
+                                &path,
+                                &std::io::Error::from(std::io::ErrorKind::Unsupported),
+                                window,
+                                cx,
+                            ),
                         }
-                        FileLinkAction::CopyPath => cx.write_to_clipboard(
-                            ClipboardItem::new_string(path.to_string_lossy().into_owned()),
-                        ),
-                        FileLinkAction::Reveal => {}
-                    },
-                    _ => {
-                        if let Some(candidate) = super::search::unresolved_candidate(
-                            &request.text,
-                            request.click_idx,
-                            request.roots.style,
-                        ) {
-                            view.report_unresolved_link(&candidate, &request.roots, window, cx);
+                    }
+                    Ok(_) if deferred => view.resume_deferred_link_click(cx),
+                    Ok(_) => {
+                        let reported = candidate.as_ref().is_some_and(|candidate| {
+                            view.report_unresolved_link(candidate, &request.roots, window, cx)
+                        });
+                        if !reported {
+                            view.warn_file_open_failed(
+                                &display_path,
+                                &std::io::Error::from(std::io::ErrorKind::NotFound),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        if deferred {
+                            view.resume_deferred_link_click(cx);
+                            log::debug!("unconfirmed file link lookup failed: {error}");
+                        } else {
+                            view.warn_file_open_failed(&display_path, &error, window, cx);
                         }
                     }
                 }
@@ -6087,10 +6501,9 @@ impl TerminalView {
         let path =
             match self.resolve_grid_link(snapshot.clone(), &roots, true, include_loopback, cx) {
                 LinkAt::Found(LinkTarget::File { path, .. }, ..) => Some(path),
-                LinkAt::Unresolved {
-                    candidate,
-                    pending: true,
-                } if explicit_file_candidate(&candidate, roots.style) => {
+                LinkAt::Unresolved { candidate, .. }
+                    if explicit_file_candidate(&candidate, roots.style) =>
+                {
                     Some(std::path::PathBuf::from(candidate.path))
                 }
                 _ => None,
@@ -6173,26 +6586,35 @@ impl TerminalView {
         // the log, and the link read as dead — while the path was only ever
         // underlined because it verifiably exists. The built-in editor has
         // its own error path downstream of OpenFileRequested.
-        let outcome = match (mode, command) {
-            (LinkFileOpen::Command, Some(template)) => {
-                run_file_command(&template, &path, line, column)
-            }
-            (LinkFileOpen::System, _) => open_file_path(&path),
-            // Told to run a command, with no command left to run: falling back
-            // to the built-in editor beats the click doing nothing.
-            (LinkFileOpen::Internal | LinkFileOpen::Command, _) => {
-                cx.emit(OpenFileRequested {
-                    path,
-                    line,
-                    column,
-                    is_dir,
-                });
-                return;
-            }
-        };
-        if let Err(e) = outcome {
-            self.warn_file_open_failed(&path, &e, window, cx);
+        if mode == LinkFileOpen::Internal || (mode == LinkFileOpen::Command && command.is_none()) {
+            cx.emit(OpenFileRequested {
+                path,
+                line,
+                column,
+                is_dir,
+            });
+            return;
         }
+        let target = path.clone();
+        let epoch = self.link_epoch;
+        crate::ui::host_ops::HostOps::run_link_task_in(
+            self.host_id,
+            window,
+            cx,
+            move || match (mode, command) {
+                (LinkFileOpen::Command, Some(template)) => {
+                    run_file_command(&template, &target, line, column)
+                }
+                _ => open_file_path(&target),
+            },
+            move |view, result, window, cx| {
+                if view.link_epoch == epoch
+                    && let Err(e) = result
+                {
+                    view.warn_file_open_failed(&path, &e, window, cx);
+                }
+            },
+        );
     }
 
     /// Says why a path-shaped token did not open anything.
@@ -6255,28 +6677,45 @@ impl TerminalView {
         + 'static,
     ) {
         let plan = self.loopback_plan(cx);
-        let loopback = super::loopback::parse_loopback_url(url);
-        if matches!(plan, LoopbackPlan::Direct | LoopbackPlan::NoForwardNeeded)
-            || loopback.is_none()
-        {
+        if matches!(plan, LoopbackPlan::Direct | LoopbackPlan::NoForwardNeeded) {
             cx.open_url(url);
             return;
         }
-        let loopback = loopback.expect("a forwardable loopback URL");
+        let Some(loopback) = super::loopback::parse_loopback_url(url) else {
+            cx.open_url(url);
+            return;
+        };
         let request = (plan, url.to_string());
-        if self.pending_loopback_urls.contains(&request) || self.pending_loopback_urls.len() >= 8 {
+        if self.pending_loopback_urls.contains(&request) {
+            return;
+        }
+        if self.pending_loopback_urls.len() >= 8 {
+            log::debug!("pane {}: loopback URL request limit reached", self.pane_id);
+            window.push_notification(
+                t_fmt(
+                    L10nKey::LoopbackForwardFailed,
+                    &[
+                        ("port", &loopback.port.to_string()),
+                        (
+                            "error",
+                            &std::io::Error::from(std::io::ErrorKind::WouldBlock).to_string(),
+                        ),
+                    ],
+                ),
+                cx,
+            );
             return;
         }
         self.pending_loopback_urls.push(request.clone());
         let route = self.forward_route();
         let epoch = self.link_epoch;
         let target = loopback.clone();
-        let work = cx
-            .background_executor()
-            .spawn(async move { forward(route, target) });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = work.await;
-            let _ = this.update_in(cx, |view, window, cx| {
+        crate::ui::host_ops::HostOps::run_link_task_in(
+            self.host_id,
+            window,
+            cx,
+            move || forward(route, target).map_err(std::io::Error::other),
+            move |view, result, window, cx| {
                 if view.link_epoch != epoch {
                     return;
                 }
@@ -6298,9 +6737,8 @@ impl TerminalView {
                         cx,
                     ),
                 }
-            });
-        })
-        .detach();
+            },
+        );
     }
 
     /// How forward requests about this pane reach the daemon that owns them —
@@ -6592,6 +7030,9 @@ impl TerminalView {
     fn request_link_repo_root(&mut self, cwd: &std::path::Path, cx: &mut Context<Self>) {
         if self.link_repo_root_pending
             || self
+                .link_repo_root_retry_after
+                .is_some_and(|until| std::time::Instant::now() < until)
+            || self
                 .link_repo_root
                 .as_ref()
                 .is_some_and(|(asked_for, _)| asked_for == cwd)
@@ -6618,22 +7059,55 @@ impl TerminalView {
         self.link_repo_root_pending = true;
         let cwd = cwd.to_path_buf();
         let epoch = self.link_epoch;
-        crate::ui::host_ops::HostOps::run(
+        crate::ui::host_ops::HostOps::run_link(
             host,
             cx,
             {
                 let cwd = cwd.clone();
-                move |h| h.repo_root(&cwd).ok().flatten()
+                move |h| h.repo_root(&cwd)
             },
-            move |view, root, cx| {
+            move |view, result, cx| {
                 if view.link_epoch != epoch {
                     return;
                 }
                 view.link_repo_root_pending = false;
-                view.link_repo_root = Some((cwd, root));
-                view.recompute_link_hover(cx);
+                match result {
+                    Ok(root) => {
+                        // A negative answer can change after `git init`.
+                        view.link_repo_root_retry_after = None;
+                        view.link_repo_root = root.map(|root| (cwd, Some(root)));
+                        if view.link_repo_root.is_none() {
+                            view.link_repo_root_retry_after =
+                                Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                        }
+                        view.recompute_link_hover(cx);
+                    }
+                    Err(error) => {
+                        log::debug!("link repository lookup failed: {error}");
+                        view.link_repo_root_retry_after =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+                        view.retry_link_hover(epoch, cx);
+                    }
+                }
             },
         );
+    }
+
+    fn retry_link_hover(&mut self, epoch: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |view, cx| {
+            smol::Timer::after(std::time::Duration::from_secs(2)).await;
+            let _ = view.update(cx, |view, cx| {
+                if view.link_epoch != epoch {
+                    return;
+                }
+                if cx.global::<Config>().link_url {
+                    view.link_probes.expire();
+                    view.recompute_link_hover(cx);
+                    view.flush_link_probes(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Asks the host about every path a lookup could not answer for, in one
@@ -6655,31 +7129,59 @@ impl TerminalView {
         }
         let generation = self.link_probes.generation();
         let epoch = self.link_epoch;
-        crate::ui::host_ops::HostOps::run(
+        // Retain completed entries even if a later stat stalls or panics.
+        let partial = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let completed = partial.clone();
+        let deadline = std::time::Instant::now() + crate::ui::host_ops::LINK_OP_TIMEOUT;
+        crate::ui::host_ops::HostOps::run_link(
             host,
             cx,
             move |h| {
                 use super::link_probe::Existence;
-                wanted
-                    .into_iter()
-                    .map(|path| {
-                        let existence = match h.stat(&path) {
-                            Ok(meta) if meta.is_dir => Existence::Dir,
-                            Ok(_) => Existence::File,
-                            Err(_) => Existence::Missing,
-                        };
-                        (path, existence)
-                    })
-                    .collect::<Vec<_>>()
+                let mut failure = None;
+                for path in wanted {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                    }
+                    let existence = match h.stat(&path) {
+                        Ok(meta) if meta.is_dir => Existence::Dir,
+                        Ok(_) => Existence::File,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Existence::Missing,
+                        Err(e) => {
+                            failure.get_or_insert(e);
+                            continue;
+                        }
+                    };
+                    completed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((path, existence));
+                }
+                match failure {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
             },
-            move |view, answers, cx| {
-                if view.link_epoch != epoch || view.link_probes.generation() != generation {
+            move |view, result, cx| {
+                if view.link_epoch != epoch {
                     return;
                 }
-                if view.link_probes.land(answers) {
-                    view.recompute_link_hover(cx);
+                let answers =
+                    std::mem::take(&mut *partial.lock().unwrap_or_else(|e| e.into_inner()));
+                let news = view.link_probes.land(generation, answers);
+                if let Err(error) = result {
+                    log::debug!("link probe failed: {error}");
+                    view.link_probes.fail(generation);
+                    if news {
+                        view.recompute_link_hover(cx);
+                    }
+                    view.retry_link_hover(epoch, cx);
+                } else {
+                    if news {
+                        view.recompute_link_hover(cx);
+                    }
+                    view.flush_link_probes(cx);
                 }
-                view.flush_link_probes(cx);
             },
         );
     }
@@ -8310,6 +8812,31 @@ fn drag_scroll_step(overshoot: f32) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn link_candidates_require_a_plausible_extension() {
+        use super::super::search::{PathStyle, unresolved_candidate};
+        for style in [PathStyle::Posix, PathStyle::Windows] {
+            for text in [
+                "3.14", "v1.2.3", "e.g.", "i.e.", "1.5s", "ready", "Makefile",
+            ] {
+                let candidate = unresolved_candidate(text, 0, style).unwrap();
+                assert!(!super::explicit_file_candidate(&candidate, style), "{text}");
+            }
+            for text in [
+                "notes.md",
+                "main.c",
+                "defs.h",
+                "script.R",
+                ".gitignore",
+                "clip.mp4",
+                "./Makefile",
+                "src/main.rs:12",
+            ] {
+                let candidate = unresolved_candidate(text, 0, style).unwrap();
+                assert!(super::explicit_file_candidate(&candidate, style), "{text}");
+            }
+        }
+    }
 
     /// What the label ladder asks a pane: are you showing a name of your own,
     /// or still standing under the app's? (#740)
@@ -8477,6 +9004,162 @@ mod tests {
         assert!(!badge(false, false, false));
         assert!(!badge(false, true, true));
         assert!(!badge(true, false, true));
+    }
+
+    #[test]
+    fn terminal_notifications_coalesce_sources_and_preserve_new_questions() {
+        use super::{AgentNoticeHistory, AgentNoticeKind, AgentNoticeSource};
+        use crate::core::cli_agent::{AgentSessionState, AgentStatus};
+        use AgentNoticeSource::{Bell, Osc, Status};
+
+        let now = std::time::Instant::now();
+        for order in [
+            [Osc, Bell, Status],
+            [Osc, Status, Bell],
+            [Bell, Osc, Status],
+            [Bell, Status, Osc],
+            [Status, Osc, Bell],
+            [Status, Bell, Osc],
+        ] {
+            let mut history = AgentNoticeHistory::default();
+            let mut session = AgentSessionState {
+                status: AgentStatus::Waiting,
+                message: Some("Approve command?".into()),
+                rich: true,
+                ..Default::default()
+            };
+            for (index, source) in order.into_iter().enumerate() {
+                let (kind, body) = match source {
+                    Osc => (AgentNoticeKind::Explicit, "Agent needs attention"),
+                    Bell => (AgentNoticeKind::Attention, "Attention"),
+                    _ => (AgentNoticeKind::Attention, "Approve command?"),
+                };
+                assert_eq!(
+                    history.accept(source, kind, Some(&session), body, now),
+                    index == 0
+                );
+                assert!(!history.accept(source, kind, Some(&session), body, now));
+            }
+            session.message = Some("Which environment?".into());
+            assert!(history.accept(
+                Status,
+                AgentNoticeKind::Attention,
+                Some(&session),
+                "Which environment?",
+                now
+            ));
+            assert!(!history.accept(
+                Osc,
+                AgentNoticeKind::Explicit,
+                Some(&session),
+                "Agent needs attention",
+                now
+            ));
+            assert!(!history.accept(
+                Bell,
+                AgentNoticeKind::Attention,
+                Some(&session),
+                "Attention",
+                now
+            ));
+            assert!(history.accept(
+                Bell,
+                AgentNoticeKind::Attention,
+                Some(&session),
+                "Attention",
+                now + std::time::Duration::from_secs(1)
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_notifications_keep_late_identity_but_reset_for_new_sessions() {
+        use super::{AgentNoticeHistory, AgentNoticeKind, AgentNoticeSource};
+        use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
+        let now = std::time::Instant::now();
+        let mut history = AgentNoticeHistory::default();
+        assert!(history.accept(
+            AgentNoticeSource::Osc,
+            AgentNoticeKind::Explicit,
+            None,
+            "Approve command?",
+            now
+        ));
+        let mut session = AgentSessionState {
+            session_id: Some("first".into()),
+            status: AgentStatus::Waiting,
+            message: Some("Approve command?".into()),
+            rich: true,
+            ..Default::default()
+        };
+        history.observe_session(Some(CLIAgent::Codex), Some(&session));
+        assert!(!history.accept(
+            AgentNoticeSource::Status,
+            AgentNoticeKind::Attention,
+            Some(&session),
+            "Approve command?",
+            now
+        ));
+        session.session_id = Some("second".into());
+        history.observe_session(Some(CLIAgent::Codex), Some(&session));
+        assert!(history.accept(
+            AgentNoticeSource::Status,
+            AgentNoticeKind::Attention,
+            Some(&session),
+            "Approve command?",
+            now
+        ));
+        session.status = AgentStatus::Done;
+        session.turns += 1;
+        session.message = None;
+        assert!(history.accept(
+            AgentNoticeSource::Status,
+            AgentNoticeKind::Finished,
+            Some(&session),
+            "Finished",
+            now
+        ));
+        assert!(!history.accept(
+            AgentNoticeSource::Osc,
+            AgentNoticeKind::Explicit,
+            Some(&session),
+            "Finished",
+            now
+        ));
+        // A separate confirmation after completion remains an attention event.
+        assert!(history.accept(
+            AgentNoticeSource::Bell,
+            AgentNoticeKind::Attention,
+            Some(&session),
+            "Attention",
+            now
+        ));
+    }
+
+    #[test]
+    fn terminal_notification_history_has_bounded_memory() {
+        use super::{AgentNoticeHistory, AgentNoticeKind, AgentNoticeSource};
+        let now = std::time::Instant::now();
+        let mut history = AgentNoticeHistory::default();
+        for n in 0..super::super::remote::MAX_TERMINAL_NOTIFICATIONS * 2 {
+            assert!(history.accept(
+                AgentNoticeSource::Osc,
+                AgentNoticeKind::Explicit,
+                None,
+                &format!("{n} {}", "文".repeat(1024)),
+                now
+            ));
+        }
+        assert_eq!(
+            history.recent.len(),
+            super::super::remote::MAX_TERMINAL_NOTIFICATIONS
+        );
+        assert!(history.recent.iter().all(|notice| {
+            notice
+                .bodies
+                .iter()
+                .all(|body| body.chars().count() <= super::super::remote::NOTIFY_BODY_MAX + 1)
+        }));
     }
 
     #[test]
@@ -10995,6 +11678,7 @@ mod gpui_tests {
         let pane = window.update(cx, |_, _, cx| cx.entity()).unwrap();
         window
             .update(cx, |view, window, cx| {
+                window.activate_window();
                 view.focus_handle.clone().focus(window, cx);
             })
             .unwrap();
@@ -11003,6 +11687,10 @@ mod gpui_tests {
         report_agent_status(AgentStatus::Done, &pane, cx, &mut daemon);
         window
             .update(cx, |view, window, cx| {
+                assert!(
+                    window.is_window_active(),
+                    "the reader is looking at this window"
+                );
                 assert!(view.focus_handle.is_focused(window));
                 view.poll_agent_status(false, window, cx);
                 assert!(
@@ -11259,15 +11947,18 @@ mod gpui_tests {
     }
 
     fn settle_link_opens(window: gpui::WindowHandle<TerminalView>, cx: &mut TestAppContext) {
+        let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        settle_link_entity_opens(&view, cx);
+    }
+
+    fn settle_link_entity_opens(view: &Entity<TerminalView>, cx: &mut TestAppContext) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             cx.run_until_parked();
-            if window
-                .update(cx, |view, _, _| {
-                    view.pending_file_links.is_empty() && view.pending_loopback_urls.is_empty()
-                })
-                .unwrap()
-            {
+            if cx.update(|cx| {
+                let view = view.read(cx);
+                view.pending_file_links.is_empty() && view.pending_loopback_urls.is_empty()
+            }) {
                 return;
             }
             assert!(
@@ -11353,6 +12044,419 @@ mod gpui_tests {
         );
         drop(file);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[gpui::test]
+    fn link_open_cold_names_do_not_need_a_previous_hover(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let dir = tempfile::tempdir().unwrap();
+        let (window, _daemon) = harness(cx);
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        window
+            .update(cx, |view, _, cx| {
+                let seen = opened.clone();
+                cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
+                    seen.borrow_mut().push(event.path.clone());
+                })
+                .detach();
+                view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+            })
+            .unwrap();
+        for name in ["Makefile", "Dockerfile", "LICENSE", "data.123", "文件.数据"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"contents").unwrap();
+            window
+                .update(cx, |view, window, cx| {
+                    view.link_probes = Default::default();
+                    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                    parser.advance(
+                        &mut *view.terminal.term.lock(),
+                        format!("\x1b[2J\x1b[H{name}").as_bytes(),
+                    );
+                    view.begin_link_click(MouseButton::Left);
+                    assert!(
+                        view.open_link_at(0, 0, window, cx)
+                            || view.defer_file_click(0, 0, window, cx, |_, _| panic!(
+                                "existing file must open"
+                            ))
+                    );
+                    view.finish_link_mouse_up();
+                })
+                .unwrap();
+            settle_link_opens(window, cx);
+            assert_eq!(opened.borrow().last(), Some(&path));
+        }
+        assert_eq!(opened.borrow().len(), 5);
+    }
+
+    #[gpui::test]
+    fn link_open_second_click_promotes_a_tentative_request(cx: &mut TestAppContext) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Makefile");
+        std::fs::write(&path, b"all:").unwrap();
+        let (window, _daemon) = harness(cx);
+        let opened = Rc::new(Cell::new(0));
+        window
+            .update(cx, |view, window, cx| {
+                let seen = opened.clone();
+                cx.subscribe(&cx.entity(), move |_, _, _: &OpenFileRequested, _| {
+                    seen.set(seen.get() + 1)
+                })
+                .detach();
+                view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                parser.advance(&mut *view.terminal.term.lock(), b"Makefile");
+                view.begin_link_click(MouseButton::Left);
+                assert!(view.defer_file_click(0, 0, window, cx, |_, _| panic!("the file exists")));
+                view.link_probes.retarget(view.host_id);
+                view.link_probes.land(
+                    view.link_probes.generation(),
+                    vec![(path, super::super::link_probe::Existence::File)],
+                );
+                view.begin_link_click(MouseButton::Left);
+                assert!(view.open_link_at(0, 0, window, cx));
+                assert_eq!(view.pending_file_links.len(), 1);
+            })
+            .unwrap();
+        settle_link_opens(window, cx);
+        assert_eq!(opened.get(), 1);
+    }
+
+    #[gpui::test]
+    fn link_open_cold_repository_root_is_part_of_the_click(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let cwd = dir.path().join("crates").join("worker");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let path = dir.path().join("src").join("main.rs");
+        std::fs::write(&path, b"fn main() {} ").unwrap();
+        let (window, _daemon) = harness(cx);
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        window
+            .update(cx, |view, window, cx| {
+                let seen = opened.clone();
+                cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
+                    seen.borrow_mut().push(event.path.clone())
+                })
+                .detach();
+                view.terminal.seed_cwd(Some(cwd.clone()));
+                // Deliberately prevent hover's independent lookup from winning the race.
+                view.link_repo_root_pending = true;
+                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                parser.advance(&mut *view.terminal.term.lock(), b"src/main.rs:3");
+                assert_eq!(view.link_roots(cx).dirs, vec![cwd]);
+                assert!(view.open_link_at(0, 0, window, cx));
+                parser.advance(&mut *view.terminal.term.lock(), b"\x1b[2J\x1b[Hnew output");
+            })
+            .unwrap();
+        settle_link_opens(window, cx);
+        assert_eq!(*opened.borrow(), vec![path]);
+    }
+
+    #[gpui::test]
+    fn link_click_consumes_the_matching_mouse_release(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, _| {
+                view.begin_link_click(MouseButton::Left);
+                view.consume_link_mouse_down();
+                view.begin_link_click(MouseButton::Right);
+                assert!(
+                    view.finish_link_mouse_up(),
+                    "a consumed down cannot leak an orphan release"
+                );
+                assert!(
+                    !view.finish_link_mouse_up(),
+                    "the consumed gesture ends exactly once"
+                );
+                view.begin_link_click(MouseButton::Left);
+                assert!(
+                    !view.finish_link_mouse_up(),
+                    "ordinary gestures retain their release"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn link_open_ambiguous_miss_returns_its_mouse_gesture_once(cx: &mut TestAppContext) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let dir = tempfile::tempdir().unwrap();
+        let (window, _daemon) = harness(cx);
+        let returned = Rc::new(Cell::new(0));
+        window
+            .update(cx, |view, window, cx| {
+                view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                parser.advance(&mut *view.terminal.term.lock(), b"ordinary");
+                view.begin_link_click(MouseButton::Left);
+                let returned = returned.clone();
+                assert!(view.defer_file_click(0, 0, window, cx, move |view, _| {
+                    assert!(!view.link_mouse_is_down());
+                    returned.set(returned.get() + 1);
+                }));
+                assert!(
+                    view.finish_link_mouse_up(),
+                    "do not send an unmatched mouse release"
+                );
+            })
+            .unwrap();
+        settle_link_opens(window, cx);
+        assert_eq!(returned.get(), 1);
+        window
+            .update(cx, |view, _, cx| {
+                view.resume_deferred_link_click(cx);
+                assert!(view.deferred_link_click.is_none());
+            })
+            .unwrap();
+        assert_eq!(returned.get(), 1);
+    }
+
+    #[gpui::test]
+    fn link_open_drag_takes_back_a_deferred_click_and_cancels_its_open(cx: &mut TestAppContext) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Makefile"), b"all:").unwrap();
+        let (window, _daemon) = harness(cx);
+        let returned = Rc::new(Cell::new(0));
+        let opened = Rc::new(Cell::new(0));
+        window
+            .update(cx, |view, window, cx| {
+                let opened = opened.clone();
+                cx.subscribe(&cx.entity(), move |_, _, _: &OpenFileRequested, _| {
+                    opened.set(opened.get() + 1)
+                })
+                .detach();
+                view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                parser.advance(&mut *view.terminal.term.lock(), b"Makefile");
+                view.begin_link_click(MouseButton::Left);
+                let returned = returned.clone();
+                assert!(view.defer_file_click(0, 0, window, cx, move |view, _| {
+                    assert!(view.link_mouse_is_down());
+                    returned.set(returned.get() + 1);
+                }));
+                view.resume_deferred_link_click(cx);
+                assert!(!view.finish_link_mouse_up());
+            })
+            .unwrap();
+        settle_link_opens(window, cx);
+        assert_eq!(returned.get(), 1);
+        assert_eq!(opened.get(), 0);
+    }
+
+    #[gpui::test]
+    fn link_menu_for_a_missing_explicit_path_is_stable_across_cache_states(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                parser.advance(&mut *view.terminal.term.lock(), b"missing.md");
+                view.record_menu_link(0, 0, cx);
+                assert_eq!(
+                    view.menu_link_path(),
+                    Some(std::path::Path::new("missing.md"))
+                );
+            })
+            .unwrap();
+        settle_link_probe(window, 0, 0, cx);
+        window
+            .update(cx, |view, _, cx| {
+                view.record_menu_link(0, 0, cx);
+                assert_eq!(
+                    view.menu_link_path(),
+                    Some(std::path::Path::new("missing.md"))
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn link_open_forwarder_panic_releases_pending_and_allows_retry(cx: &mut TestAppContext) {
+        let (window, pane, _daemon) = rooted_harness(cx);
+        window
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    bind_to_a_disconnected_remote_workspace(view, cx);
+                    view.open_url_with_forwarder(
+                        "http://localhost:3000/retry",
+                        window,
+                        cx,
+                        |_, _| panic!("injected forwarding panic"),
+                    );
+                })
+            })
+            .unwrap();
+        settle_link_entity_opens(&pane, cx);
+        window
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    assert!(view.pending_loopback_urls.is_empty());
+                    view.open_url_with_forwarder(
+                        "http://localhost:3000/retry",
+                        window,
+                        cx,
+                        |_, _| Ok(crate::daemon::protocol::LoopbackForward { local_port: 4000 }),
+                    );
+                })
+            })
+            .unwrap();
+        settle_link_entity_opens(&pane, cx);
+        assert_eq!(
+            cx.opened_url().as_deref(),
+            Some("http://127.0.0.1:4000/retry")
+        );
+    }
+
+    #[gpui::test]
+    fn link_open_revalidates_an_expired_extensionless_hit_on_the_first_click(
+        cx: &mut TestAppContext,
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Makefile");
+        std::fs::write(&path, b"all:\n").unwrap();
+        let (window, pane, _daemon) = rooted_harness(cx);
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        window
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    let seen = opened.clone();
+                    cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
+                        seen.borrow_mut().push(event.path.clone());
+                    })
+                    .detach();
+                    view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                    parser.advance(&mut *view.terminal.term.lock(), b"Makefile");
+                    view.link_probes.retarget(view.host_id);
+                    view.link_probes.land(
+                        view.link_probes.generation(),
+                        vec![(path.clone(), super::super::link_probe::Existence::File)],
+                    );
+                    view.link_probes.expire_answers_for_test();
+                    assert!(view.hover_link_at(0, 0, false, cx));
+                    assert!(view.hover_link_at(0, 0, true, cx));
+                    assert!(view.open_link_at(0, 0, window, cx));
+                    assert!(
+                        opened.borrow().is_empty(),
+                        "the click must still validate off-thread"
+                    );
+                })
+            })
+            .unwrap();
+        settle_link_entity_opens(&pane, cx);
+        assert_eq!(*opened.borrow(), vec![path.clone()]);
+
+        std::fs::remove_file(&path).unwrap();
+        window
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    view.link_probes.land(
+                        view.link_probes.generation(),
+                        vec![(path.clone(), super::super::link_probe::Existence::File)],
+                    );
+                    view.link_probes.expire_answers_for_test();
+                    assert!(view.open_link_at(0, 0, window, cx));
+                })
+            })
+            .unwrap();
+        settle_link_entity_opens(&pane, cx);
+        assert_eq!(
+            *opened.borrow(),
+            vec![path],
+            "stale evidence cannot open a deleted file"
+        );
+    }
+
+    #[gpui::test]
+    fn link_open_prose_keeps_its_click_and_menu_on_a_cold_cache(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, window, cx| {
+                view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                for text in ["3.14", "v1.2.3", "e.g.", "1.5s"] {
+                    parser.advance(
+                        &mut *view.terminal.term.lock(),
+                        format!("\x1b[2J\x1b[H{text}").as_bytes(),
+                    );
+                    assert!(!view.open_link_at(0, 0, window, cx), "{text}");
+                    assert!(view.pending_file_links.is_empty());
+                    view.record_menu_link(0, 0, cx);
+                    assert!(view.menu_link_path().is_none(), "{text}");
+                    let roots = view.link_roots(cx);
+                    let candidate =
+                        super::super::search::unresolved_candidate(text, 0, roots.style).unwrap();
+                    assert!(!view.report_unresolved_link(&candidate, &roots, window, cx));
+                }
+            })
+            .unwrap();
+        settle_link_probe(window, 0, 0, cx);
+        window
+            .update(cx, |view, window, cx| {
+                assert!(!view.open_link_at(0, 0, window, cx));
+                view.record_menu_link(0, 0, cx);
+                assert!(
+                    view.menu_link_path().is_none(),
+                    "a warm miss has the same menu"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn link_open_request_caps_keep_duplicates_but_reject_new_work(cx: &mut TestAppContext) {
+        let (window, pane, _daemon) = rooted_harness(cx);
+        cx.update_window(window.into(), |_, window, cx| {
+            pane.update(cx, |view, cx| {
+                let roots = super::super::search::LinkRoots::local(vec![std::env::temp_dir()]);
+                let request = |n| FileLinkRequest {
+                    text: format!("file-{n}.rs"),
+                    click_idx: 0,
+                    roots: roots.clone(),
+                };
+                view.pending_file_links = (0..8)
+                    .map(|n| (request(n), FileLinkAction::Open, false))
+                    .collect();
+                assert!(view.resolve_file_link(request(0), FileLinkAction::Open, window, cx));
+                assert!(!view.resolve_file_link(request(8), FileLinkAction::Open, window, cx));
+                assert_eq!(view.pending_file_links.len(), 8);
+                view.pending_file_links.clear();
+
+                bind_to_a_disconnected_remote_workspace(view, cx);
+                let plan = view.loopback_plan(cx);
+                view.pending_loopback_urls = (0..8)
+                    .map(|n| (plan.clone(), format!("http://localhost:3000/{n}")))
+                    .collect();
+                for n in [0, 8] {
+                    view.open_url_with_forwarder(
+                        &format!("http://localhost:3000/{n}"),
+                        window,
+                        cx,
+                        |_, _| panic!("no request should be scheduled"),
+                    );
+                }
+                assert_eq!(view.pending_loopback_urls.len(), 8);
+                view.pending_loopback_urls.clear();
+            })
+        })
+        .unwrap();
     }
 
     #[gpui::test]

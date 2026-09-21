@@ -520,6 +520,10 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsNewTabPositionDesc => "新打开的标签页插入的位置。",
         L10nKey::SettingsTabBarPosition => "标签栏位置",
         L10nKey::SettingsTabBarPositionDesc => "将标签页显示为顶部横向条或左侧垂直侧栏。",
+        L10nKey::SettingsTabFullPath => "标签显示目录路径",
+        L10nKey::SettingsTabFullPathDesc => {
+            "在标签栏、侧栏和切换器中显示目录路径，关闭时只显示最后一级目录。较长路径会按空间缩短，悬停可查看完整路径。自定义名称和终端标题不受影响。"
+        }
         L10nKey::SettingsSidebarGrouping => "侧栏分组",
         L10nKey::SettingsSidebarGroupingDesc => {
             "按 git 仓库给侧栏标签页分组。仓库外的标签页归到“草稿”，选“按仓库或文件夹”时则按工作目录分。仅左侧栏。"
@@ -535,7 +539,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsNotifyOnCommandFinishDesc => "较长的前台命令完成后发出桌面提醒。",
         L10nKey::SettingsAgentNotifications => "Agent 通知",
         L10nKey::SettingsAgentNotificationsDesc => {
-            "Agent 任务完成、请求权限或等待输入时发出桌面提醒。未聚焦包括切到同一窗口的其他标签页或分屏。"
+            "控制 Agent 事件和终端程序主动请求的桌面提醒。未聚焦包括切到同一窗口的其他标签页或分屏。命令完成通知单独设置。"
         }
         L10nKey::SettingsNotifyThreshold => "通知阈值",
         L10nKey::SettingsNotifyThresholdDesc => "命令需运行多久才能算作“较长”。",

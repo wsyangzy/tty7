@@ -874,9 +874,9 @@ impl RemoteTerminal {
         if let Ok(mut pending) = self.clipboard_writes.lock() {
             pending.clear();
         }
-        if let Ok(mut pending) = self.agent_notifications.lock() {
-            pending.clear();
-        }
+        // Retired readers may still be finishing a batch. Give this link its
+        // own queue so they cannot enqueue an old alert after a relink.
+        self.agent_notifications = Arc::new(Mutex::new(VecDeque::new()));
         self.clipboard_write_busy.store(false, Ordering::Release);
 
         let read_half = stream.try_clone()?;
@@ -1115,6 +1115,7 @@ impl RemoteTerminal {
     pub fn detach_link(&mut self) {
         self.link.send(ClientMsg::Detach);
         self.stop_reader();
+        self.agent_notifications = Arc::new(Mutex::new(VecDeque::new()));
         self.poll_exited();
     }
 
@@ -1264,15 +1265,14 @@ impl RemoteTerminal {
                                 }
                                 let mut notes = Vec::new();
                                 osc.feed(&out_batch, &mut notes);
-                                for (title, body) in notes {
-                                    if agent.lock().ok().is_some_and(|agent| agent.is_some()) {
-                                        // The view applies the current Agent notification
-                                        // mode and window focus before showing the alert.
-                                        if let Ok(mut pending) = agent_notifications.lock() {
-                                            pending.push_back((title, body));
+                                if let Ok(mut pending) = agent_notifications.lock() {
+                                    for note in notes {
+                                        if pending.len() == MAX_TERMINAL_NOTIFICATIONS {
+                                            pending.pop_front();
                                         }
-                                    } else {
-                                        notify_desktop(title.as_deref(), &body);
+                                        // Identity can arrive after output. Every OSC
+                                        // alert goes through the view's live policy.
+                                        pending.push_back(note);
                                     }
                                 }
                                 mode_tok.feed(&out_batch, |payload| {
@@ -1987,8 +1987,11 @@ impl RemoteTerminal {
         Ok((term, pane_id))
     }
 
-    pub fn take_agent_notification(&self) -> Option<(Option<String>, String)> {
-        self.agent_notifications.lock().ok()?.pop_front()
+    pub fn take_terminal_notifications(&self) -> Vec<(Option<String>, String)> {
+        self.agent_notifications
+            .lock()
+            .map(|mut pending| pending.drain(..).collect())
+            .unwrap_or_default()
     }
 
     pub fn take_auth_prompt(&self) -> Option<(u64, AuthPromptKind)> {
@@ -2589,9 +2592,10 @@ pub(crate) fn notify_desktop_for_pane(title: Option<&str>, body: &str, pane: Opt
 /// ugly way, and on Windows a stray `ESC` makes the toast XML fail to parse and
 /// the whole notification disappear — so clamp both here, once, for all paths.
 const NOTIFY_TITLE_MAX: usize = 96;
-const NOTIFY_BODY_MAX: usize = 512;
+pub(super) const NOTIFY_BODY_MAX: usize = 512;
+pub(super) const MAX_TERMINAL_NOTIFICATIONS: usize = 32;
 
-fn sanitize_notification_text(s: &str, max_chars: usize) -> String {
+pub(super) fn sanitize_notification_text(s: &str, max_chars: usize) -> String {
     let mut out = String::new();
     let mut taken = 0usize;
     for ch in s.chars() {
@@ -3012,6 +3016,9 @@ impl OscNotifyScanner {
     fn feed(&mut self, bytes: &[u8], out: &mut Vec<(Option<String>, String)>) {
         self.tok.feed(bytes, |payload| {
             if let Some(note) = parse_osc_notification(payload) {
+                if out.len() == MAX_TERMINAL_NOTIFICATIONS {
+                    out.remove(0);
+                }
                 out.push(note);
             }
         });
@@ -3026,7 +3033,10 @@ fn parse_osc_notification(payload: &[u8]) -> Option<(Option<String>, String)> {
     if title.as_deref() == Some(crate::core::cli_agent::AGENT_EVENT_SENTINEL) {
         return None;
     }
-    Some((title, body))
+    Some((
+        title.map(|title| sanitize_notification_text(&title, NOTIFY_TITLE_MAX)),
+        sanitize_notification_text(&body, NOTIFY_BODY_MAX),
+    ))
 }
 
 fn connect() -> anyhow::Result<Stream> {
@@ -3240,9 +3250,7 @@ mod replay_tests {
 
             let mut notes = Vec::new();
             for _ in 0..200 {
-                while let Some(note) = term.take_agent_notification() {
-                    notes.push(note);
-                }
+                notes.extend(term.take_terminal_notifications());
                 if notes.len() == 2 {
                     break;
                 }
@@ -3257,7 +3265,99 @@ mod replay_tests {
                 "{} notifications must follow the view policy",
                 agent.display_name(),
             );
-            assert_eq!(term.take_agent_notification(), None);
+            assert!(term.take_terminal_notifications().is_empty());
+        }
+    }
+
+    #[test]
+    fn terminal_notifications_bound_unknown_output_and_isolate_relinks() {
+        use std::io::Write as _;
+
+        crate::core::config::pin_test_config_dir();
+        let (client, mut daemon) = socket_pair();
+        let mut term = RemoteTerminal::from_stream(client, TermSize::new(80, 24)).unwrap();
+        // OSC precedes the first Agent frame. That frame flushes output before
+        // setting identity, so these must still be queued rather than displayed.
+        let output: String = (0..MAX_TERMINAL_NOTIFICATIONS * 2)
+            .map(|n| format!("\x1b]9;notice {n}\x07"))
+            .collect();
+        DaemonMsg::Output(output.into_bytes())
+            .encode(&mut daemon)
+            .unwrap();
+        DaemonMsg::Agent(Some(CLIAgent::Codex))
+            .encode(&mut daemon)
+            .unwrap();
+        daemon.flush().unwrap();
+        for _ in 0..200 {
+            if term.foreground_agent() == Some(CLIAgent::Codex) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(term.foreground_agent(), Some(CLIAgent::Codex));
+        let notes = term.take_terminal_notifications();
+        assert_eq!(notes.len(), MAX_TERMINAL_NOTIFICATIONS);
+        assert_eq!(notes[0].1, format!("notice {}", MAX_TERMINAL_NOTIFICATIONS));
+        assert_eq!(
+            notes.last().unwrap().1,
+            format!("notice {}", MAX_TERMINAL_NOTIFICATIONS * 2 - 1)
+        );
+
+        let retired_queue = term.agent_notifications.clone();
+        retired_queue
+            .lock()
+            .unwrap()
+            .push_back((None, "old approval".into()));
+        let (new_client, mut new_daemon) = socket_pair();
+        term.adopt_relink(
+            new_client,
+            Vec::new(),
+            &PaneRoute::Local,
+            TermSize::new(80, 24),
+            8,
+            16,
+        )
+        .unwrap();
+        // A retiring reader can finish after the swap without polluting it.
+        retired_queue
+            .lock()
+            .unwrap()
+            .push_back((None, "late old approval".into()));
+        assert!(term.take_terminal_notifications().is_empty());
+        DaemonMsg::Snapshot(b"\x1b]9;replayed approval\x07".to_vec())
+            .encode(&mut new_daemon)
+            .unwrap();
+        DaemonMsg::Output(b"\x1b]9;new approval\x07".to_vec())
+            .encode(&mut new_daemon)
+            .unwrap();
+        new_daemon.flush().unwrap();
+        let mut notes = Vec::new();
+        for _ in 0..200 {
+            notes.extend(term.take_terminal_notifications());
+            if !notes.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(notes, vec![(None, "new approval".into())]);
+    }
+
+    #[test]
+    fn terminal_notification_scanning_bounds_batch_and_text() {
+        let mut scanner = OscNotifyScanner::default();
+        let mut notes = Vec::new();
+        let title = "界".repeat(NOTIFY_TITLE_MAX * 2);
+        let body = "文".repeat(NOTIFY_BODY_MAX * 2);
+        for _ in 0..MAX_TERMINAL_NOTIFICATIONS * 2 {
+            scanner.feed(
+                format!("\x1b]777;notify;{title};{body}\x07").as_bytes(),
+                &mut notes,
+            );
+        }
+        assert_eq!(notes.len(), MAX_TERMINAL_NOTIFICATIONS);
+        for (title, body) in notes {
+            assert_eq!(title.unwrap().chars().count(), NOTIFY_TITLE_MAX + 1);
+            assert_eq!(body.chars().count(), NOTIFY_BODY_MAX + 1);
         }
     }
 

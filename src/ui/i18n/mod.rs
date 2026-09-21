@@ -475,6 +475,8 @@ l10n_keys! {
     SettingsNewTabPositionDesc,
     SettingsTabBarPosition,
     SettingsTabBarPositionDesc,
+    SettingsTabFullPath,
+    SettingsTabFullPathDesc,
     SettingsSidebarGrouping,
     SettingsSidebarGroupingDesc,
     SettingsDiffPreviewFromCounts,
