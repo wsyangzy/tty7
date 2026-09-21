@@ -12,9 +12,9 @@
 //! spinner tick, which reads as a second cursor blinking in the wrong place.
 //!
 //! [`ParkedCursorScanner`] finds those hide/show pairs in the byte stream and
-//! [`ParkedCursorRepair`] restores the cell the cursor stood on when it went
-//! invisible, which is the cell the correcting frame would have moved it back
-//! to anyway.
+//! [`ParkedCursorRepair`] remembers that cell for painting only. The parser's
+//! cursor must stay where the stream left it: subsequent text, wrapping and
+//! cursor-position replies all depend on it, including an agent's exit output.
 //!
 //! Only conhost parks a cursor, so the reader runs this for panes on a ConPTY
 //! alone — see [`crate::terminal::remote::PtySource`], which answers that per
@@ -34,6 +34,8 @@ use alacritty_terminal::term::Term;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorCut {
+    /// Output or a screen switch invalidated the previous painting hint.
+    Reset,
     /// `ESC [ ? 25 l` — the cursor went invisible at this offset.
     Hidden,
     /// `ESC [ ? 25 h` — the cursor came back. `parked` marks the show as one
@@ -100,10 +102,16 @@ impl ParkedCursorScanner {
                     // Plain text to the end of the batch: it wrote cells, so
                     // the run no longer ends on a move.
                     self.last_was_move = false;
+                    if !self.hidden {
+                        on_cut(bytes.len(), CursorCut::Reset);
+                    }
                     return;
                 };
                 if off > 0 {
                     self.last_was_move = false;
+                    if !self.hidden {
+                        on_cut(i + off, CursorCut::Reset);
+                    }
                 }
                 self.state = State::Esc;
                 i += off + 1;
@@ -125,6 +133,10 @@ impl ParkedCursorScanner {
                     // repair we skip.
                     _ => {
                         self.last_was_move = true;
+                        if !self.hidden || b == b'c' {
+                            self.hidden = false;
+                            on_cut(i + 1, CursorCut::Reset);
+                        }
                         self.state = State::Text;
                     }
                 },
@@ -156,6 +168,15 @@ impl ParkedCursorScanner {
 
     fn finish_csi(&mut self, final_byte: u8, at: usize, on_cut: &mut impl FnMut(usize, CursorCut)) {
         if self.csi.first() == Some(&b'?') {
+            if matches!(final_byte, b'h' | b'l')
+                && self.csi[1..]
+                    .split(|b| *b == b';')
+                    .any(|mode| matches!(mode, b"47" | b"1047" | b"1049"))
+            {
+                self.hidden = false;
+                on_cut(at + 1, CursorCut::Reset);
+                return;
+            }
             if self.csi == b"?25" {
                 match final_byte {
                     b'l' => {
@@ -181,19 +202,21 @@ impl ParkedCursorScanner {
         } else if !NEUTRAL.contains(&final_byte) {
             self.last_was_move = false;
         }
+        if !self.hidden && !NEUTRAL.contains(&final_byte) {
+            on_cut(at + 1, CursorCut::Reset);
+        }
     }
 }
 
-/// The other half: keeps the cell the cursor was hidden on, and restores it
-/// when the matching show turns out to be parked.
+/// A painting hint, never a mutation of the terminal's parsing cursor.
 #[derive(Default)]
 pub struct ParkedCursorRepair {
     hidden: Option<Hidden>,
+    displayed: Option<Point>,
 }
 
 struct Hidden {
     point: Point,
-    input_needs_wrap: bool,
     at: Instant,
 }
 
@@ -202,6 +225,11 @@ impl ParkedCursorRepair {
     /// drops its run.
     pub fn reset(&mut self) {
         self.hidden = None;
+        self.displayed = None;
+    }
+
+    pub fn point(&self) -> Option<Point> {
+        self.displayed
     }
 
     /// A hide and a show further apart than this are an application keeping the
@@ -209,13 +237,13 @@ impl ParkedCursorRepair {
     /// frame — whatever it shows the cursor on is its own choice and stands.
     const FRAME: Duration = Duration::from_millis(100);
 
-    pub fn apply<T: EventListener>(&mut self, term: &mut Term<T>, cut: CursorCut) {
+    pub fn apply<T: EventListener>(&mut self, term: &Term<T>, cut: CursorCut) {
         match cut {
+            CursorCut::Reset => self.reset(),
             CursorCut::Hidden => {
                 let cursor = &term.grid().cursor;
                 let hidden = Hidden {
-                    point: cursor.point,
-                    input_needs_wrap: cursor.input_needs_wrap,
+                    point: self.displayed.take().unwrap_or(cursor.point),
                     at: Instant::now(),
                 };
                 // A second hide while already hidden changes nothing: the cell
@@ -223,21 +251,21 @@ impl ParkedCursorRepair {
                 self.hidden.get_or_insert(hidden);
             }
             CursorCut::Shown { parked } => {
+                self.displayed = None;
                 let Some(hidden) = self.hidden.take() else {
                     return;
                 };
                 if !parked || hidden.at.elapsed() > Self::FRAME {
                     return;
                 }
-                let grid = term.grid_mut();
+                let grid = term.grid();
                 let line = hidden
                     .point
                     .line
                     .0
                     .clamp(0, grid.screen_lines().saturating_sub(1) as i32);
                 let column = hidden.point.column.0.min(grid.columns().saturating_sub(1));
-                grid.cursor.point = Point::new(Line(line), Column(column));
-                grid.cursor.input_needs_wrap = hidden.input_needs_wrap;
+                self.displayed = Some(Point::new(Line(line), Column(column)));
             }
         }
     }
@@ -251,7 +279,7 @@ mod tests {
 
     /// Drives a stream through the emulator the way the pty reader does —
     /// advance to each cut, act on it, carry on — and reports the cell the
-    /// cursor ends on.
+    /// painted cursor ends on. The parsing cursor is left untouched.
     fn cursor_after(stream: &[u8]) -> (i32, usize) {
         let mut term = Term::new(
             alacritty_terminal::term::Config::default(),
@@ -268,10 +296,10 @@ mod tests {
         for (off, cut) in cuts {
             parser.advance(&mut term, &stream[at..off]);
             at = off;
-            repair.apply(&mut term, cut);
+            repair.apply(&term, cut);
         }
         parser.advance(&mut term, &stream[at..]);
-        let point = term.grid().cursor.point;
+        let point = repair.point().unwrap_or(term.grid().cursor.point);
         (point.line.0, point.column.0)
     }
 
@@ -304,6 +332,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn consecutive_repaints_keep_the_painted_cursor_until_real_output_moves_it() {
+        let repaint = b"\x1b[?25l\x1b[20;2H\x1b[K\x1b[?25h";
+        let mut stream = b"\x1b[6;4H".to_vec();
+        stream.extend_from_slice(repaint);
+        stream.extend_from_slice(repaint);
+        assert_eq!(cursor_after(&stream), (5, 3));
+        stream.extend_from_slice(b"\r\nprompt> ");
+        assert_eq!(cursor_after(&stream), (20, 8));
+    }
+
+    #[test]
+    fn exit_output_wrap_and_cursor_replies_match_the_unmodified_stream() {
+        use alacritty_terminal::event::Event;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Replies(Arc<Mutex<Vec<String>>>);
+
+        impl EventListener for Replies {
+            fn send_event(&self, event: Event) {
+                if let Event::PtyWrite(reply) = event {
+                    self.0.lock().unwrap().push(reply);
+                }
+            }
+        }
+
+        let streams: &[&[u8]] = &[
+            b"\x1b[6;4H\x1b[?25l\x1b[12;1HSession: sid\x1b[?25h\x1b[6n\r\nResume: agent resume sid\r\nprompt> ",
+            b"\x1b[6;4H\x1b[?25l\x1b[12;79Hxy\x1b[?25hZ\x1b[6n\r\nprompt> ",
+            b"\x1b[3;1H\x1b[?1049h\x1b[6;4H\x1b[?25l\x1b[12;1Hexiting\x1b[?1049l\x1b[?25hSession: sid\r\nprompt> ",
+        ];
+        let size = crate::terminal::size::TermSize::new(80, 24);
+        for stream in streams {
+            for chunk_size in [1, 2, 7, stream.len()] {
+                let actual_replies = Replies::default();
+                let expected_replies = Replies::default();
+                let mut actual = Term::new(Default::default(), &size, actual_replies.clone());
+                let mut expected = Term::new(Default::default(), &size, expected_replies.clone());
+                let mut parser: Processor = Processor::new();
+                let mut reference: Processor = Processor::new();
+                let mut scanner = ParkedCursorScanner::new();
+                let mut repair = ParkedCursorRepair::default();
+                for chunk in stream.chunks(chunk_size) {
+                    reference.advance(&mut expected, chunk);
+                    let mut at = 0;
+                    scanner.feed(chunk, |off, cut| {
+                        parser.advance(&mut actual, &chunk[at..off]);
+                        repair.apply(&actual, cut);
+                        at = off;
+                    });
+                    parser.advance(&mut actual, &chunk[at..]);
+                    assert_eq!(actual.grid().cursor.point, expected.grid().cursor.point);
+                    assert_eq!(
+                        actual.grid().cursor.input_needs_wrap,
+                        expected.grid().cursor.input_needs_wrap
+                    );
+                }
+                for line in 0..24 {
+                    for column in 0..80 {
+                        let point = Point::new(Line(line), Column(column));
+                        assert_eq!(actual.grid()[point], expected.grid()[point]);
+                    }
+                }
+                assert_eq!(
+                    *actual_replies.0.lock().unwrap(),
+                    *expected_replies.0.lock().unwrap()
+                );
+                assert!(repair.point().is_none(), "shell text retires the hint");
+            }
+        }
+    }
+
     fn cuts(stream: &[&[u8]]) -> Vec<CursorCut> {
         let mut scanner = ParkedCursorScanner::new();
         let mut got = Vec::new();
@@ -328,6 +429,7 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                (2, CursorCut::Reset),
                 (8, CursorCut::Hidden),
                 (16, CursorCut::Shown { parked: false })
             ],
@@ -399,8 +501,16 @@ mod tests {
     #[test]
     fn an_unrelated_private_mode_is_not_a_visibility_change() {
         assert!(
-            cuts(&[b"\x1b[?2026h\x1b[?1049l"]).is_empty(),
+            cuts(&[b"\x1b[?2026h"]).is_empty(),
             "only ?25 says anything about the cursor"
         );
+    }
+
+    #[test]
+    fn screen_switches_discard_the_previous_cursor_hint() {
+        for mode in ["47", "1047", "1049"] {
+            let stream = format!("\x1b[?25l\x1b[20;2H\x1b[K\x1b[?{mode}l\x1b[?25h");
+            assert_eq!(shown(&[stream.as_bytes()]), Some(false));
+        }
     }
 }

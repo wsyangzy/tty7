@@ -601,7 +601,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsTabFullPath => "タブ名にディレクトリパスを表示",
         L10nKey::SettingsTabFullPathDesc => {
-            "タブバー、サイドバー、切り替え画面で末尾のフォルダー名の代わりにパスを表示します。長いパスは省略され、ホバーで全体を確認できます。独自の名前と端末タイトルは変わりません。"
+            "タブバー、サイドバー、切り替え画面で末尾のフォルダー名の代わりにパスを表示します。長いパスは省略され、ホバーで全体を確認できます。独自の名前とパス以外の端末タイトルは変わりません。"
         }
         L10nKey::SettingsSidebarGrouping => "サイドバーのグループ化",
         L10nKey::SettingsSidebarGroupingDesc => {

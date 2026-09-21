@@ -592,7 +592,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsTabFullPath => "Show paths in tab labels",
         L10nKey::SettingsTabFullPathDesc => {
-            "Show the directory path instead of its last folder name in the tab bar, sidebar and switcher. Long paths shorten to fit; hover shows the full path. Custom names and terminal titles keep their own text."
+            "Show the directory path instead of its last folder name in the tab bar, sidebar and switcher. Long paths shorten to fit; hover shows the full path. Custom names and non-path terminal titles keep their own text."
         }
         L10nKey::SettingsSidebarGrouping => "Sidebar grouping",
         L10nKey::SettingsSidebarGroupingDesc => {
