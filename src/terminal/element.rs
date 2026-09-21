@@ -1694,7 +1694,11 @@ impl TerminalElement {
             history_size = term.grid().history_size();
             let selection = content.selection;
 
-            let cur = content.cursor;
+            let cur = self
+                .view
+                .read(cx)
+                .terminal
+                .display_cursor(&term, content.cursor);
             let cursor_row = cur.point.line.0 + display_offset;
             let cursor_hidden = matches!(cur.shape, CursorShape::Hidden);
             // TUIs that hide the hardware cursor (Kimi CLI, Ink apps) draw

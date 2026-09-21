@@ -173,6 +173,24 @@ pub(crate) fn cwd_label(raw: &str, home: Option<&std::path::Path>, full_path: bo
     crate::ui::path_display::split_path_leaf(path).1
 }
 
+/// Shell integrations also report directories as OSC titles. Apply the path
+/// setting to those titles without cutting program titles such as `vim src/main.rs`.
+pub(crate) fn osc_label(raw: &str, home: Option<&std::path::Path>, full_path: bool) -> String {
+    let title = strip_host_prefix(raw.trim());
+    let is_path = title.starts_with(['/', '\\'])
+        || title.starts_with("~/")
+        || title.starts_with("~\\")
+        || (title.len() >= 3
+            && title.as_bytes()[0].is_ascii_alphabetic()
+            && title.as_bytes()[1] == b':'
+            && matches!(title.as_bytes()[2], b'/' | b'\\'));
+    if !full_path && is_path {
+        cwd_label(title, home, false)
+    } else {
+        abbreviate_home(title, home).into_owned()
+    }
+}
+
 /// The one place a tab gets its displayed name, whichever surface is asking.
 ///
 /// `label()` prefers custom names, then the project directory for agents or
@@ -219,11 +237,7 @@ pub(crate) fn label_of(
     };
     match view.label() {
         TabLabel::Named(name) => name.to_string(),
-        // Through `short_title` because a title is so often a path: the shell
-        // integration writes `user@host:~/dir`, and a tab spelling that out in
-        // full where the one beside it says "…/dir" would be the same
-        // disagreement in a new place.
-        TabLabel::Osc(title) => shortened(title),
+        TabLabel::Osc(title) => shortened(&osc_label(title, home, full_path)),
         TabLabel::Agent(agent) => agent.display_name().to_string(),
         TabLabel::Cwd(cwd) if full_path => shortened(cwd),
         TabLabel::Cwd(cwd) => cwd_label(cwd, home, false),
@@ -3312,6 +3326,57 @@ mod tests {
         root.cwd = Some(r"\\server\share".into());
         assert_eq!(label_of(&root, 0, None, true), r"\\server\share");
         assert_eq!(tooltip_of(&root, 0, None, true), None);
+    }
+
+    #[test]
+    fn directory_labels_in_shell_titles_follow_the_path_setting() {
+        let mut tab = strip_tab();
+        tab.cwd = Some("/different/cwd".into());
+        for (title, folder) in [
+            ("D:/workspace/code/backend/tty7", "tty7"),
+            ("user@host:D:/workspace/code/backend/tty7/", "tty7"),
+            (r"D:\workspace\code\backend\tty7\", "tty7"),
+            (r"user@host:D:\workspace\code\backend\tty7", "tty7"),
+            ("user@host: /work/tty7/", "tty7"),
+            ("user@host:~/work/tty7", "tty7"),
+            (r"~\work\tty7", "tty7"),
+            ("/Users/x/work/my project/", "my project"),
+            (r"\\server\share\项目\", "项目"),
+            ("/", "/"),
+            ("D:/", "D:/"),
+            (r"D:\", r"D:\"),
+            ("~", "~"),
+        ] {
+            tab.osc_title = Some(title.into());
+            assert_eq!(super::osc_label(title, Some(home()), false), folder);
+            assert_eq!(label_of(&tab, 0, Some(home()), false), folder);
+            let full = super::abbreviate_home(super::strip_host_prefix(title), Some(home()));
+            assert_eq!(super::osc_label(title, Some(home()), true), full);
+            assert_eq!(
+                label_of(&tab, 0, Some(home()), true),
+                super::short_title(title, Some(home()))
+            );
+            let tooltip = super::abbreviate_home(title, Some(home()));
+            assert_eq!(
+                tooltip_of(&tab, 0, Some(home()), false).as_deref(),
+                (tooltip != folder).then_some(tooltip.as_ref())
+            );
+        }
+        for title in [
+            "build status",
+            "vim src/main.rs",
+            "https://example.com/app",
+            "deploy@host:2222",
+        ] {
+            tab.osc_title = Some(title.into());
+            assert_eq!(super::osc_label(title, Some(home()), false), title);
+            assert_eq!(
+                label_of(&tab, 0, Some(home()), false),
+                label_of(&tab, 0, Some(home()), true)
+            );
+        }
+        tab.name = Some("D:/custom/tab/name".into());
+        assert_eq!(label_of(&tab, 0, None, false), "D:/custom/tab/name");
     }
 
     #[test]

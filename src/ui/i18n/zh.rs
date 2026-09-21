@@ -522,7 +522,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsTabBarPositionDesc => "将标签页显示为顶部横向条或左侧垂直侧栏。",
         L10nKey::SettingsTabFullPath => "标签显示目录路径",
         L10nKey::SettingsTabFullPathDesc => {
-            "在标签栏、侧栏和切换器中显示目录路径，关闭时只显示最后一级目录。较长路径会按空间缩短，悬停可查看完整路径。自定义名称和终端标题不受影响。"
+            "在标签栏、侧栏和切换器中显示目录路径，关闭时只显示最后一级目录。较长路径会按空间缩短，悬停可查看完整路径。自定义名称和非路径终端标题不受影响。"
         }
         L10nKey::SettingsSidebarGrouping => "侧栏分组",
         L10nKey::SettingsSidebarGroupingDesc => {

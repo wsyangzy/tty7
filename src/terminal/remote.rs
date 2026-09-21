@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, RenderableCursor, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, CursorShape, CursorStyle};
 
 use crate::terminal::parked_cursor::{CursorCut, ParkedCursorRepair, ParkedCursorScanner};
@@ -84,6 +84,7 @@ struct AgentSlot {
 }
 
 struct ReaderSignals {
+    cursor_repair: Arc<Mutex<ParkedCursorRepair>>,
     cwd: Arc<Mutex<Option<PathBuf>>>,
     shell: Arc<Mutex<ShellState>>,
     remote: Arc<Mutex<Option<RemoteContext>>>,
@@ -548,6 +549,8 @@ fn send_loop(
 
 pub struct RemoteTerminal {
     pub term: Arc<FairMutex<Term<EventProxy>>>,
+    // Read only while holding `term`, so the hint and rendered grid agree.
+    cursor_repair: Arc<Mutex<ParkedCursorRepair>>,
     pub events: smol::channel::Receiver<AlacEvent>,
     pub palette: [alacritty_terminal::vte::ansi::Rgb; 256],
     pub exited: bool,
@@ -877,6 +880,7 @@ impl RemoteTerminal {
         // Retired readers may still be finishing a batch. Give this link its
         // own queue so they cannot enqueue an old alert after a relink.
         self.agent_notifications = Arc::new(Mutex::new(VecDeque::new()));
+        self.cursor_repair = Arc::new(Mutex::new(ParkedCursorRepair::default()));
         self.clipboard_write_busy.store(false, Ordering::Release);
 
         let read_half = stream.try_clone()?;
@@ -912,6 +916,7 @@ impl RemoteTerminal {
             buffered,
             quit.clone(),
             ReaderSignals {
+                cursor_repair: self.cursor_repair.clone(),
                 cwd: self.cwd.clone(),
                 shell: self.shell_state.clone(),
                 remote: self.remote_context.clone(),
@@ -1011,6 +1016,7 @@ impl RemoteTerminal {
         let config = terminal_config_from_user(&user_config);
         let term = Term::new(config, &size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
+        let cursor_repair = Arc::new(Mutex::new(ParkedCursorRepair::default()));
 
         let cwd: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
         let shell_state: Arc<Mutex<ShellState>> = Arc::new(Mutex::new(ShellState::default()));
@@ -1039,6 +1045,7 @@ impl RemoteTerminal {
             buffered,
             reader_quit.clone(),
             ReaderSignals {
+                cursor_repair: cursor_repair.clone(),
                 cwd: cwd.clone(),
                 shell: shell_state.clone(),
                 remote: remote_context.clone(),
@@ -1067,6 +1074,7 @@ impl RemoteTerminal {
 
         Ok(Self {
             term,
+            cursor_repair,
             events: rx,
             palette: super::palette::build(),
             exited: false,
@@ -1153,6 +1161,7 @@ impl RemoteTerminal {
             .name("tty7-remote-reader".to_string())
             .spawn(move || {
                 let ReaderSignals {
+                    cursor_repair,
                     cwd,
                     shell,
                     remote,
@@ -1180,7 +1189,6 @@ impl RemoteTerminal {
                 let mut mode_tok = OscTokenizer::new(&[b"133"]);
                 let mut zle_tok = OscTokenizer::new(&[b"133"]);
                 let mut cursor_scan = ParkedCursorScanner::new();
-                let mut parked_cursor = ParkedCursorRepair::default();
                 let mut pending: Vec<u8> = buffered;
                 // Kitty-graphics decode runs on its own thread with newest-frame
                 // coalescing (issue #213): inflating a full-window browser frame
@@ -1250,11 +1258,12 @@ impl RemoteTerminal {
                                     if cuts.is_empty() {
                                         processor.advance(&mut *term, &out_batch);
                                     } else {
+                                        let mut parked_cursor = cursor_repair.lock().unwrap();
                                         let mut at = 0usize;
                                         for (off, cut) in cuts {
                                             processor.advance(&mut *term, &out_batch[at..off]);
                                             at = off;
-                                            parked_cursor.apply(&mut term, cut);
+                                            parked_cursor.apply(&term, cut);
                                         }
                                         processor.advance(&mut *term, &out_batch[at..]);
                                     }
@@ -1364,6 +1373,7 @@ impl RemoteTerminal {
                             // this frame must be parsed into the old grid.
                             DaemonMsg::Size(ws) => {
                                 flush_batch!();
+                                cursor_scan.reset();
                                 {
                                     let mut term = term.lock();
                                     if quit.load(Ordering::SeqCst) {
@@ -1373,19 +1383,20 @@ impl RemoteTerminal {
                                         ws.cols as usize,
                                         ws.rows as usize,
                                     ));
+                                    cursor_repair.lock().unwrap().reset();
                                 }
                                 proxy.send_event(AlacEvent::Wakeup);
                             }
                             DaemonMsg::Snapshot(bytes) => {
                                 flush_batch!();
                                 cursor_scan.reset();
-                                parked_cursor.reset();
                                 proxy.replaying.store(true, Ordering::Relaxed);
                                 {
                                     let mut term = term.lock();
                                     if quit.load(Ordering::SeqCst) {
                                         return;
                                     }
+                                    cursor_repair.lock().unwrap().reset();
                                     processor.advance(&mut *term, &bytes);
                                     if processor.sync_timeout().sync_timeout().is_some() {
                                         processor.stop_sync(&mut *term);
@@ -1532,14 +1543,28 @@ impl RemoteTerminal {
                                     };
                                 }
                                 if active && at_prompt {
+                                    cursor_scan.reset();
                                     let mut term = term.lock();
                                     if quit.load(Ordering::SeqCst) {
                                         return;
                                     }
+                                    let had_hint = {
+                                        let mut repair = cursor_repair.lock().unwrap();
+                                        let had_hint = repair.point().is_some();
+                                        repair.reset();
+                                        had_hint
+                                    };
                                     let resets = stale_mode_resets(*term.mode());
                                     if !resets.is_empty() {
-                                        processor.advance(&mut *term, &resets);
-                                        drop(term);
+                                        // A Prompt frame can follow a PTY read ending
+                                        // midway through an escape sequence. Injecting
+                                        // our reset into that parser would discard it.
+                                        let mut reset_processor: ansi::Processor =
+                                            ansi::Processor::new();
+                                        reset_processor.advance(&mut *term, &resets);
+                                    }
+                                    drop(term);
+                                    if had_hint || !resets.is_empty() {
                                         proxy.send_event(AlacEvent::Wakeup);
                                     }
                                 }
@@ -1566,6 +1591,8 @@ impl RemoteTerminal {
                                     .is_some_and(|c| c.kind == RemoteKind::NativeSsh)
                                 {
                                     local_conpty.store(false, Ordering::Relaxed);
+                                    cursor_scan.reset();
+                                    cursor_repair.lock().unwrap().reset();
                                 }
                                 if let Ok(mut guard) = remote.lock() {
                                     *guard = ctx;
@@ -1762,11 +1789,39 @@ impl RemoteTerminal {
         self.size = size;
         self.synced_cell = cell;
         if !echoed {
-            self.term.lock().resize(size);
+            let mut term = self.term.lock();
+            term.resize(size);
+            self.cursor_repair.lock().unwrap().reset();
         }
 
         let win = win_size(size, cell_w, cell_h);
         self.link.send(ClientMsg::Resize(win));
+    }
+
+    /// Correct only the painted caret. Output, queries, image anchors and the
+    /// shell editor must continue to use the cursor the PTY stream established.
+    pub(super) fn display_cursor(
+        &self,
+        term: &Term<EventProxy>,
+        mut cursor: RenderableCursor,
+    ) -> RenderableCursor {
+        use alacritty_terminal::grid::Dimensions as _;
+        use alacritty_terminal::term::cell::Flags;
+
+        if term.mode().contains(TermMode::VI) || matches!(cursor.shape, CursorShape::Hidden) {
+            return cursor;
+        }
+        if let Some(mut point) = self.cursor_repair.lock().unwrap().point()
+            && point.line.0 >= 0
+            && (point.line.0 as usize) < term.screen_lines()
+            && point.column.0 < term.columns()
+        {
+            if point.column.0 > 0 && term.grid()[point].flags.contains(Flags::WIDE_CHAR_SPACER) {
+                point.column.0 -= 1;
+            }
+            cursor.point = point;
+        }
+        cursor
     }
 
     pub fn foreground_cwd(&self) -> Option<PathBuf> {
@@ -4294,7 +4349,7 @@ mod parked_cursor_tests {
         (term, daemon_side)
     }
 
-    /// Feeds one conhost-shaped repaint and reports the cell the cursor ends on,
+    /// Feeds one conhost-shaped repaint and reports the painted cursor cell,
     /// waiting for the `X` the frame paints so the reader is known to be done.
     fn cursor_after_conpty_frame(pty: PtySource, frame: &[u8]) -> (i32, usize) {
         let (term, mut daemon_side) = terminal_on(pty, TermSize::new(80, 24));
@@ -4315,7 +4370,7 @@ mod parked_cursor_tests {
                     [alacritty_terminal::index::Column(1)]
                 .c;
                 if painted == 'X' {
-                    let point = t.grid().cursor.point;
+                    let point = term.display_cursor(&t, t.renderable_content().cursor).point;
                     return (point.line.0, point.column.0);
                 }
             }
@@ -4394,6 +4449,117 @@ mod parked_cursor_tests {
             (8, 8),
             "the frame painted the cursor somewhere on purpose"
         );
+    }
+
+    #[test]
+    fn exit_output_and_prompt_keep_their_stream_positions_on_every_pty() {
+        use alacritty_terminal::index::{Column, Line};
+
+        for pty in [PtySource::LocalConpty, PtySource::Raw] {
+            for exit_text in ["Session ID: sid", "Resume: agent resume sid", ""] {
+                let (term, mut daemon) = terminal_on(pty, TermSize::new(80, 24));
+                let frame = format!("\x1b[6;4H\x1b[?25l\x1b[12;1H{exit_text}\x1b[K\x1b[?25h");
+                DaemonMsg::Output(frame.into_bytes())
+                    .encode(&mut daemon)
+                    .unwrap();
+                DaemonMsg::Output(b"\r\nprompt> \x1b[6n".to_vec())
+                    .encode(&mut daemon)
+                    .unwrap();
+                DaemonMsg::Prompt {
+                    active: true,
+                    at_prompt: true,
+                    last_exit: Some(130),
+                }
+                .encode(&mut daemon)
+                .unwrap();
+                daemon.flush().unwrap();
+
+                for _ in 0..600 {
+                    if term.at_prompt() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(term.at_prompt(), "the exit never reached the shell prompt");
+                let t = term.term.lock();
+                let row = |line| {
+                    (0..80)
+                        .map(|column| t.grid()[Line(line)][Column(column)].c)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                };
+                assert_eq!(row(11), exit_text, "the program's exit output is intact");
+                assert_eq!(row(12), "prompt>", "the prompt starts at column zero");
+                assert_eq!(
+                    (0..24)
+                        .filter(|line| row(*line).contains("prompt>"))
+                        .count(),
+                    1,
+                    "no duplicate prompt was introduced"
+                );
+                let cursor = t.grid().cursor.point;
+                assert_eq!((cursor.line.0, cursor.column.0), (12, 8));
+                assert_eq!(
+                    term.display_cursor(&t, t.renderable_content().cursor).point,
+                    cursor
+                );
+                let replies: Vec<_> = std::iter::from_fn(|| term.events.try_recv().ok())
+                    .filter_map(|event| match event {
+                        AlacEvent::PtyWrite(reply) => Some(reply),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(replies, ["\x1b[13;9R"]);
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_mode_reset_preserves_a_split_output_sequence() {
+        use alacritty_terminal::index::{Column, Line};
+
+        let (term, mut daemon) = terminal_on(PtySource::LocalConpty, TermSize::new(80, 24));
+        DaemonMsg::Output(b"\x1b[?25l\x1b[12;".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: Some(130),
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        DaemonMsg::Output(b"1HSession: sid\r\nprompt> \x1b[6n".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: Some(0),
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        daemon.flush().unwrap();
+
+        for _ in 0..600 {
+            if term.shell_state.lock().unwrap().seq >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(term.shell_state.lock().unwrap().seq, 2);
+        let t = term.term.lock();
+        let row = |line| {
+            (0..80)
+                .map(|column| t.grid()[Line(line)][Column(column)].c)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(row(11), "Session: sid");
+        assert_eq!(row(12), "prompt>");
+        assert_eq!(t.grid().cursor.point.line.0, 12);
     }
 
     /// Vim opens its command line with exactly the shape the parked-cursor

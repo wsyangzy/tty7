@@ -34,8 +34,10 @@ mod blocking {
     struct Inner {
         state: Mutex<State>,
         wake: Condvar,
-        links: Mutex<HashMap<HostId, LinkCount>>,
     }
+
+    #[derive(Clone, Default)]
+    pub(super) struct LinkCapacity(Arc<Mutex<HashMap<HostId, LinkCount>>>);
 
     #[derive(Default)]
     struct LinkCount {
@@ -58,7 +60,6 @@ mod blocking {
                     idle: 0,
                 }),
                 wake: Condvar::new(),
-                links: Mutex::new(HashMap::new()),
             }
         }
     }
@@ -83,14 +84,14 @@ mod blocking {
     // A timed-out UI wait does not stop a filesystem syscall. Keep its slot
     // until the queued closure is discarded or the running closure exits.
     pub(super) struct LinkPermit {
-        inner: Arc<Inner>,
+        capacity: LinkCapacity,
         host: HostId,
         background: bool,
     }
 
-    impl LinkPermit {
-        fn acquire(inner: &Arc<Inner>, host: HostId, background: bool) -> io::Result<Self> {
-            let mut links = inner.links.lock().unwrap_or_else(|e| e.into_inner());
+    impl LinkCapacity {
+        pub(super) fn acquire(&self, host: HostId, background: bool) -> io::Result<LinkPermit> {
+            let mut links = self.0.lock().unwrap_or_else(|e| e.into_inner());
             let host_total = links.get(&host).map_or(0, |count| count.total);
             let host_probes = links.get(&host).map_or(0, |count| count.probes);
             if links.values().map(|count| count.total).sum::<usize>() >= MAX_LINKS
@@ -107,8 +108,8 @@ mod blocking {
             let count = links.entry(host).or_default();
             count.total += 1;
             count.probes += usize::from(background);
-            Ok(Self {
-                inner: Arc::clone(inner),
+            Ok(LinkPermit {
+                capacity: self.clone(),
                 host,
                 background,
             })
@@ -117,7 +118,7 @@ mod blocking {
 
     impl Drop for LinkPermit {
         fn drop(&mut self) {
-            let mut links = self.inner.links.lock().unwrap_or_else(|e| e.into_inner());
+            let mut links = self.capacity.0.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(count) = links.get_mut(&self.host) {
                 count.total -= 1;
                 count.probes -= usize::from(self.background);
@@ -126,10 +127,6 @@ mod blocking {
                 }
             }
         }
-    }
-
-    pub(super) fn link_permit(host: HostId, background: bool) -> io::Result<LinkPermit> {
-        LinkPermit::acquire(pool(), host, background)
     }
 
     pub(super) fn submit(job: impl FnOnce() + Send + 'static, bounded: bool) -> io::Result<()> {
@@ -283,36 +280,36 @@ mod blocking {
 
         #[test]
         fn link_capacity_is_bounded_per_host_and_globally_and_released_on_drop() {
-            let inner = Arc::new(Inner::new());
+            let capacity = LinkCapacity::default();
             let mut permits = Vec::new();
             for _ in 0..MAX_LINKS_PER_HOST {
-                permits.push(LinkPermit::acquire(&inner, HostId::LOCAL, false).unwrap());
+                permits.push(capacity.acquire(HostId::LOCAL, false).unwrap());
             }
-            assert!(LinkPermit::acquire(&inner, HostId::LOCAL, false).is_err());
+            assert!(capacity.acquire(HostId::LOCAL, false).is_err());
             permits.pop();
-            permits.push(LinkPermit::acquire(&inner, HostId::LOCAL, false).unwrap());
+            permits.push(capacity.acquire(HostId::LOCAL, false).unwrap());
             for n in MAX_LINKS_PER_HOST..MAX_LINKS {
-                permits.push(LinkPermit::acquire(&inner, HostId(n as u64), false).unwrap());
+                permits.push(capacity.acquire(HostId(n as u64), false).unwrap());
             }
-            assert!(LinkPermit::acquire(&inner, HostId(u64::MAX), false).is_err());
+            assert!(capacity.acquire(HostId(u64::MAX), false).is_err());
             drop(permits);
-            assert!(inner.links.lock().unwrap().is_empty());
+            assert!(capacity.0.lock().unwrap().is_empty());
         }
 
         #[test]
         fn link_probes_leave_room_for_clicks_on_the_same_host_and_other_hosts() {
-            let inner = Arc::new(Inner::new());
+            let capacity = LinkCapacity::default();
             let mut probes = Vec::new();
             for n in 0..MAX_PROBES {
-                probes.push(LinkPermit::acquire(&inner, HostId((n / 2) as u64), true).unwrap());
+                probes.push(capacity.acquire(HostId((n / 2) as u64), true).unwrap());
             }
-            assert!(LinkPermit::acquire(&inner, HostId::LOCAL, true).is_err());
-            assert!(LinkPermit::acquire(&inner, HostId(u64::MAX), true).is_err());
-            let click = LinkPermit::acquire(&inner, HostId::LOCAL, false).unwrap();
-            let second_click = LinkPermit::acquire(&inner, HostId::LOCAL, false).unwrap();
-            assert!(LinkPermit::acquire(&inner, HostId::LOCAL, false).is_err());
+            assert!(capacity.acquire(HostId::LOCAL, true).is_err());
+            assert!(capacity.acquire(HostId(u64::MAX), true).is_err());
+            let click = capacity.acquire(HostId::LOCAL, false).unwrap();
+            let second_click = capacity.acquire(HostId::LOCAL, false).unwrap();
+            assert!(capacity.acquire(HostId::LOCAL, false).is_err());
             drop((click, second_click, probes));
-            assert!(inner.links.lock().unwrap().is_empty());
+            assert!(capacity.0.lock().unwrap().is_empty());
         }
 
         fn state(jobs: usize, threads: usize, idle: usize) -> State {
@@ -405,7 +402,12 @@ where
 
 pub const LINK_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+// Every window in an App shares admission limits. Independent test Apps must
+// not consume each other's LOCAL host slots. The worker pool stays process-wide.
+impl gpui::Global for blocking::LinkCapacity {}
+
 async fn link_task<T>(
+    capacity: blocking::LinkCapacity,
     host: HostId,
     background: bool,
     f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
@@ -413,10 +415,11 @@ async fn link_task<T>(
 where
     T: Send + 'static,
 {
-    link_task_with_timeout(host, background, LINK_OP_TIMEOUT, f).await
+    link_task_with_timeout(capacity, host, background, LINK_OP_TIMEOUT, f).await
 }
 
 async fn link_task_with_timeout<T>(
+    capacity: blocking::LinkCapacity,
     host: HostId,
     background: bool,
     timeout: std::time::Duration,
@@ -426,7 +429,7 @@ where
     T: Send + 'static,
 {
     let deadline = std::time::Instant::now() + timeout;
-    let permit = blocking::link_permit(host, background)?;
+    let permit = capacity.acquire(host, background)?;
     smol::future::or(
         async move {
             off_thread_with_admission(
@@ -483,6 +486,7 @@ mod link_task_tests {
         let ran = Arc::new(AtomicBool::new(false));
         let seen = Arc::clone(&ran);
         let result = smol::block_on(link_task_with_timeout(
+            blocking::LinkCapacity::default(),
             HostId::from_connection_key("test:expired-link"),
             false,
             Duration::ZERO,
@@ -497,10 +501,12 @@ mod link_task_tests {
 
     #[test]
     fn link_timeout_keeps_capacity_until_the_real_worker_finishes() {
+        let capacity = blocking::LinkCapacity::default();
         let host = HostId::from_connection_key("test:blocked-link");
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let result = smol::block_on(link_task_with_timeout(
+            capacity.clone(),
             host,
             false,
             Duration::from_secs(1),
@@ -513,9 +519,9 @@ mod link_task_tests {
         // Always release the worker before an assertion could unwind this test.
         let started = started_rx.try_recv().is_ok();
         let permits: Vec<_> = (0..3)
-            .map(|_| blocking::link_permit(host, false).unwrap())
+            .map(|_| capacity.acquire(host, false).unwrap())
             .collect();
-        let blocked = blocking::link_permit(host, false).is_err();
+        let blocked = capacity.acquire(host, false).is_err();
         let _ = release_tx.send(());
         assert!(
             started,
@@ -528,7 +534,7 @@ mod link_task_tests {
         );
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            if let Ok(permit) = blocking::link_permit(host, false) {
+            if let Ok(permit) = capacity.acquire(host, false) {
                 drop(permit);
                 break;
             }
@@ -618,8 +624,9 @@ impl HostOps {
         L: FnOnce(&mut E, std::io::Result<T>, &mut Context<E>) + 'static,
     {
         tty7_core::host::register_ui_thread();
+        let capacity = cx.default_global::<blocking::LinkCapacity>().clone();
         cx.spawn(async move |this, cx| {
-            let out = link_task(host.id(), true, move || f(&*host)).await;
+            let out = link_task(capacity, host.id(), true, move || f(&*host)).await;
             let _ = this.update(cx, |view, cx| land(view, out, cx));
         })
         .detach();
@@ -653,8 +660,9 @@ impl HostOps {
         L: FnOnce(&mut E, std::io::Result<T>, &mut Window, &mut Context<E>) + 'static,
     {
         tty7_core::host::register_ui_thread();
+        let capacity = cx.default_global::<blocking::LinkCapacity>().clone();
         cx.spawn_in(window, async move |this, cx| {
-            let out = link_task(host, false, f).await;
+            let out = link_task(capacity, host, false, f).await;
             let _ = this.update_in(cx, |view, window, cx| land(view, out, window, cx));
         })
         .detach();
@@ -938,6 +946,64 @@ mod gpui_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Pane;
+
+    #[gpui::test]
+    fn link_admission_is_shared_within_an_app_and_isolated_between_apps(
+        cx_a: &mut TestAppContext,
+        cx_b: &mut TestAppContext,
+    ) {
+        use super::{HostId, blocking::LinkCapacity};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        cx_a.executor().allow_parking();
+        cx_b.executor().allow_parking();
+        let _permits = cx_a.update(|cx| {
+            let capacity = cx.default_global::<LinkCapacity>();
+            (0..4)
+                .map(|_| capacity.acquire(HostId::LOCAL, false).unwrap())
+                .collect::<Vec<_>>()
+        });
+        let submit = |cx: &mut TestAppContext| {
+            let result = Rc::new(RefCell::new(None));
+            let seen = result.clone();
+            let pane = cx.new(|_| Pane);
+            pane.update(cx, |_, cx| {
+                HostOps::run_link(
+                    tty7_core::host::local::LocalHost::new(),
+                    cx,
+                    |_| Ok(7usize),
+                    move |_, out, _| *seen.borrow_mut() = Some(out),
+                );
+            });
+            (pane, result)
+        };
+        let (_pane_a, result_a) = submit(cx_a);
+        let (_pane_b, result_b) = submit(cx_b);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            cx_a.run_until_parked();
+            cx_b.run_until_parked();
+            if result_a.borrow().is_some() && result_b.borrow().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "link results did not land"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            result_a.borrow_mut().take().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "another pane in the same app must observe its existing host limit"
+        );
+        assert_eq!(
+            result_b.borrow_mut().take().unwrap().unwrap(),
+            7,
+            "a separate app must not inherit the first app's occupied slots"
+        );
+    }
 
     #[gpui::test]
     fn a_detached_result_lands_after_its_view_is_dropped(cx: &mut TestAppContext) {

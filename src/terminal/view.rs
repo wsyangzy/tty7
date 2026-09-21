@@ -6414,6 +6414,11 @@ impl TerminalView {
                         column,
                         is_dir,
                     })) => {
+                        // A local stat accepts mixed separators, but Explorer
+                        // does not. Give every action the same native spelling;
+                        // paths on another host keep that host's spelling.
+                        let path =
+                            tty7_core::core::path_spelling::spelling_on_buf(view.host_id, path);
                         if view
                             .deferred_link_click
                             .as_ref()
@@ -8309,6 +8314,7 @@ fn select_end_copy(enabled: bool, grid: bool, editor: bool) -> SelectEndCopy {
 /// Hands a path to whatever the OS has it associated with. Also the fallback
 /// for a directory the file tree cannot reach.
 pub(crate) fn open_file_path(path: &std::path::Path) -> std::io::Result<()> {
+    let path = tty7_core::core::path_spelling::local_spelling(path);
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else if cfg!(windows) {
@@ -8316,8 +8322,21 @@ pub(crate) fn open_file_path(path: &std::path::Path) -> std::io::Result<()> {
     } else {
         "xdg-open"
     };
-    std::process::Command::new(opener).arg(path).spawn()?;
+    std::process::Command::new(opener)
+        .arg(path.as_os_str())
+        .spawn()?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn explorer_select_argument(path: &std::path::Path) -> std::ffi::OsString {
+    // Explorer needs a plain Win32 path, even when Rust can stat the mixed
+    // separators or extended-length prefix supplied by a shell or Git.
+    let path = tty7_core::core::path_spelling::local_spelling(path);
+    let mut argument = std::ffi::OsString::from("/select,\"");
+    argument.push(path.as_os_str());
+    argument.push("\"");
+    argument
 }
 
 /// Shows a path where it lives, rather than opening it.
@@ -8340,7 +8359,7 @@ pub(crate) fn reveal_file_path(path: &std::path::Path) -> std::io::Result<()> {
     let mut command = {
         use std::os::windows::process::CommandExt;
         let mut c = std::process::Command::new("explorer");
-        c.raw_arg(format!("/select,\"{}\"", path.display()));
+        c.raw_arg(explorer_select_argument(path));
         c
     };
     #[cfg(not(any(target_os = "macos", windows)))]
@@ -9745,6 +9764,39 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn link_open_windows_reveal_argument_uses_native_paths() {
+        for (input, expected) in [
+            (
+                r"D:/workspace/code/backend/tty7\target/debug/tty7-app.exe",
+                r#"/select,"D:\workspace\code\backend\tty7\target\debug\tty7-app.exe""#,
+            ),
+            (
+                r"D:/项目 files/target/debug/tty7-app.exe",
+                r#"/select,"D:\项目 files\target\debug\tty7-app.exe""#,
+            ),
+            (
+                r"\\server\项目 files/target/debug/tty7-app.exe",
+                r#"/select,"\\server\项目 files\target\debug\tty7-app.exe""#,
+            ),
+            (
+                r"\\?\D:\项目 files\target\debug\tty7-app.exe",
+                r#"/select,"D:\项目 files\target\debug\tty7-app.exe""#,
+            ),
+            (
+                r"\\?\UNC\server\项目 files\target\debug\tty7-app.exe",
+                r#"/select,"\\server\项目 files\target\debug\tty7-app.exe""#,
+            ),
+        ] {
+            assert_eq!(
+                super::explorer_select_argument(Path::new(input)),
+                std::ffi::OsString::from(expected),
+                "Explorer must receive a bare switch followed by a quoted native path: {input}"
+            );
+        }
+    }
+
     #[test]
     fn file_command_template_substitutes_path_line_and_column() {
         let argv = expand_file_command_template(
@@ -11038,10 +11090,9 @@ mod gpui_tests {
     /// The same pane, but hung under a `gpui_component::Root` the way the real
     /// window hangs it.
     ///
-    /// `harness` makes the view its own root, which is enough for anything
-    /// that never paints — but gpui-component's text input reaches for `Root`
-    /// while painting, so any test that lets a frame draw with the search bar
-    /// (or any other input) on screen needs this one instead.
+    /// `harness` makes the view its own root. Text inputs and notifications
+    /// need the component Root, so tests that paint inputs or dispatch async
+    /// link operations use this harness, including their failure paths.
     fn rooted_harness(
         cx: &mut TestAppContext,
     ) -> (
@@ -11946,11 +11997,6 @@ mod gpui_tests {
             .unwrap();
     }
 
-    fn settle_link_opens(window: gpui::WindowHandle<TerminalView>, cx: &mut TestAppContext) {
-        let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
-        settle_link_entity_opens(&view, cx);
-    }
-
     fn settle_link_entity_opens(view: &Entity<TerminalView>, cx: &mut TestAppContext) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -11974,76 +12020,137 @@ mod gpui_tests {
         use std::cell::RefCell;
         use std::rc::Rc;
 
-        let dir = std::env::temp_dir();
-        let name = format!("tty7-link-open-{}.txt", std::process::id());
-        let path = dir.join(&name);
-        let file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
-        let (window, _daemon) = harness(cx);
+        let dir = tempfile::tempdir().unwrap();
+        let name = "link.txt";
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"contents").unwrap();
+        let (window, pane, _daemon) = rooted_harness(cx);
         let opened = Rc::new(RefCell::new(Vec::new()));
         window
-            .update(cx, |view, window, cx| {
-                let seen = opened.clone();
-                cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
-                    seen.borrow_mut().push(event.path.clone());
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    let seen = opened.clone();
+                    cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
+                        seen.borrow_mut().push(event.path.clone());
+                    })
+                    .detach();
+                    view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                    parser.advance(
+                        &mut *view.terminal.term.lock(),
+                        format!("see {name}\r\n").as_bytes(),
+                    );
+                    assert!(
+                        !view.open_link_at(0, 0, window, cx),
+                        "ordinary text must keep its terminal mouse handling"
+                    );
+                    assert!(view.open_link_at(5, 0, window, cx));
+                    assert!(view.open_link_at(5, 0, window, cx));
+                    assert_eq!(
+                        view.pending_file_links.len(),
+                        1,
+                        "a repeated click shares the request"
+                    );
+                    assert!(
+                        opened.borrow().is_empty(),
+                        "file validation must yield to the UI"
+                    );
+                    view.record_menu_link(5, 0, cx);
+                    assert!(
+                        view.menu_link_path().is_some(),
+                        "a cold file candidate has a menu"
+                    );
+                    view.terminal.seed_cwd(None);
+                    view.resolve_menu_link(FileLinkAction::CopyPath, window, cx);
+                    assert_eq!(
+                        view.pending_file_links.len(),
+                        2,
+                        "copy and open are distinct actions"
+                    );
+                    view.record_menu_link(0, 0, cx);
+                    assert!(
+                        view.menu_link_path().is_none(),
+                        "ordinary words have no file menu"
+                    );
+                    parser.advance(
+                        &mut *view.terminal.term.lock(),
+                        b"\x1b[2J\x1b[Hunrelated output",
+                    );
                 })
-                .detach();
-                view.terminal.seed_cwd(Some(dir));
-                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
-                parser.advance(
-                    &mut *view.terminal.term.lock(),
-                    format!("see {name}\r\n").as_bytes(),
-                );
-                assert!(
-                    !view.open_link_at(0, 0, window, cx),
-                    "ordinary text must keep its terminal mouse handling"
-                );
-                assert!(view.open_link_at(5, 0, window, cx));
-                assert!(view.open_link_at(5, 0, window, cx));
-                assert_eq!(
-                    view.pending_file_links.len(),
-                    1,
-                    "a repeated click shares the request"
-                );
-                assert!(
-                    opened.borrow().is_empty(),
-                    "file validation must yield to the UI"
-                );
-                view.record_menu_link(5, 0, cx);
-                assert!(
-                    view.menu_link_path().is_some(),
-                    "a cold file candidate has a menu"
-                );
-                view.terminal.seed_cwd(None);
-                view.resolve_menu_link(FileLinkAction::CopyPath, window, cx);
-                assert_eq!(
-                    view.pending_file_links.len(),
-                    2,
-                    "copy and open are distinct actions"
-                );
-                view.record_menu_link(0, 0, cx);
-                assert!(
-                    view.menu_link_path().is_none(),
-                    "ordinary words have no file menu"
-                );
-                parser.advance(
-                    &mut *view.terminal.term.lock(),
-                    b"\x1b[2J\x1b[Hunrelated output",
-                );
             })
             .unwrap();
-        settle_link_opens(window, cx);
+        settle_link_entity_opens(&pane, cx);
         assert_eq!(*opened.borrow(), vec![path.clone()]);
         assert_eq!(
             cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text())),
             Some(path.to_string_lossy().into_owned()),
             "the menu copies the resolved path using the roots captured at right click"
         );
-        drop(file);
-        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[gpui::test]
+    fn link_open_windows_relative_paths_use_native_spelling(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("项目 files");
+        let root = tty7_core::core::path_spelling::local_spelling_buf(root);
+        let parent = root.join("target").join("debug");
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("tty7-app.exe");
+        std::fs::write(&path, b"test file").unwrap();
+        let (window, pane, _daemon) = rooted_harness(cx);
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        window
+            .update(cx, |_, _, cx| {
+                pane.update(cx, |view, cx| {
+                    let seen = opened.clone();
+                    cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
+                        seen.borrow_mut().push(event.path.clone());
+                    })
+                    .detach();
+                    view.terminal.seed_cwd(Some(std::path::PathBuf::from(
+                        root.to_string_lossy().replace('\\', "/"),
+                    )));
+                })
+            })
+            .unwrap();
+
+        for displayed in ["target/debug/tty7-app.exe", r"target\debug\tty7-app.exe"] {
+            window
+                .update(cx, |_, window, cx| {
+                    pane.update(cx, |view, cx| {
+                        let mut parser: alacritty_terminal::vte::ansi::Processor =
+                            Default::default();
+                        parser.advance(
+                            &mut *view.terminal.term.lock(),
+                            format!("\x1b[2J\x1b[Hsee \"{displayed}\"\r\n").as_bytes(),
+                        );
+                        assert!(view.open_link_at(5, 0, window, cx));
+                        view.record_menu_link(5, 0, cx);
+                        assert!(view.menu_link_path().is_some());
+                        view.resolve_menu_link(FileLinkAction::CopyPath, window, cx);
+                    })
+                })
+                .unwrap();
+            settle_link_entity_opens(&pane, cx);
+            // Path equality accepts mixed separators on Windows, so compare
+            // the actual spelling delivered to the editor and clipboard.
+            assert_eq!(
+                opened
+                    .borrow()
+                    .last()
+                    .map(|path| path.as_os_str().to_owned()),
+                Some(path.as_os_str().to_owned())
+            );
+            assert_eq!(
+                cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text())),
+                Some(path.to_string_lossy().into_owned())
+            );
+        }
+        assert_eq!(opened.borrow().len(), 2);
     }
 
     #[gpui::test]
@@ -12051,40 +12158,45 @@ mod gpui_tests {
         use std::cell::RefCell;
         use std::rc::Rc;
         let dir = tempfile::tempdir().unwrap();
-        let (window, _daemon) = harness(cx);
+        let (window, pane, _daemon) = rooted_harness(cx);
         let opened = Rc::new(RefCell::new(Vec::new()));
         window
-            .update(cx, |view, _, cx| {
-                let seen = opened.clone();
-                cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
-                    seen.borrow_mut().push(event.path.clone());
+            .update(cx, |_, _, cx| {
+                pane.update(cx, |view, cx| {
+                    let seen = opened.clone();
+                    cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
+                        seen.borrow_mut().push(event.path.clone());
+                    })
+                    .detach();
+                    view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
                 })
-                .detach();
-                view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
             })
             .unwrap();
         for name in ["Makefile", "Dockerfile", "LICENSE", "data.123", "文件.数据"] {
             let path = dir.path().join(name);
             std::fs::write(&path, b"contents").unwrap();
             window
-                .update(cx, |view, window, cx| {
-                    view.link_probes = Default::default();
-                    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
-                    parser.advance(
-                        &mut *view.terminal.term.lock(),
-                        format!("\x1b[2J\x1b[H{name}").as_bytes(),
-                    );
-                    view.begin_link_click(MouseButton::Left);
-                    assert!(
-                        view.open_link_at(0, 0, window, cx)
-                            || view.defer_file_click(0, 0, window, cx, |_, _| panic!(
-                                "existing file must open"
-                            ))
-                    );
-                    view.finish_link_mouse_up();
+                .update(cx, |_, window, cx| {
+                    pane.update(cx, |view, cx| {
+                        view.link_probes = Default::default();
+                        let mut parser: alacritty_terminal::vte::ansi::Processor =
+                            Default::default();
+                        parser.advance(
+                            &mut *view.terminal.term.lock(),
+                            format!("\x1b[2J\x1b[H{name}").as_bytes(),
+                        );
+                        view.begin_link_click(MouseButton::Left);
+                        assert!(
+                            view.open_link_at(0, 0, window, cx)
+                                || view.defer_file_click(0, 0, window, cx, |_, _| panic!(
+                                    "existing file must open"
+                                ))
+                        );
+                        view.finish_link_mouse_up();
+                    })
                 })
                 .unwrap();
-            settle_link_opens(window, cx);
+            settle_link_entity_opens(&pane, cx);
             assert_eq!(opened.borrow().last(), Some(&path));
         }
         assert_eq!(opened.borrow().len(), 5);
@@ -12097,31 +12209,37 @@ mod gpui_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Makefile");
         std::fs::write(&path, b"all:").unwrap();
-        let (window, _daemon) = harness(cx);
+        let (window, pane, _daemon) = rooted_harness(cx);
         let opened = Rc::new(Cell::new(0));
         window
-            .update(cx, |view, window, cx| {
-                let seen = opened.clone();
-                cx.subscribe(&cx.entity(), move |_, _, _: &OpenFileRequested, _| {
-                    seen.set(seen.get() + 1)
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    let seen = opened.clone();
+                    cx.subscribe(&cx.entity(), move |_, _, _: &OpenFileRequested, _| {
+                        seen.set(seen.get() + 1)
+                    })
+                    .detach();
+                    view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                    parser.advance(&mut *view.terminal.term.lock(), b"Makefile");
+                    view.begin_link_click(MouseButton::Left);
+                    assert!(
+                        view.defer_file_click(0, 0, window, cx, |_, _| {
+                            panic!("the file exists")
+                        })
+                    );
+                    view.link_probes.retarget(view.host_id);
+                    view.link_probes.land(
+                        view.link_probes.generation(),
+                        vec![(path, super::super::link_probe::Existence::File)],
+                    );
+                    view.begin_link_click(MouseButton::Left);
+                    assert!(view.open_link_at(0, 0, window, cx));
+                    assert_eq!(view.pending_file_links.len(), 1);
                 })
-                .detach();
-                view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
-                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
-                parser.advance(&mut *view.terminal.term.lock(), b"Makefile");
-                view.begin_link_click(MouseButton::Left);
-                assert!(view.defer_file_click(0, 0, window, cx, |_, _| panic!("the file exists")));
-                view.link_probes.retarget(view.host_id);
-                view.link_probes.land(
-                    view.link_probes.generation(),
-                    vec![(path, super::super::link_probe::Existence::File)],
-                );
-                view.begin_link_click(MouseButton::Left);
-                assert!(view.open_link_at(0, 0, window, cx));
-                assert_eq!(view.pending_file_links.len(), 1);
             })
             .unwrap();
-        settle_link_opens(window, cx);
+        settle_link_entity_opens(&pane, cx);
         assert_eq!(opened.get(), 1);
     }
 
@@ -12136,26 +12254,28 @@ mod gpui_tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let path = dir.path().join("src").join("main.rs");
         std::fs::write(&path, b"fn main() {} ").unwrap();
-        let (window, _daemon) = harness(cx);
+        let (window, pane, _daemon) = rooted_harness(cx);
         let opened = Rc::new(RefCell::new(Vec::new()));
         window
-            .update(cx, |view, window, cx| {
-                let seen = opened.clone();
-                cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
-                    seen.borrow_mut().push(event.path.clone())
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    let seen = opened.clone();
+                    cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
+                        seen.borrow_mut().push(event.path.clone())
+                    })
+                    .detach();
+                    view.terminal.seed_cwd(Some(cwd.clone()));
+                    // Deliberately prevent hover's independent lookup from winning the race.
+                    view.link_repo_root_pending = true;
+                    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                    parser.advance(&mut *view.terminal.term.lock(), b"src/main.rs:3");
+                    assert_eq!(view.link_roots(cx).dirs, vec![cwd]);
+                    assert!(view.open_link_at(0, 0, window, cx));
+                    parser.advance(&mut *view.terminal.term.lock(), b"\x1b[2J\x1b[Hnew output");
                 })
-                .detach();
-                view.terminal.seed_cwd(Some(cwd.clone()));
-                // Deliberately prevent hover's independent lookup from winning the race.
-                view.link_repo_root_pending = true;
-                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
-                parser.advance(&mut *view.terminal.term.lock(), b"src/main.rs:3");
-                assert_eq!(view.link_roots(cx).dirs, vec![cwd]);
-                assert!(view.open_link_at(0, 0, window, cx));
-                parser.advance(&mut *view.terminal.term.lock(), b"\x1b[2J\x1b[Hnew output");
             })
             .unwrap();
-        settle_link_opens(window, cx);
+        settle_link_entity_opens(&pane, cx);
         assert_eq!(*opened.borrow(), vec![path]);
     }
 
@@ -12189,31 +12309,35 @@ mod gpui_tests {
         use std::cell::Cell;
         use std::rc::Rc;
         let dir = tempfile::tempdir().unwrap();
-        let (window, _daemon) = harness(cx);
+        let (window, pane, _daemon) = rooted_harness(cx);
         let returned = Rc::new(Cell::new(0));
         window
-            .update(cx, |view, window, cx| {
-                view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
-                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
-                parser.advance(&mut *view.terminal.term.lock(), b"ordinary");
-                view.begin_link_click(MouseButton::Left);
-                let returned = returned.clone();
-                assert!(view.defer_file_click(0, 0, window, cx, move |view, _| {
-                    assert!(!view.link_mouse_is_down());
-                    returned.set(returned.get() + 1);
-                }));
-                assert!(
-                    view.finish_link_mouse_up(),
-                    "do not send an unmatched mouse release"
-                );
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                    parser.advance(&mut *view.terminal.term.lock(), b"ordinary");
+                    view.begin_link_click(MouseButton::Left);
+                    let returned = returned.clone();
+                    assert!(view.defer_file_click(0, 0, window, cx, move |view, _| {
+                        assert!(!view.link_mouse_is_down());
+                        returned.set(returned.get() + 1);
+                    }));
+                    assert!(
+                        view.finish_link_mouse_up(),
+                        "do not send an unmatched mouse release"
+                    );
+                })
             })
             .unwrap();
-        settle_link_opens(window, cx);
+        settle_link_entity_opens(&pane, cx);
         assert_eq!(returned.get(), 1);
         window
-            .update(cx, |view, _, cx| {
-                view.resume_deferred_link_click(cx);
-                assert!(view.deferred_link_click.is_none());
+            .update(cx, |_, _, cx| {
+                pane.update(cx, |view, cx| {
+                    view.resume_deferred_link_click(cx);
+                    assert!(view.deferred_link_click.is_none());
+                })
             })
             .unwrap();
         assert_eq!(returned.get(), 1);
@@ -12225,30 +12349,32 @@ mod gpui_tests {
         use std::rc::Rc;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Makefile"), b"all:").unwrap();
-        let (window, _daemon) = harness(cx);
+        let (window, pane, _daemon) = rooted_harness(cx);
         let returned = Rc::new(Cell::new(0));
         let opened = Rc::new(Cell::new(0));
         window
-            .update(cx, |view, window, cx| {
-                let opened = opened.clone();
-                cx.subscribe(&cx.entity(), move |_, _, _: &OpenFileRequested, _| {
-                    opened.set(opened.get() + 1)
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    let opened = opened.clone();
+                    cx.subscribe(&cx.entity(), move |_, _, _: &OpenFileRequested, _| {
+                        opened.set(opened.get() + 1)
+                    })
+                    .detach();
+                    view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                    parser.advance(&mut *view.terminal.term.lock(), b"Makefile");
+                    view.begin_link_click(MouseButton::Left);
+                    let returned = returned.clone();
+                    assert!(view.defer_file_click(0, 0, window, cx, move |view, _| {
+                        assert!(view.link_mouse_is_down());
+                        returned.set(returned.get() + 1);
+                    }));
+                    view.resume_deferred_link_click(cx);
+                    assert!(!view.finish_link_mouse_up());
                 })
-                .detach();
-                view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
-                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
-                parser.advance(&mut *view.terminal.term.lock(), b"Makefile");
-                view.begin_link_click(MouseButton::Left);
-                let returned = returned.clone();
-                assert!(view.defer_file_click(0, 0, window, cx, move |view, _| {
-                    assert!(view.link_mouse_is_down());
-                    returned.set(returned.get() + 1);
-                }));
-                view.resume_deferred_link_click(cx);
-                assert!(!view.finish_link_mouse_up());
             })
             .unwrap();
-        settle_link_opens(window, cx);
+        settle_link_entity_opens(&pane, cx);
         assert_eq!(returned.get(), 1);
         assert_eq!(opened.get(), 0);
     }
@@ -12464,36 +12590,38 @@ mod gpui_tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let (window, _daemon) = harness(cx);
+        let (window, pane, _daemon) = rooted_harness(cx);
         let calls = Arc::new(AtomicUsize::new(0));
         window
-            .update(cx, |view, window, cx| {
-                bind_to_a_disconnected_remote_workspace(view, cx);
-                let called = calls.clone();
-                view.open_url_with_forwarder(
-                    "http://localhost:3000/a?q=1#part",
-                    window,
-                    cx,
-                    move |_, _| {
-                        called.fetch_add(1, Ordering::SeqCst);
-                        Ok(crate::daemon::protocol::LoopbackForward { local_port: 4000 })
-                    },
-                );
-                view.open_url_with_forwarder(
-                    "http://localhost:3000/a?q=1#part",
-                    window,
-                    cx,
-                    |_, _| panic!("a duplicate click must not start another request"),
-                );
-                assert_eq!(
-                    calls.load(Ordering::SeqCst),
-                    0,
-                    "forwarding cannot run in the click handler"
-                );
-                assert_eq!(view.pending_loopback_urls.len(), 1);
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    bind_to_a_disconnected_remote_workspace(view, cx);
+                    let called = calls.clone();
+                    view.open_url_with_forwarder(
+                        "http://localhost:3000/a?q=1#part",
+                        window,
+                        cx,
+                        move |_, _| {
+                            called.fetch_add(1, Ordering::SeqCst);
+                            Ok(crate::daemon::protocol::LoopbackForward { local_port: 4000 })
+                        },
+                    );
+                    view.open_url_with_forwarder(
+                        "http://localhost:3000/a?q=1#part",
+                        window,
+                        cx,
+                        |_, _| panic!("a duplicate click must not start another request"),
+                    );
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        0,
+                        "forwarding cannot run in the click handler"
+                    );
+                    assert_eq!(view.pending_loopback_urls.len(), 1);
+                })
             })
             .unwrap();
-        settle_link_opens(window, cx);
+        settle_link_entity_opens(&pane, cx);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             cx.opened_url().as_deref(),
@@ -12501,11 +12629,16 @@ mod gpui_tests {
         );
 
         window
-            .update(cx, |view, window, cx| {
-                view.open_url_with_forwarder("http://localhost:3000/stale", window, cx, |_, _| {
-                    Ok(crate::daemon::protocol::LoopbackForward { local_port: 5000 })
-                });
-                view.set_workspace(None);
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    view.open_url_with_forwarder(
+                        "http://localhost:3000/stale",
+                        window,
+                        cx,
+                        |_, _| Ok(crate::daemon::protocol::LoopbackForward { local_port: 5000 }),
+                    );
+                    view.set_workspace(None);
+                })
             })
             .unwrap();
         cx.run_until_parked();
