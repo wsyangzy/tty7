@@ -1606,6 +1606,7 @@ mod tests {
                     launch_argv: Some(vec!["claude".into()]),
                     rich: true,
                     cwd: Some("/work/api".into()),
+                    project_cwd: Some("/work/api".into()),
                     activity: 3,
                     turns: 1,
                 },

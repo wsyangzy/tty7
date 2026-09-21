@@ -1839,6 +1839,7 @@ mod tests {
                 ]),
                 rich: true,
                 cwd: Some("/repo/.claude/worktrees/fix-x".into()),
+                project_cwd: Some("/repo".into()),
                 activity: 12,
                 turns: 4,
             })),

@@ -3225,32 +3225,40 @@ mod replay_tests {
         crate::core::config::pin_test_config_dir();
         let (client, mut daemon) = socket_pair();
         let term = RemoteTerminal::from_stream(client, TermSize::new(80, 24)).unwrap();
-        *term.agent.lock().unwrap() = Some(CLIAgent::Codex);
-        DaemonMsg::Output(
-            b"\x1b]9;Approve command?\x07\x1b]777;notify;Codex;Choose an option\x07".to_vec(),
-        )
-        .encode(&mut daemon)
-        .unwrap();
-        daemon.flush().unwrap();
+        for agent in CLIAgent::ALL {
+            *term.agent.lock().unwrap() = Some(agent);
+            DaemonMsg::Output(
+                format!(
+                    "\x1b]9;Approve command?\x07\x1b]777;notify;{};Choose an option\x07",
+                    agent.display_name(),
+                )
+                .into_bytes(),
+            )
+            .encode(&mut daemon)
+            .unwrap();
+            daemon.flush().unwrap();
 
-        let mut notes = Vec::new();
-        for _ in 0..200 {
-            while let Some(note) = term.take_agent_notification() {
-                notes.push(note);
+            let mut notes = Vec::new();
+            for _ in 0..200 {
+                while let Some(note) = term.take_agent_notification() {
+                    notes.push(note);
+                }
+                if notes.len() == 2 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            if notes.len() == 2 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            assert_eq!(
+                notes,
+                vec![
+                    (None, "Approve command?".into()),
+                    (Some(agent.display_name().into()), "Choose an option".into()),
+                ],
+                "{} notifications must follow the view policy",
+                agent.display_name(),
+            );
+            assert_eq!(term.take_agent_notification(), None);
         }
-        assert_eq!(
-            notes,
-            vec![
-                (None, "Approve command?".into()),
-                (Some("Codex".into()), "Choose an option".into()),
-            ]
-        );
-        assert_eq!(term.take_agent_notification(), None);
     }
 
     fn ws(cols: u16, rows: u16) -> WinSize {
@@ -5829,6 +5837,7 @@ mod tests {
                 launch_argv: None,
                 rich: true,
                 cwd: None,
+                project_cwd: None,
                 activity: 0,
                 turns: 0,
             }))
@@ -5890,6 +5899,7 @@ mod tests {
             launch_argv: None,
             rich: true,
             cwd: None,
+            project_cwd: None,
             activity: 0,
             turns: 0,
         }))
@@ -5940,6 +5950,7 @@ mod tests {
             launch_argv: None,
             rich: true,
             cwd: None,
+            project_cwd: None,
             activity: 0,
             turns: 0,
         }))

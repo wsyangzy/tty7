@@ -1747,6 +1747,7 @@ impl DaemonPane {
                     at_prompt: carried.at_prompt,
                     last_exit_code: carried.last_exit,
                     command: None,
+                    command_cwd: None,
                     // Not carried: the handoff record is a wire format shared
                     // with older images, and a pane mid-`ssh` that comes back
                     // claiming a prompt it cannot vouch for would be worse
@@ -2115,18 +2116,26 @@ impl DaemonPane {
                             let facts_before = may_change_facts.then(|| observed_facts(&st));
                             record_output(&mut st, bytes);
                             fan_out_output(&mut st, bytes, frames, &gate);
-                            apply_signals(&mut st, signals);
                             if let Some(remote) = remote {
                                 apply_remote_context(&mut st, remote);
                             }
+                            // Bind the foreground launch before hooks can report a
+                            // child session's cwd. Unknown probes leave it alone.
+                            if let Some(Some(detected)) = agent.as_ref() {
+                                let launch_cwd = st.remote.is_none()
+                                    .then(|| probed_cwd.clone()).flatten()
+                                    .or_else(|| st.cwd.clone());
+                                apply_agent(&mut st, Some(detected.clone()), launch_cwd);
+                            }
+                            apply_signals(&mut st, signals);
                             latch_remote_prompt(&mut st, saw_prompt_mark);
                             // Keep kitty file/shm transfer gated on the pane's
                             // *current* locality: an `ssh` that just took the PTY
                             // must stop us honoring host-local object names. Cheap
                             // and only meaningful when a probe follows.
                             graphics.set_local(st.remote.is_none());
-                            if let Some(agent) = agent {
-                                apply_agent(&mut st, agent);
+                            if matches!(agent, Some(None)) {
+                                apply_agent(&mut st, None, None);
                             }
                             apply_probed_cwd(&mut st, probed_cwd);
                             if let Some(tr1) = tr1 {
@@ -2141,7 +2150,7 @@ impl DaemonPane {
                                 && facts_changed(&before, &after)
                             {
                                 crate::core::machine::observe_pane(pane, |p| {
-                                    if after.cwd.is_some() {
+                                    if after.cwd.is_some() || after.agent.is_some() {
                                         p.cwd = after.cwd;
                                     }
                                     // Unlike the others this one is also cleared
@@ -2306,13 +2315,18 @@ impl DaemonPane {
     }
 
     pub fn info(&self) -> PaneInfo {
-        let (cwd, osc_title, alive) = {
+        let (cwd, osc_title, alive, agent) = {
             let st = self.state.lock().unwrap();
-            (st.cwd.clone(), st.osc_title.clone(), st.alive)
+            (
+                pane_project_cwd(&st).map(Path::to_path_buf),
+                st.osc_title.clone(),
+                st.alive,
+                st.agent,
+            )
         };
         PaneInfo {
             pane_id: self.id,
-            cwd: cwd.or_else(|| self.foreground_cwd()),
+            cwd: cwd.or_else(|| agent.is_none().then(|| self.foreground_cwd()).flatten()),
             title: self.foreground_title(),
             osc_title,
             alive,
@@ -2852,7 +2866,10 @@ fn observe_subscriber(
 
 fn agent_state_snapshot(st: &PaneState) -> Option<crate::daemon::control::PaneAgentState> {
     st.agent_session
-        .clone()
+        .as_ref()
+        // Project metadata alone says nothing about whether a turn is idle.
+        .filter(|state| state.rich || state.status != crate::core::cli_agent::AgentStatus::Idle)
+        .cloned()
         .map(|state| crate::daemon::control::PaneAgentState {
             pane_id: st.id,
             agent: st.agent,
@@ -2871,8 +2888,15 @@ struct ObservedFacts {
     shell: Option<ShellSpec>,
 }
 
+fn pane_project_cwd(st: &PaneState) -> Option<&Path> {
+    match st.agent_session.as_ref().filter(|_| st.agent.is_some()) {
+        Some(session) => session.project_cwd.as_deref(),
+        None => st.cwd.as_deref(),
+    }
+}
+
 fn observed_facts(st: &PaneState) -> ObservedFacts {
-    let cwd = st.cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
+    let cwd = pane_project_cwd(st).map(|p| p.to_string_lossy().into_owned());
     let agent = st.agent.map(|agent| crate::core::machine::AgentFacts {
         agent,
         session_id: st.agent_session.as_ref().and_then(|s| s.session_id.clone()),
@@ -2915,12 +2939,8 @@ fn agent_facts_changed(
 }
 
 fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
-    if let Some(cwd) = signals.cwd {
-        if st.cwd.as_ref() != Some(&cwd) {
-            notify(st, DaemonMsg::Cwd(cwd.clone()));
-            st.cwd = Some(cwd);
-        }
-    }
+    // Bind a launch before later OSC 7 reports in the same read can replace
+    // its directory. Shell command marks retain their own ordered snapshot.
     if let Some(title) = signals.title {
         // No `notify`: a window renders its own tabs from its own terminal,
         // which parsed the same sequence. This is only for the tree.
@@ -2932,6 +2952,7 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
             apply_agent(
                 st,
                 agent_from_shell_mark(&shell, crate::core::config::agent_commands_cached()),
+                shell.command_cwd.clone().or_else(|| st.cwd.clone()),
             );
         }
         st.shell = shell.clone();
@@ -2945,6 +2966,12 @@ fn apply_signals(st: &mut PaneState, signals: SniffSignals) {
         );
     }
     apply_agent_signals(st, signals.agent_events, signals.notification);
+    if let Some(cwd) = signals.cwd
+        && st.cwd.as_ref() != Some(&cwd)
+    {
+        notify(st, DaemonMsg::Cwd(cwd.clone()));
+        st.cwd = Some(cwd);
+    }
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -2979,8 +3006,12 @@ fn apply_agent_signals(
             st.agent = event.agent;
             notify(st, DaemonMsg::Agent(st.agent));
         }
+        let project_cwd = event.cwd.clone().or_else(|| st.cwd.clone());
         st.agent_session
-            .get_or_insert_with(AgentSessionState::default)
+            .get_or_insert_with(|| AgentSessionState {
+                project_cwd,
+                ..Default::default()
+            })
             .apply_event(event);
     }
 
@@ -2988,9 +3019,10 @@ fn apply_agent_signals(
         && st.agent.is_some()
         && !st.agent_session.as_ref().is_some_and(|s| s.rich)
     {
-        let sess = st
-            .agent_session
-            .get_or_insert_with(AgentSessionState::default);
+        let sess = st.agent_session.get_or_insert_with(|| AgentSessionState {
+            project_cwd: st.cwd.clone(),
+            ..Default::default()
+        });
         sess.status = AgentStatus::Waiting;
         sess.message = Some(body);
     }
@@ -3052,7 +3084,8 @@ fn suppress_relayed_prompt_marks(shell: &mut Vec<ShellState>) {
         let same = a.active == b.active
             && a.at_prompt == b.at_prompt
             && a.last_exit_code == b.last_exit_code
-            && a.command == b.command;
+            && a.command == b.command
+            && a.command_cwd == b.command_cwd;
         // `dedup_by` keeps `b`, the earlier of the pair, and drops `a`. Move
         // the reading over first so the collapse costs a `Prompt` message and
         // nothing else.
@@ -3068,6 +3101,7 @@ fn apply_remote_context(st: &mut PaneState, remote: Option<RemoteContext>) {
         return;
     }
     st.cwd = None;
+    apply_agent(st, None, None);
     // A new far side has to prove its own shell integration. The mark that is
     // standing right now belongs to whatever the pane was before this hop —
     // the near shell's "I started `ssh`", or the previous host's prompt.
@@ -3092,25 +3126,33 @@ fn latch_remote_prompt(st: &mut PaneState, saw_prompt_mark: bool) {
 fn apply_agent(
     st: &mut PaneState,
     detected: Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>,
+    launch_cwd: Option<PathBuf>,
 ) {
+    use crate::core::cli_agent::AgentSessionState;
+
     let (agent, argv) = match detected {
         Some((agent, argv)) => (Some(agent), Some(argv)),
         None => (None, None),
     };
-    if st.agent == agent {
-        stamp_launch_argv(st, argv);
-        return;
-    }
-    if agent.is_none() && st.agent_session.is_some() {
-        st.agent_session = None;
-        notify(st, DaemonMsg::AgentStatus(None));
-    }
-    if agent.is_none() {
+    if st.agent != agent {
+        if st.agent_session.take().is_some() {
+            notify(st, DaemonMsg::AgentStatus(None));
+        }
         st.agent_argv = None;
+        notify(st, DaemonMsg::Agent(agent));
+        st.agent = agent;
     }
-    notify(st, DaemonMsg::Agent(agent));
-    st.agent = agent;
     stamp_launch_argv(st, argv);
+    if agent.is_some() && st.agent_session.is_none() {
+        // Even agents without hooks need a stable project identity. A later
+        // hook may report tool or child-session cwd; it cannot change this.
+        st.agent_session = Some(AgentSessionState {
+            project_cwd: launch_cwd,
+            launch_argv: st.agent_argv.clone(),
+            ..Default::default()
+        });
+        notify(st, DaemonMsg::AgentStatus(st.agent_session.clone()));
+    }
 }
 
 fn stamp_launch_argv(st: &mut PaneState, argv: Option<Vec<String>>) {
@@ -3245,19 +3287,18 @@ fn foreground_remote_context(
 fn foreground_agent(
     master: &Mutex<Option<Box<dyn MasterPty + Send>>>,
 ) -> Option<Option<(crate::core::cli_agent::CLIAgent, Vec<String>)>> {
-    let detect = || {
-        let pid = master
-            .lock()
-            .ok()
-            .and_then(|m| m.as_ref().and_then(|m| m.process_group_leader()))?;
-        let argv = crate::daemon::remote::foreground_argv(pid)?;
-        let agent = crate::core::cli_agent::CLIAgent::detect_from_argv_with(
+    let pid = master
+        .lock()
+        .ok()
+        .and_then(|m| m.as_ref().and_then(|m| m.process_group_leader()))?;
+    let argv = crate::daemon::remote::foreground_argv(pid)?;
+    Some(
+        crate::core::cli_agent::CLIAgent::detect_from_argv_with(
             &argv,
             crate::core::config::agent_commands_cached(),
-        )?;
-        Some((agent, argv))
-    };
-    Some(detect())
+        )
+        .map(|agent| (agent, argv)),
+    )
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -3284,6 +3325,8 @@ struct ShellState {
     mark_at_prompt: bool,
     last_exit_code: Option<i32>,
     command: Option<String>,
+    /// Directory when OSC 133;C launched this command, before child output.
+    command_cwd: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -3301,6 +3344,7 @@ struct SniffSignals {
 struct OscSniffer {
     tok: OscTokenizer,
     shell: ShellState,
+    cwd: Option<PathBuf>,
 }
 
 impl OscSniffer {
@@ -3308,21 +3352,31 @@ impl OscSniffer {
         Self {
             tok: OscTokenizer::new(&[b"0", b"2", b"7", b"133", b"9", b"777"]),
             shell: ShellState::default(),
+            cwd: None,
         }
     }
 
     fn feed(&mut self, bytes: &[u8]) -> SniffSignals {
         let mut signals = SniffSignals::default();
         let shell = &mut self.shell;
+        let cwd = &mut self.cwd;
         self.tok.feed(bytes, |payload| {
             if let Some(path) = parse_osc7(payload) {
+                *cwd = Some(path.clone());
                 signals.cwd = Some(path);
             } else if let Some(title) = parse_osc_title(payload) {
                 signals.title = Some(title);
             } else if let Some(rest) = payload.strip_prefix(b"133;") {
                 if handle_osc133(shell, rest) {
+                    if rest.first() == Some(&b'C') {
+                        shell.command_cwd = cwd.clone();
+                    }
                     match signals.shell.last_mut() {
-                        Some(last) if last.at_prompt == shell.at_prompt => {
+                        Some(last)
+                            if last.at_prompt == shell.at_prompt
+                                && last.command == shell.command
+                                && last.command_cwd == shell.command_cwd =>
+                        {
                             *last = shell.clone();
                         }
                         _ => signals.shell.push(shell.clone()),
@@ -3354,6 +3408,7 @@ fn handle_osc133(shell: &mut ShellState, rest: &[u8]) -> bool {
         Some(b'D') => {
             shell.at_prompt = true;
             shell.command = None;
+            shell.command_cwd = None;
             shell.last_exit_code = rest
                 .strip_prefix(b"D;")
                 .and_then(|c| std::str::from_utf8(c).ok())
@@ -4623,6 +4678,7 @@ mod tests {
             mark_at_prompt,
             last_exit_code: None,
             command: command.map(str::to_string),
+            command_cwd: None,
         };
         let hop = |target: &str| RemoteContext {
             kind: RemoteKind::Ssh,
@@ -4864,6 +4920,163 @@ mod tests {
     }
 
     #[test]
+    fn every_agent_keeps_its_project_until_the_foreground_launch_ends() {
+        use crate::core::cli_agent::{AgentEvent, AgentEventKind, CLIAgent};
+
+        for agent in CLIAgent::ALL {
+            let project = PathBuf::from("/work/main-project");
+            let child = PathBuf::from("/elsewhere/arbitrary-task");
+            let next = PathBuf::from("/work/next-project");
+            let detected = Some((agent, vec![agent.slug().into()]));
+            let mut st = test_state(true);
+            st.cwd = Some(project.clone());
+            apply_agent(&mut st, detected.clone(), Some(project.clone()));
+            assert!(!st.agent_session.as_ref().unwrap().rich);
+            apply_probed_cwd(&mut st, Some(child.clone()));
+            apply_agent(&mut st, detected.clone(), Some(child.clone()));
+            assert_eq!(pane_project_cwd(&st), Some(project.as_path()), "{agent:?}");
+
+            for kind in [
+                AgentEventKind::SessionStart,
+                AgentEventKind::ToolComplete,
+                AgentEventKind::Stop,
+                AgentEventKind::SessionEnd,
+                AgentEventKind::SessionStart,
+            ] {
+                apply_agent_signals(
+                    &mut st,
+                    vec![AgentEvent {
+                        agent: Some(agent),
+                        kind,
+                        session_id: Some(format!("{kind:?}")),
+                        message: None,
+                        cwd: Some(child.clone()),
+                        prompt: None,
+                    }],
+                    None,
+                );
+                assert_eq!(
+                    pane_project_cwd(&st),
+                    Some(project.as_path()),
+                    "{agent:?} {kind:?}"
+                );
+            }
+            assert_eq!(st.agent_session.as_ref().unwrap().cwd, Some(child.clone()));
+            assert_eq!(
+                observed_facts(&st).cwd.as_deref(),
+                Some("/work/main-project")
+            );
+            let (tx, rx) = mpsc::channel();
+            replay_state(&st, &tx, true);
+            assert!(rx.try_iter().any(|msg| matches!(msg,
+                DaemonMsg::AgentStatus(Some(session)) if session.project_cwd == Some(project.clone()))));
+
+            apply_agent(&mut st, None, None);
+            assert!(st.agent_session.is_none());
+            apply_probed_cwd(&mut st, Some(next.clone()));
+            assert_eq!(pane_project_cwd(&st), Some(next.as_path()));
+            apply_agent(&mut st, detected, Some(next.clone()));
+            assert_eq!(pane_project_cwd(&st), Some(next.as_path()));
+            let other = if agent == CLIAgent::Claude {
+                CLIAgent::Codex
+            } else {
+                CLIAgent::Claude
+            };
+            apply_agent(
+                &mut st,
+                Some((other, vec![other.slug().into()])),
+                Some(project.clone()),
+            );
+            assert_eq!(pane_project_cwd(&st), Some(project.as_path()));
+        }
+    }
+
+    #[test]
+    fn project_capture_keeps_command_order_across_every_read_boundary() {
+        let stream = b"\x1b]7;file://localhost/work/main-project\x07\x1b]133;C;codex\x07\x1b]7;file://localhost/elsewhere/child\x07";
+        for split in 0..=stream.len() {
+            let mut sniffer = OscSniffer::new();
+            let mut st = test_state(true);
+            st.cwd = Some(PathBuf::from("/old"));
+            apply_signals(&mut st, sniffer.feed(&stream[..split]));
+            apply_signals(&mut st, sniffer.feed(&stream[split..]));
+            assert_eq!(
+                st.shell.command_cwd.as_deref(),
+                Some(Path::new("/work/main-project")),
+                "split {split}"
+            );
+            assert_eq!(st.cwd.as_deref(), Some(Path::new("/elsewhere/child")));
+            #[cfg(windows)]
+            assert_eq!(
+                pane_project_cwd(&st),
+                Some(Path::new("/work/main-project")),
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn reader_binds_the_probed_project_before_hooks_and_persists_unknown_projects() {
+        use crate::core::cli_agent::CLIAgent;
+        use crate::core::machine::{
+            MACHINE_FILE, MachineStore, OBSERVE_SLOT, PaneSeed, publish_observations,
+            withdraw_observations,
+        };
+        const PANE: u64 = 79;
+        let _slot = OBSERVE_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = MachineStore::open(dir.path().join(MACHINE_FILE));
+        let ws = store.workspace_create(None, None, None).unwrap();
+        store
+            .tab_create(ws.id, None, PaneSeed::bare(PANE), None, None)
+            .unwrap();
+        publish_observations(&store);
+        for project in [Some(PathBuf::from("/work/main-project")), None] {
+            crate::core::machine::observe_pane(PANE, |p| p.cwd = Some("/old".into()));
+            let mut st = test_state(true);
+            st.id = PANE;
+            st.cwd = project.as_ref().map(|_| PathBuf::from("/old"));
+            let state = Arc::new(Mutex::new(st));
+            let probe_cwd = project.clone();
+            let stream = concat!(
+                "\x1b]777;notify;tty7://cli-agent;",
+                r#"{"agent":"codex","event":"session-start","cwd":"/work/main-project","session_id":"main"}"#,
+                "\x07",
+                "\x1b]777;notify;tty7://cli-agent;",
+                r#"{"agent":"codex","event":"tool-complete","cwd":"/elsewhere/child","session_id":"child"}"#,
+                "\x07"
+            );
+            DaemonPane::spawn_reader(
+                state.clone(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(OutputGate::new()),
+                Box::new(std::io::Cursor::new(stream.as_bytes().to_vec())),
+                null_writer(),
+                || false,
+                ForegroundProbes {
+                    remote: Box::new(|| None),
+                    agent: Box::new(|| Some(Some((CLIAgent::Codex, vec!["codex".into()])))),
+                    cwd: Box::new(move || probe_cwd.clone()),
+                },
+                Arc::new(DeathReporter::new(|| {})),
+            )
+            .join()
+            .unwrap();
+            let st = state.lock().unwrap();
+            assert_eq!(pane_project_cwd(&st), project.as_deref());
+            assert_eq!(
+                st.agent_session.as_ref().unwrap().cwd.as_deref(),
+                Some(Path::new("/elsewhere/child"))
+            );
+            assert_eq!(
+                store.pane(PANE).unwrap().cwd,
+                project.map(|p| p.to_string_lossy().into_owned())
+            );
+        }
+        withdraw_observations();
+    }
+
+    #[test]
     fn observed_facts_prefer_the_sessions_argv_and_carry_its_status() {
         use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
 
@@ -4884,6 +5097,7 @@ mod tests {
         st.agent_session = Some(AgentSessionState {
             status: AgentStatus::Working,
             session_id: Some("sess-1".into()),
+            project_cwd: st.cwd.clone(),
             launch_argv: Some(vec!["claude".into(), "--model".into(), "opus".into()]),
             ..Default::default()
         });
@@ -5093,7 +5307,7 @@ mod tests {
             Ok(DaemonMsg::AgentStatus(Some(s))) if s.message.as_deref().unwrap().contains("permission")
         ));
 
-        apply_agent(&mut st, None);
+        apply_agent(&mut st, None, None);
         assert!(st.agent_session.is_none());
         assert!(matches!(rx.try_recv(), Ok(DaemonMsg::AgentStatus(None))));
         assert!(matches!(rx.try_recv(), Ok(DaemonMsg::Agent(None))));
@@ -5124,6 +5338,7 @@ mod tests {
             launch_argv: None,
             rich: true,
             cwd: None,
+            project_cwd: None,
             activity: 0,
             turns: 0,
         });
@@ -5261,6 +5476,7 @@ mod tests {
             mark_at_prompt: true,
             last_exit_code: Some(0),
             command: None,
+            command_cwd: None,
         };
         st.ring.append(b"\x1b[?1049h\x1b[2Jthe agent's screen");
 
@@ -5302,6 +5518,7 @@ mod tests {
             mark_at_prompt: true,
             last_exit_code: Some(0),
             command: None,
+            command_cwd: None,
         };
         st.ring.append(b"\x1b[?1049hstranded alt screen");
 
@@ -5713,6 +5930,21 @@ mod tests {
             agent_state_snapshot(&st),
             None,
             "a detected agent without session state is not yet a fact worth listing"
+        );
+        apply_agent(
+            &mut st,
+            Some((CLIAgent::Claude, vec!["claude".into()])),
+            Some(PathBuf::from("/work/project")),
+        );
+        assert_eq!(
+            agent_state_snapshot(&st),
+            None,
+            "project metadata is not an idle report"
+        );
+        apply_agent_signals(&mut st, vec![], Some("needs permission".into()));
+        assert_eq!(
+            agent_state_snapshot(&st).unwrap().state.status,
+            AgentStatus::Waiting
         );
 
         st.agent_session = Some(AgentSessionState {
@@ -7008,6 +7240,7 @@ mod tests {
                     mark_at_prompt: true,
                     last_exit_code: Some(0),
                     command: None,
+                    command_cwd: None,
                 }],
                 ..SniffSignals::default()
             },

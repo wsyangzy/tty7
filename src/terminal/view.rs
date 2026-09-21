@@ -421,6 +421,8 @@ pub struct TerminalView {
     last_agent_status: Option<crate::core::cli_agent::AgentStatus>,
     last_agent_message: Option<String>,
     agent_bell_pending: bool,
+    /// A terminal alert needs a visible badge even without a rich Waiting event.
+    agent_attention_unread: bool,
     last_agent_session: (Option<String>, Option<Vec<String>>),
     agent_turn_started: Option<std::time::Instant>,
     agent_was_rich: bool,
@@ -735,10 +737,10 @@ fn agent_attention_requested(
     use crate::core::cli_agent::AgentStatus;
 
     if let Some(session) = session.filter(|s| s.rich) {
-        // A rich completion already has its own notification. Codex can emit
-        // a BEL for the same result as well as for mid-turn approval prompts.
+        // A completion transition already notifies. A later BEL can be a
+        // plan confirmation shown after the turn ended, so it is a new alert.
         if session.status == AgentStatus::Done {
-            return false;
+            return bell && previous_status == Some(AgentStatus::Done);
         }
         if session.status == AgentStatus::Waiting
             && (previous_status != Some(AgentStatus::Waiting)
@@ -748,6 +750,13 @@ fn agent_attention_requested(
         }
     }
     bell
+}
+
+// BEL carries no reason: keep an unread alert separate from the daemon
+// status. Idle can show a dialog and Done can have a follow-up question:
+// viewing the pane or the agent exiting dismisses an unread alert.
+fn agent_attention_badge(unread: bool, requested: bool, pane_focused: bool) -> bool {
+    !pane_focused && (unread || requested)
 }
 
 /// The longest command line to put in a confirmation. The shell sends up to
@@ -1500,6 +1509,7 @@ impl TerminalView {
         let focus_subs = vec![
             cx.on_focus_in(&focus_handle, window, |view, window, cx| {
                 view.cursor_visible = true;
+                view.agent_attention_unread = false;
                 if view.keep_unread_on_focus {
                     view.keep_unread_on_focus = false;
                 } else {
@@ -1515,9 +1525,15 @@ impl TerminalView {
             }),
             // A minimized Windows window may not draw the frame that would
             // deliver on_blur. Report immediately, deduplicating both paths.
-            cx.observe_window_activation(window, |view, window, _cx| {
+            cx.observe_window_activation(window, |view, window, cx| {
                 if view.focus_handle.is_focused(window) {
                     view.report_focus_change(window.is_window_active());
+                    if window.is_window_active() {
+                        view.agent_attention_unread = false;
+                        view.agent_result_unread = false;
+                        view.note_agent_result_unread(cx);
+                        cx.notify();
+                    }
                 }
             }),
         ];
@@ -1674,6 +1690,7 @@ impl TerminalView {
             last_agent_status: None,
             last_agent_message: None,
             agent_bell_pending: false,
+            agent_attention_unread: false,
             last_agent_session: (None, None),
             agent_turn_started: None,
             agent_was_rich: false,
@@ -1820,7 +1837,13 @@ impl TerminalView {
     }
 
     pub fn spawnable_cwd(&self) -> Option<std::path::PathBuf> {
-        self.remote_context().is_none().then(|| self.cwd())?
+        self.remote_context().is_none().then(|| {
+            if self.agent().is_some() {
+                self.project_cwd()
+            } else {
+                self.cwd()
+            }
+        })?
     }
 
     pub fn host(&self, cx: &gpui::App) -> Option<crate::ui::host_ops::SharedHost> {
@@ -1968,6 +1991,10 @@ impl TerminalView {
         }))
     }
 
+    pub fn agent_attention_unread(&self) -> bool {
+        self.agent_attention_unread
+    }
+
     pub fn agent_result_unread(&self) -> bool {
         self.agent_result_unread
     }
@@ -2042,6 +2069,18 @@ impl TerminalView {
     /// cwd, [`Self::effective_host_cwd`] takes only one the host can resolve.
     pub fn effective_cwd(&self) -> Option<std::path::PathBuf> {
         self.git_status_cwd.clone().or_else(|| self.cwd())
+    }
+
+    /// Stable tab identity; the active worktree remains `effective_cwd`.
+    pub fn project_cwd(&self) -> Option<std::path::PathBuf> {
+        if self.agent().is_some() {
+            match self.agent_session() {
+                Some(session) => session.project_cwd,
+                None => self.cwd(),
+            }
+        } else {
+            self.effective_cwd()
+        }
     }
 
     /// [`Self::effective_cwd`], restricted to paths the pane's host can act
@@ -3705,18 +3744,25 @@ impl TerminalView {
     }
 
     fn poll_foreground(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // An active window can still be showing a different tab or split.
+        let pane_focused = window.is_window_active() && self.focus_handle.is_focused(window);
         let agent_notify_allowed = cx
             .global::<Config>()
             .notify_on_agent_event
-            .allows(window.is_window_active());
+            .allows(pane_focused);
         // Consume disabled alerts too, so enabling notifications does not
         // deliver old permission requests.
         while let Some((title, body)) = self.terminal.take_agent_notification() {
+            self.agent_attention_unread |= !pane_focused;
+            cx.notify();
             if agent_notify_allowed {
                 self.notify_pane(title.as_deref(), &body, cx);
             }
         }
         if self.terminal.exited {
+            if std::mem::take(&mut self.agent_attention_unread) {
+                cx.notify();
+            }
             return;
         }
         let at_prompt = self.terminal.at_prompt();
@@ -3813,6 +3859,18 @@ impl TerminalView {
             self.refresh_git_status(cwd_now, GitRefresh::Opportunistic, cx);
         }
 
+        // A tool can work in a different repository. Resolve the project's
+        // own group without moving the file tree or SCM away from that work.
+        if self.cwd_is_on_host()
+            && let Some(project) = self.project_cwd()
+            && self.git_status_cwd.as_ref() != Some(&project)
+            && cx
+                .try_global::<crate::terminal::git_status::GitStatusCache>()
+                .and_then(|cache| cache.known_repo_for(self.host_id, &project))
+                .is_none()
+        {
+            self.probe_git_cwd(project, GitRefresh::Opportunistic, cx);
+        }
         self.follow_history_scope(cx);
     }
 
@@ -3991,29 +4049,27 @@ impl TerminalView {
         trigger: GitRefresh,
         cx: &mut Context<Self>,
     ) {
+        if self.git_status_cwd != cwd {
+            self.git_status_cwd = cwd.clone();
+            cx.notify();
+        }
+        if let Some(cwd) = cwd {
+            self.probe_git_cwd(cwd, trigger, cx);
+        }
+    }
+
+    fn probe_git_cwd(
+        &mut self,
+        cwd: std::path::PathBuf,
+        trigger: GitRefresh,
+        cx: &mut Context<Self>,
+    ) {
         use crate::terminal::git_status::GitStatusCache;
 
-        let changed = self.git_status_cwd != cwd;
-        self.git_status_cwd = cwd.clone();
-        let Some(cwd) = cwd else {
-            if changed {
-                cx.notify();
-            }
-            return;
-        };
         let id = self.host_id;
-        let Some(host) = self.host(cx) else {
-            if changed {
-                cx.notify();
-            }
+        let Some(host) = self.host(cx).filter(|host| host.is_connected()) else {
             return;
         };
-        if !host.is_connected() {
-            if changed {
-                cx.notify();
-            }
-            return;
-        }
         cx.default_global::<GitStatusCache>();
         let claimed = cx.update_global::<GitStatusCache, _>(|cache, _| match trigger {
             GitRefresh::Edge => cache.begin_probe(id, &cwd),
@@ -4036,8 +4092,10 @@ impl TerminalView {
                 });
                 if rerun {
                     let _ = pane.update(cx, |view, cx| {
-                        if view.git_status_cwd.as_deref() == Some(&cwd) {
-                            view.refresh_git_status(Some(cwd), GitRefresh::Edge, cx);
+                        if view.git_status_cwd.as_deref() == Some(&cwd)
+                            || view.project_cwd().as_deref() == Some(&cwd)
+                        {
+                            view.probe_git_cwd(cwd, GitRefresh::Edge, cx);
                         }
                     });
                 }
@@ -4105,20 +4163,30 @@ impl TerminalView {
             .map(|a| a.display_name())
             .unwrap_or("Agent");
         let bell = std::mem::take(&mut self.agent_bell_pending);
-        if !adopted_baseline
-            && notify_allowed
+        let attention_requested = !adopted_baseline
             && agent_attention_requested(
                 self.last_agent_status,
                 self.last_agent_message.as_deref(),
                 session.as_ref(),
                 bell,
-            )
+            );
+        let pane_focused = window.is_window_active() && self.focus_handle.is_focused(window);
+        let attention_unread = self.agent().is_some()
+            && agent_attention_badge(
+                self.agent_attention_unread,
+                attention_requested || bell,
+                pane_focused,
+            );
+        if std::mem::replace(&mut self.agent_attention_unread, attention_unread) != attention_unread
         {
+            cx.notify();
+        }
+        if attention_requested && notify_allowed {
             let body = session
                 .as_ref()
                 .filter(|s| s.status == AgentStatus::Waiting)
                 .and_then(|s| s.message.clone())
-                .unwrap_or_else(|| t(L10nKey::NotifyAgentWaiting).to_string());
+                .unwrap_or_else(|| t(L10nKey::AgentStatusAttention).to_string());
             self.notify_pane(Some(agent_name), &body, cx);
         }
         self.last_agent_message = session.as_ref().and_then(|s| s.message.clone());
@@ -4151,7 +4219,7 @@ impl TerminalView {
                 })
                 .cloned()
         {
-            self.agent_result_unread = mark.unread && !self.focus_handle.is_focused(window);
+            self.agent_result_unread = mark.unread && !pane_focused;
             self.keep_unread_on_focus = false;
             self.record_agent_read_mark(turns, cx);
             cx.notify();
@@ -4168,7 +4236,7 @@ impl TerminalView {
                 // built, before its leaf was attached, never gets the blur that
                 // would clear `self.focused` — trusting the cached flag there
                 // drops the badge on the one pane the reader is not looking at.
-                self.agent_result_unread = !self.focus_handle.is_focused(window);
+                self.agent_result_unread = !pane_focused;
                 self.keep_unread_on_focus = false;
             }
             Some(AgentStatus::Done) => {}
@@ -8401,6 +8469,17 @@ mod tests {
     }
 
     #[test]
+    fn agent_alert_badge_lasts_until_seen_without_requiring_a_working_turn() {
+        let badge = super::agent_attention_badge;
+        // Alerts from idle dialogs and completed turns use the same latch.
+        assert!(badge(false, true, false));
+        assert!(badge(true, false, false));
+        assert!(!badge(false, false, false));
+        assert!(!badge(false, true, true));
+        assert!(!badge(true, false, true));
+    }
+
+    #[test]
     fn agent_attention_notifications_cover_bells_and_new_waiting_messages() {
         use crate::core::cli_agent::{AgentSessionState, AgentStatus};
 
@@ -8443,8 +8522,14 @@ mod tests {
             true,
         ));
 
+        session.status = AgentStatus::Idle;
+        assert!(needs_attention(AgentStatus::Idle, None, &session, true));
+        assert!(!needs_attention(AgentStatus::Idle, None, &session, false));
+
         session.status = AgentStatus::Done;
         assert!(!needs_attention(AgentStatus::Working, None, &session, true));
+        assert!(needs_attention(AgentStatus::Done, None, &session, true));
+        assert!(!needs_attention(AgentStatus::Done, None, &session, false));
         session.rich = false;
         assert!(needs_attention(AgentStatus::Working, None, &session, true));
         assert!(super::agent_attention_requested(None, None, None, true));
@@ -10369,6 +10454,7 @@ mod gpui_tests {
                 launch_argv: Some(vec!["claude".into()]),
                 rich: true,
                 cwd: None,
+                project_cwd: None,
                 activity: 0,
                 turns: 0,
             }))
@@ -10425,6 +10511,7 @@ mod gpui_tests {
             launch_argv: Some(vec!["claude".into()]),
             rich: true,
             cwd: None,
+            project_cwd: None,
             activity: 0,
             turns: 0,
         }))
@@ -10492,6 +10579,7 @@ mod gpui_tests {
             launch_argv: Some(vec!["claude".into()]),
             rich: true,
             cwd: None,
+            project_cwd: None,
             activity: 0,
             turns,
         };
@@ -10931,7 +11019,7 @@ mod gpui_tests {
     /// one place that has to prefer the agent's answer over the kernel's.
     #[gpui::test]
     fn a_pane_follows_its_agent_into_a_worktree(cx: &mut TestAppContext) {
-        use crate::core::cli_agent::{AgentSessionState, AgentStatus};
+        use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
         use std::io::Write as _;
         use std::path::PathBuf;
 
@@ -10939,6 +11027,9 @@ mod gpui_tests {
         let working_in = PathBuf::from("/repo/.claude/worktrees/wt");
 
         let (window, mut daemon) = harness(cx);
+        DaemonMsg::Agent(Some(CLIAgent::Claude))
+            .encode(&mut daemon)
+            .unwrap();
         DaemonMsg::Cwd(launched_in.clone())
             .encode(&mut daemon)
             .unwrap();
@@ -10949,6 +11040,7 @@ mod gpui_tests {
             launch_argv: Some(vec!["claude".into()]),
             rich: true,
             cwd: Some(working_in.clone()),
+            project_cwd: Some(launched_in.clone()),
             activity: 0,
             turns: 0,
         }))
@@ -10981,12 +11073,15 @@ mod gpui_tests {
                     "the file tree, the cwd row and the SCM panel all root here"
                 );
                 assert_eq!(view.effective_host_cwd(), Some(working_in.clone()));
+                assert_eq!(view.project_cwd(), Some(launched_in.clone()));
+                assert_eq!(view.spawnable_cwd(), Some(launched_in.clone()));
             })
             .unwrap();
 
         // Turn over: the agent is gone, and with it any claim about where the
         // work is. Falling back to a stale worktree would be worse than the
         // bug this fixes.
+        DaemonMsg::Agent(None).encode(&mut daemon).unwrap();
         DaemonMsg::AgentStatus(None).encode(&mut daemon).unwrap();
         daemon.flush().unwrap();
         for _ in 0..200 {

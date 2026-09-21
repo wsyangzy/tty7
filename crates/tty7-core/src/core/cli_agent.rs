@@ -712,6 +712,10 @@ pub struct AgentSessionState {
     pub rich: bool,
     #[serde(default)]
     pub cwd: Option<std::path::PathBuf>,
+    /// The project this foreground agent was launched in. Hook events may
+    /// change the working cwd, but cannot rename or regroup the owning tab.
+    #[serde(default)]
+    pub project_cwd: Option<std::path::PathBuf>,
     #[serde(default)]
     pub activity: u64,
     /// How many turns this session has finished: bumped each time it settles
@@ -1357,6 +1361,34 @@ mod tests {
 
         s.apply_event(&ev(AgentEventKind::SessionEnd, None));
         assert_eq!(s.cwd, None, "session end releases the cwd claim");
+
+        let project = PathBuf::from("/main-project");
+        s.project_cwd = Some(project.clone());
+        for (n, kind) in [
+            AgentEventKind::SessionStart,
+            AgentEventKind::PromptSubmit,
+            AgentEventKind::ToolComplete,
+            AgentEventKind::Stop,
+            AgentEventKind::SessionEnd,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = ev(kind, Some("/other-worktree"));
+            event.session_id = Some(format!("session-{n}"));
+            s.apply_event(&event);
+            assert_eq!(s.session_id, event.session_id);
+            assert_eq!(s.project_cwd.as_ref(), Some(&project), "{kind:?}");
+        }
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(serde_json::from_str::<AgentSessionState>(&json).unwrap(), s);
+        assert_eq!(
+            serde_json::from_str::<AgentSessionState>("{}")
+                .unwrap()
+                .project_cwd,
+            None,
+            "older peers do not report a project directory"
+        );
     }
 
     #[test]

@@ -464,6 +464,7 @@ impl Tty7App {
                 let agent = tab.agent(cx);
                 let agent_status = tab.agent_status(cx);
                 let agent_unread = tab.agent_unread_count(cx);
+                let agent_attention = tab.agent_attention_unread(cx);
                 let git_cwd = git_click(tab, window, cx);
                 let badge_extra = if show_badges && badge_pos < 9 {
                     row_metrics::BADGE + row_metrics::GAP
@@ -635,11 +636,10 @@ impl Tty7App {
                 {
                     false => None,
                     true => tab
-                        .pane
-                        .focused_or_first(window, cx)
+                        .title_leaf(Some(window), cx)
                         .and_then(|leaf| {
                             let leaf = leaf.read(cx);
-                            Some((leaf.effective_cwd()?, leaf.display_home(cx)))
+                            Some((leaf.project_cwd()?, leaf.display_home(cx)))
                         })
                         .map(|(cwd, home)| {
                             let text = cwd.display().to_string();
@@ -928,6 +928,7 @@ impl Tty7App {
                         agent,
                         agent_status,
                         agent_unread,
+                        agent_attention,
                         ssh_dot,
                         22.,
                         cx,
@@ -1897,9 +1898,18 @@ impl Tty7App {
                 if stated.as_ref().is_some_and(GroupKey::is_custom) {
                     return stated;
                 }
-                let cwd = tab.pane.first_leaf().and_then(|leaf| {
-                    let view = leaf.terminal()?.read(cx);
-                    Some((view.host_id(), view.git_status_cwd()?.to_path_buf()))
+                let cwd = tab.title_leaf(None, cx).and_then(|leaf| {
+                    let view = leaf.read(cx);
+                    let cwd = view.project_cwd();
+                    // An onward SSH hop reports paths outside this pane's Host.
+                    // A shell still starting may simply not have reported its
+                    // directory yet, so only explicit loss clears its group.
+                    if view.remote_context().is_some() || (view.agent().is_some() && cwd.is_none())
+                    {
+                        *tab.sidebar_group.borrow_mut() = None;
+                        return None;
+                    }
+                    Some((view.host_id(), cwd?))
                 });
                 if let Some((id, cwd)) = cwd {
                     let known = cx.global::<GitStatusCache>().known_repo_for(id, &cwd);
@@ -2274,6 +2284,103 @@ mod fold_tests {
                 GroupKey::custom("work"),
                 "the tab itself was not written over either"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn a_split_uses_its_remembered_agents_project_for_label_and_group(cx: &mut TestAppContext) {
+        use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
+        use crate::daemon::protocol::DaemonMsg;
+        use crate::ui::pane::Pane;
+        use std::io::Write as _;
+
+        let (app, mut vcx, mut streams) = harness_with_tabs(cx, 2);
+        let project = PathBuf::from("/work/main-project");
+        let child = PathBuf::from("/work/temporary-child");
+        let agent_pane = app.update(&mut vcx, |app, cx| {
+            plant_repo(app, 0, "/work/other-project", "/work/other-project", cx);
+            plant_repo(app, 1, "/work/main-project", "/work/main-project", cx);
+            let pane = app.tabs[1].title_leaf(None, cx).unwrap();
+            pane.update(cx, |view, _| {
+                view.set_git_status_cwd_for_test(Some(child.clone()))
+            });
+            pane
+        });
+        DaemonMsg::Agent(Some(CLIAgent::Codex))
+            .encode(&mut streams[1])
+            .unwrap();
+        DaemonMsg::Cwd(child.clone())
+            .encode(&mut streams[1])
+            .unwrap();
+        DaemonMsg::AgentStatus(Some(AgentSessionState {
+            status: AgentStatus::Done,
+            cwd: Some(child.clone()),
+            project_cwd: Some(project.clone()),
+            rich: true,
+            ..Default::default()
+        }))
+        .encode(&mut streams[1])
+        .unwrap();
+        streams[1].flush().unwrap();
+        for _ in 0..200 {
+            if agent_pane.read_with(&vcx, |view, _| view.agent_session().is_some()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            assert_eq!(agent_pane.read(cx).project_cwd(), Some(project.clone()));
+            assert_eq!(agent_pane.read(cx).effective_cwd(), Some(child.clone()));
+            let second = app.tabs.remove(1).pane;
+            let first = std::mem::replace(&mut app.tabs[0].pane, Pane::Empty);
+            app.tabs[0].pane = Pane::split_node(Axis::Horizontal, 0.5, first, second);
+            app.remember_focused_leaf(agent_pane.entity_id());
+            let elsewhere = cx.focus_handle();
+            window.focus(&elsewhere, cx);
+
+            let (label, _) = app.tabs[0].label_view(Some(window), cx);
+            assert_eq!(label.cwd.as_deref(), Some("/work/main-project"));
+            assert_eq!(
+                app.tab_label(&app.tabs[0], 0, Some(window), cx),
+                "main-project"
+            );
+            assert_eq!(app.sidebar_group_keys(cx)[0], Some(GroupKey::Repo(project)));
+
+            app.tabs[0].name = Some("My task".into());
+            *app.tabs[0].sidebar_group.borrow_mut() = GroupKey::custom("Pinned");
+            assert_eq!(app.tab_label(&app.tabs[0], 0, Some(window), cx), "My task");
+            assert_eq!(app.sidebar_group_keys(cx)[0], GroupKey::custom("Pinned"));
+        });
+
+        // A new agent with no trusted project must not inherit a directory
+        // merely because a previous session or a tool happened to report it.
+        DaemonMsg::AgentStatus(Some(AgentSessionState {
+            status: AgentStatus::Working,
+            cwd: Some(child),
+            rich: true,
+            ..Default::default()
+        }))
+        .encode(&mut streams[1])
+        .unwrap();
+        streams[1].flush().unwrap();
+        for _ in 0..200 {
+            if agent_pane.read_with(&vcx, |view, _| {
+                view.agent_session()
+                    .is_some_and(|session| session.project_cwd.is_none())
+            }) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        app.update(&mut vcx, |app, cx| {
+            assert_eq!(agent_pane.read(cx).project_cwd(), None);
+            assert_eq!(app.sidebar_group_keys(cx)[0], GroupKey::custom("Pinned"));
+            assert_eq!(app.tab_label(&app.tabs[0], 0, None, cx), "My task");
+            *app.tabs[0].sidebar_group.borrow_mut() =
+                Some(GroupKey::Repo(PathBuf::from("/work/main-project")));
+            assert_eq!(app.sidebar_group_keys(cx)[0], None);
+            assert_eq!(*app.tabs[0].sidebar_group.borrow(), None);
         });
     }
 

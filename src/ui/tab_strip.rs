@@ -158,9 +158,8 @@ pub(crate) fn project_name(raw: &str) -> String {
 
 /// The one place a tab gets its displayed name, whichever surface is asking.
 ///
-/// `label()` ranks the evidence — a given name, then the title the pane is
-/// showing, then the working directory, then a generic agent identity, then
-/// the process it is running — and this renders whatever came back. Both
+/// `label()` prefers custom names, then the project directory for agents or
+/// the terminal title for other panes. This renders whatever came back. Both
 /// callers arrive with a
 /// [`TabView`](crate::ui::machine_mirror::TabView): the switcher reads one out
 /// of the machine tree for a window it does not own, and the strip builds one
@@ -963,7 +962,7 @@ pub(crate) fn workspace_avatar(
                 .text_color(cx.theme().foreground.opacity(0.65))
                 .child(initial),
         )
-        .children(dot.map(|rgb| Tty7App::status_dot(rgb, 0, size, cx.theme().popover, false)))
+        .children(dot.map(|rgb| Tty7App::status_dot(rgb, 0, size, cx.theme().popover)))
 }
 
 pub(crate) fn select_workspace_action(index: usize) -> Option<Box<dyn gpui::Action>> {
@@ -1270,23 +1269,13 @@ impl Tty7App {
         .collect()
     }
 
-    /// Working and Done differ only in hue (blue vs green), and Waiting vs Done
-    /// — the pair that actually decides whether you go and look — is amber vs
-    /// green, the pair red-green colour vision separates worst. Give Waiting a
-    /// hole so it is a different *shape*, not just a different colour.
-    fn status_dot(
-        rgb: u32,
-        unread: usize,
-        size: f32,
-        ring: gpui::Hsla,
-        hollow: bool,
-    ) -> gpui::AnyElement {
+    fn status_dot(rgb: u32, unread: usize, size: f32, ring: gpui::Hsla) -> gpui::AnyElement {
         let d = (size * 0.42).max(7.);
         // The halo was the surface itself, which is only a ring while the
         // surface is light — on a dark theme it went near-black and read as a
         // notch bitten out of the avatar rather than a badge sitting on it.
         // Light themes already ring the dot in white; give the dark ones the
-        // same white edge, and the hollow Waiting dot the same white hole.
+        // same white edge.
         let bg = match crate::ui::presets::surface_is_dark(ring) {
             true => gpui::white(),
             false => ring,
@@ -1321,12 +1310,6 @@ impl Tty7App {
                 .border_2()
                 .border_color(bg)
                 .bg(gpui::rgb(rgb))
-                .when(hollow, |dot| {
-                    dot.flex()
-                        .items_center()
-                        .justify_center()
-                        .child(div().size(px((d * 0.36).max(2.5))).rounded_full().bg(bg))
-                })
                 .into_any_element()
         }
     }
@@ -1337,6 +1320,7 @@ impl Tty7App {
         agent: Option<crate::core::cli_agent::CLIAgent>,
         status: Option<crate::core::cli_agent::AgentStatus>,
         unread: usize,
+        attention: bool,
         ssh: Option<u32>,
         size: f32,
         cx: &App,
@@ -1359,16 +1343,30 @@ impl Tty7App {
         };
         match agent {
             Some(agent) => {
-                let hollow = status == Some(crate::core::cli_agent::AgentStatus::Waiting);
-                let dot = status
-                    .and_then(|s| s.dot_rgb())
-                    .map(|rgb| Self::status_dot(rgb, unread, size, cx.theme().background, hollow));
+                use crate::core::cli_agent::AgentStatus;
+                let needs_attention = attention || status == Some(AgentStatus::Waiting);
+                let dot_status = if needs_attention {
+                    Some(AgentStatus::Waiting)
+                } else {
+                    status
+                };
+                let dot = dot_status.and_then(|s| s.dot_rgb()).map(|rgb| {
+                    Self::status_dot(
+                        rgb,
+                        if needs_attention { 0 } else { unread },
+                        size,
+                        cx.theme().background,
+                    )
+                });
                 // Which agent this is, and what it wants, were carried entirely
                 // by a brand hue and a nine-pixel dot. Say it in words too.
-                let tip = match agent_status_label(status) {
+                let mut tip = match agent_status_label(status) {
                     Some(state) => format!("{} — {state}", agent.display_name()),
                     None => agent.display_name().to_string(),
                 };
+                if attention && status != Some(AgentStatus::Waiting) {
+                    tip.push_str(&format!(" · {}", t(L10nKey::AgentStatusAttention)));
+                }
                 // The disc is a solid fill of the agent's brand on every
                 // row, lit or not: a tint reads as a disabled tab, and the
                 // colour is how the eye tells one agent from another down a
@@ -1412,7 +1410,7 @@ impl Tty7App {
                     ),
                 )
                 .when_some(ssh, |b, rgb| {
-                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background, false))
+                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background))
                 })
                 .into_any_element(),
         }
@@ -1894,6 +1892,7 @@ impl Tty7App {
             let agent = tab.agent(cx);
             let agent_status = tab.agent_status(cx);
             let agent_unread = tab.agent_unread_count(cx);
+            let agent_attention = tab.agent_attention_unread(cx);
             let zoomed = self.tab_is_zoomed(i);
 
             let rename_input = self
@@ -2017,6 +2016,7 @@ impl Tty7App {
                         Some(agent),
                         agent_status,
                         agent_unread,
+                        agent_attention,
                         None,
                         18.,
                         cx,
@@ -3051,8 +3051,8 @@ mod tests {
     }
 
     #[test]
-    fn a_generic_agent_title_shows_its_project_name() {
-        for agent in [None, Some(crate::core::cli_agent::CLIAgent::Codex)] {
+    fn agent_tabs_show_project_folder_names_unless_renamed() {
+        for agent in crate::core::cli_agent::CLIAgent::ALL {
             for cwd in [
                 r"D:\workspace\code\backend\tty7",
                 "D:/workspace/code/backend/tty7/",
@@ -3060,12 +3060,18 @@ mod tests {
                 r"\\server\share\tty7\",
             ] {
                 let mut tab = strip_tab();
-                tab.agent = agent;
-                tab.osc_title = Some("Codex".into());
+                tab.agent = Some(agent);
                 tab.cwd = Some(cwd.into());
+                for title in ["npm", "MEMORIES", "any terminal title"] {
+                    tab.osc_title = Some(title.into());
+                    assert_eq!(label_of(&tab, 0, None), "tty7");
+                    assert_eq!(tooltip_of(&tab, 0, None).as_deref(), Some(cwd));
+                }
+                tab.name = Some("my project".into());
+                assert_eq!(label_of(&tab, 0, None), "my project");
+                assert_eq!(tooltip_of(&tab, 0, None), None);
+                tab.name = None;
                 assert_eq!(label_of(&tab, 0, None), "tty7");
-                assert_eq!(super::project_name(cwd), "tty7");
-                assert_eq!(tooltip_of(&tab, 0, None).as_deref(), Some(cwd));
             }
         }
     }

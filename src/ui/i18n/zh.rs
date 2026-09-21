@@ -535,13 +535,14 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsNotifyOnCommandFinishDesc => "较长的前台命令完成后发出桌面提醒。",
         L10nKey::SettingsAgentNotifications => "Agent 通知",
         L10nKey::SettingsAgentNotificationsDesc => {
-            "Agent 任务完成、请求权限或等待输入时发出桌面提醒。"
+            "Agent 任务完成、请求权限或等待输入时发出桌面提醒。未聚焦包括切到同一窗口的其他标签页或分屏。"
         }
         L10nKey::SettingsNotifyThreshold => "通知阈值",
         L10nKey::SettingsNotifyThresholdDesc => "命令需运行多久才能算作“较长”。",
         L10nKey::SettingsWindow => "窗口",
         L10nKey::NotifyModeNever => "从不",
         L10nKey::NotifyModeUnfocused => "窗口未聚焦时",
+        L10nKey::AgentNotifyModeUnfocused => "面板未聚焦时",
         L10nKey::NotifyModeAlways => "总是",
         L10nKey::SettingsStartupNormal => "普通",
         L10nKey::SettingsStartupMaximized => "最大化",
@@ -1721,6 +1722,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::TrayAgentNeedsInput => "需要输入",
         L10nKey::AgentStatusWorking => "运行中",
         L10nKey::AgentStatusWaiting => "需要输入",
+        L10nKey::AgentStatusAttention => "有新提醒",
         L10nKey::AgentStatusDone => "已完成",
         L10nKey::NotifyCommandFinished => "命令运行完成，用时 {secs} 秒",
         L10nKey::NotifyCommandFinishedWithCommand => "{command} 已完成，用时 {secs} 秒",

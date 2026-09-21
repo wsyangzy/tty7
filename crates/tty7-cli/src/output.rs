@@ -8,10 +8,9 @@ use tty7_core::daemon::protocol::{PaneInfo, PaneProcs, PortProbe};
 
 use crate::resolve;
 
-/// What to call a tab in a table or a tree. Almost no tab carries a name — the
-/// GUI's strip shows the terminal's OSC title instead — so a column printing
-/// `tab.name` alone comes out empty for a window full of work. The evidence
-/// ranking is shared with the GUI; only the rendering is ours.
+/// What to call a tab in a table or a tree. The GUI shares the label priority:
+/// custom name first, then project directory for agents or terminal title for
+/// other panes. Only the rendering is ours.
 pub fn tab_label(view: &TabView) -> String {
     match view.label() {
         TabLabel::Named(name) => name.to_string(),
@@ -19,9 +18,8 @@ pub fn tab_label(view: &TabView) -> String {
             let title = strip_host_prefix(title);
             // A title that is only a path is what a shell integration writes,
             // and it gets cut down to its leaf like a cwd — the tree prints the
-            // whole path underneath anyway. Prose is an agent saying what it is
-            // doing: that is the name, and it stays whole, clamped only so one
-            // talkative tab cannot widen every column in the table.
+            // whole path underneath anyway. Other program titles stay whole,
+            // clamped so one talkative tab cannot widen every column.
             match title.starts_with(['/', '~']) {
                 true => path_leaf(title).to_string(),
                 false => clamp(title, 40),
@@ -498,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unnamed_tab_borrows_its_title_then_an_agent_then_a_place_then_its_process() {
+    fn tab_labels_follow_the_shared_name_priority() {
         let view = |f: &dyn Fn(&mut TabView)| {
             let mut v = TabView {
                 id: tty7_core::core::machine::TabId::new(),
@@ -524,17 +522,21 @@ mod tests {
             )),
             "Claude Code"
         );
-        // What the pane's own terminal says it is doing beats naming the agent
-        // running it — every tab of a workspace would otherwise read alike.
-        // The mark the agent writes in front of that title comes off here too:
-        // `tab_label` reads `TabView::label`, so the table says what the tab
-        // strip says without either being told about the other.
+        // Without a directory, use the agent identity rather than an OSC title.
         assert_eq!(
             tab_label(&view(&|v| {
                 v.osc_title = Some("✳ fixing the switcher".into());
                 v.agent = Some(tty7_core::core::cli_agent::CLIAgent::Claude);
             })),
-            "fixing the switcher"
+            "Claude Code"
+        );
+        assert_eq!(
+            tab_label(&view(&|v| {
+                v.osc_title = Some("npm".into());
+                v.agent = Some(tty7_core::core::cli_agent::CLIAgent::Codex);
+                v.cwd = Some(r"D:\workspace\code\backend\tty7".into());
+            })),
+            "tty7"
         );
         assert_eq!(
             tab_label(&view(

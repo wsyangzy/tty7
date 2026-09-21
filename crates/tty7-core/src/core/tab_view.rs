@@ -18,8 +18,7 @@ pub struct TabView {
     pub name: Option<String>,
     /// The foreground process of the tab's leading pane — "zsh", "vim".
     pub title: String,
-    /// The title the tab's terminal reported over OSC 0/2, which is the name the
-    /// window that owns it puts on its tab. See
+    /// The raw terminal title reported over OSC 0/2, used for non-agent tabs. See
     /// [`PaneRecord::osc_title`](crate::core::machine::PaneRecord::osc_title).
     pub osc_title: Option<String>,
     pub cwd: Option<String>,
@@ -37,17 +36,13 @@ pub struct TabView {
 pub enum TabLabel<'a> {
     /// Someone named this tab, so nothing else gets a say.
     Named(&'a str),
-    /// The terminal's own title. Second only to a given name because it is what
-    /// the window owning the tab is showing: a shell writes where it is, an
-    /// agent writes what it is doing, and either way disagreeing with the tab
-    /// strip would be worse than any ranking of our own.
+    /// The terminal's own title, used only when no agent is running.
     ///
     /// It may well be a path (`user@host:~/dir` is what the shell integration
     /// sets), so a caller that abbreviates [`Cwd`](Self::Cwd) has to abbreviate
     /// this too.
     Osc(&'a str),
-    /// No name, title, or useful cwd, but an agent is running in it — which is
-    /// what anyone scanning a list of tabs is looking for.
+    /// An agent is running, but no custom name or useful cwd is available.
     Agent(CLIAgent),
     /// The working directory of the tab's leading pane.
     Cwd(&'a str),
@@ -181,6 +176,12 @@ impl TabView {
         {
             return TabLabel::Named(name);
         }
+        let cwd = self.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty());
+        // OSC titles can come from any child process, not just the agent.
+        // Name agent tabs after their project regardless of the terminal title.
+        if let Some(agent) = self.agent {
+            return cwd.map(TabLabel::Cwd).unwrap_or(TabLabel::Agent(agent));
+        }
         if let Some(title) = self
             .osc_title
             .as_deref()
@@ -197,14 +198,8 @@ impl TabView {
         {
             return TabLabel::Osc(title);
         }
-        // A bare agent identity is shared by every tab running that agent;
-        // the project directory distinguishes them. A concrete OSC task title
-        // already won above, so this only changes the generic fallback.
-        if let Some(cwd) = self.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        if let Some(cwd) = cwd {
             return TabLabel::Cwd(cwd);
-        }
-        if let Some(agent) = self.agent {
-            return TabLabel::Agent(agent);
         }
         match self.title.trim() {
             "" => TabLabel::Unknown,
@@ -334,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn a_label_prefers_the_name_then_the_title_then_the_place_then_the_agent() {
+    fn a_label_prefers_custom_names_and_projects_for_agents() {
         let named = TabView {
             name: Some("  deploy  ".into()),
             osc_title: Some("✳ fixing the switcher".into()),
@@ -344,16 +339,14 @@ mod tests {
         };
         assert_eq!(named.label(), TabLabel::Named("deploy"));
 
-        // The window owning this tab shows the title its agent set, so the
-        // switcher listing the same tab has to show it too — naming it after
-        // the agent is what made every tab of a workspace read "Claude Code".
+        // Terminal titles cannot override an agent's project name.
         let titled = TabView {
             osc_title: Some("  ✳ fixing the switcher  ".into()),
             agent: Some(CLIAgent::Claude),
             cwd: Some("/work".into()),
             ..view()
         };
-        assert_eq!(titled.label(), TabLabel::Osc("fixing the switcher"));
+        assert_eq!(titled.label(), TabLabel::Cwd("/work"));
 
         let blank_title = TabView {
             osc_title: Some("   ".into()),
@@ -424,6 +417,54 @@ mod tests {
                 TabLabel::Cwd(r"D:\workspace\code\backend\tty7")
             );
         }
+    }
+
+    #[test]
+    fn agent_labels_ignore_terminal_titles_in_every_state() {
+        for agent in CLIAgent::ALL {
+            for status in [
+                None,
+                Some(AgentStatus::Idle),
+                Some(AgentStatus::Working),
+                Some(AgentStatus::Waiting),
+                Some(AgentStatus::Done),
+            ] {
+                let mut tab = TabView {
+                    agent: Some(agent),
+                    status,
+                    ..view()
+                };
+                for title in [
+                    "npm",
+                    "npm exec @upstash/context7-mcp@latest",
+                    "MEMORIES",
+                    "a new child process title",
+                    "修复标签页标题",
+                    "",
+                ] {
+                    tab.osc_title = Some(title.into());
+                    tab.cwd = Some("  /work/tty7  ".into());
+                    assert_eq!(tab.label(), TabLabel::Cwd("/work/tty7"));
+                    for cwd in [None, Some("   ".into())] {
+                        tab.cwd = cwd;
+                        assert_eq!(tab.label(), TabLabel::Agent(agent));
+                    }
+                    tab.name = Some("  my project  ".into());
+                    assert_eq!(tab.label(), TabLabel::Named("my project"));
+                    tab.cwd = Some("/work/tty7".into());
+                    assert_eq!(tab.label(), TabLabel::Named("my project"));
+                    tab.name = Some("   ".into());
+                    assert_eq!(tab.label(), TabLabel::Cwd("/work/tty7"));
+                    tab.name = None;
+                }
+            }
+        }
+        let shell = TabView {
+            osc_title: Some("npm".into()),
+            cwd: Some("/work/tty7".into()),
+            ..view()
+        };
+        assert_eq!(shell.label(), TabLabel::Osc("npm"));
     }
 
     #[test]

@@ -576,7 +576,11 @@ impl Tab {
 
     /// The leaf a tab names itself after — its title and, with it, the home
     /// that title's path is measured against.
-    fn title_leaf(&self, window: Option<&Window>, cx: &App) -> Option<Entity<TerminalView>> {
+    pub(crate) fn title_leaf(
+        &self,
+        window: Option<&Window>,
+        cx: &App,
+    ) -> Option<Entity<TerminalView>> {
         let leaf = match window {
             Some(window) => self
                 .pane
@@ -660,7 +664,7 @@ impl Tab {
             // those up as the title the pane is showing.
             title: crate::terminal::view::DEFAULT_TITLE.to_string(),
             osc_title: leaf.stated_title().map(str::to_string),
-            cwd: leaf.effective_cwd().map(|p| p.display().to_string()),
+            cwd: leaf.project_cwd().map(|p| p.display().to_string()),
             agent: leaf.agent(),
             status: leaf.agent_session().map(|s| s.status),
             live: !leaf.terminal.exited,
@@ -729,6 +733,13 @@ impl Tab {
 
     pub(crate) fn agent_status(&self, cx: &App) -> Option<crate::core::cli_agent::AgentStatus> {
         self.agent_row(cx).map(|(_, status)| status)
+    }
+
+    pub(crate) fn agent_attention_unread(&self, cx: &App) -> bool {
+        self.pane
+            .terminals()
+            .into_iter()
+            .any(|leaf| leaf.read(cx).agent_attention_unread())
     }
 
     pub(crate) fn agent_unread_count(&self, cx: &App) -> usize {

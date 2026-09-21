@@ -164,6 +164,7 @@ struct TabRow {
     agent: Option<crate::core::cli_agent::CLIAgent>,
     status: Option<crate::core::cli_agent::AgentStatus>,
     unread: usize,
+    attention: bool,
     ssh: Option<u32>,
     active: bool,
     /// Branch and diff counts, the same line the tab sidebar shows. Only this
@@ -966,18 +967,17 @@ impl Tty7App {
                         named: tab.name.as_deref().is_some_and(|n| !n.trim().is_empty())
                             || tab.agent(cx).is_some(),
                         path: tab
-                            .pane
-                            .terminals()
-                            .first()
+                            .title_leaf(None, cx)
                             .and_then(|leaf| {
                                 let leaf = leaf.read(cx);
-                                Some((leaf.cwd()?, leaf.display_home(cx)))
+                                Some((leaf.project_cwd()?, leaf.display_home(cx)))
                             })
                             .map(|(p, home)| crate::ui::home::display_path(&p, home.as_deref()))
                             .unwrap_or_default(),
                         agent: tab.agent(cx),
                         status: tab.agent_status(cx),
                         unread: tab.agent_unread_count(cx),
+                        attention: tab.agent_attention_unread(cx),
                         ssh: self.tab_ssh_dot(tab, cx),
                         active: i == self.active,
                         git: tab.git_status(None, cx),
@@ -1023,6 +1023,7 @@ impl Tty7App {
                 agent: v.agent,
                 status: v.status,
                 unread: 0,
+                attention: false,
                 ssh: None,
                 active: Some(v.id) == active,
                 git: git(v.cwd.as_deref()),
@@ -2917,6 +2918,7 @@ impl Tty7App {
                         tab.agent,
                         tab.status,
                         tab.unread,
+                        tab.attention,
                         tab.ssh,
                         ROW_AVATAR,
                         cx,
@@ -3321,6 +3323,35 @@ fn glyph_col(w: f32, child: impl IntoElement) -> impl IntoElement {
 mod tests {
     use super::*;
 
+    #[gpui::test]
+    fn a_split_switcher_path_follows_the_same_pane_as_its_label(cx: &mut gpui::TestAppContext) {
+        use crate::ui::pane::Pane;
+        use std::path::PathBuf;
+
+        let (app, mut vcx, _streams) = crate::ui::app::test_window::harness_with_tabs(cx, 2);
+        app.update(&mut vcx, |app, cx| {
+            for (i, path) in ["/work/first-project", "/work/selected-project"]
+                .into_iter()
+                .enumerate()
+            {
+                app.tabs[i]
+                    .title_leaf(None, cx)
+                    .unwrap()
+                    .update(cx, |view, _| {
+                        view.set_git_status_cwd_for_test(Some(PathBuf::from(path)));
+                    });
+            }
+            let selected = app.tabs[1].title_leaf(None, cx).unwrap().entity_id();
+            let second = app.tabs.remove(1).pane;
+            let first = std::mem::replace(&mut app.tabs[0].pane, Pane::Empty);
+            app.tabs[0].pane = Pane::split_node(gpui::Axis::Horizontal, 0.5, first, second);
+            app.remember_focused_leaf(selected);
+            let rows = app.tab_rows_for(app.workspace, cx);
+            assert_eq!(rows[0].label, "selected-project");
+            assert_eq!(rows[0].path, "/work/selected-project");
+        });
+    }
+
     /// #485 on the path #645 did not cover. A machine the switcher knows only
     /// from a listing snapshot has no store entry to name it, so its group
     /// used to be labelled by the target's own spelling — and a `Profile`
@@ -3471,6 +3502,7 @@ mod tests {
             agent: None,
             status: None,
             unread: 0,
+            attention: false,
             ssh: None,
             active: false,
             git: None,
@@ -3725,10 +3757,11 @@ mod tests {
         view.name = None;
         assert_eq!(
             tab_view_label(&view, 0, None),
-            "修复 workspace switcher",
-            "then the title the local strip would be showing — mark and all,              which is to say without the mark"
+            "tty7",
+            "agent tabs use the project name in every window"
         );
 
+        view.agent = None;
         view.osc_title = Some("user@host:~/repo/025/tty7".to_string());
         assert_eq!(
             tab_view_label(&view, 0, None),
@@ -3744,6 +3777,7 @@ mod tests {
         );
 
         view.osc_title = None;
+        view.agent = Some(crate::core::cli_agent::CLIAgent::Claude);
         assert_eq!(
             tab_view_label(&view, 0, None),
             "tty7",
