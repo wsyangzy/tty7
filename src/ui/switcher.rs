@@ -13,6 +13,7 @@ use tty7_core::core::machine::TabId;
 use tty7_core::core::session::{RemoteTarget, RouteSnapshot, WorkspaceId};
 
 use crate::core::actions::{SwitcherAcross, SwitcherAcrossBack};
+use crate::core::config::Config;
 use crate::core::session::WorkspaceStore;
 use crate::daemon::install::InstallPhase;
 use crate::terminal::pane_liveness::Liveness;
@@ -157,9 +158,9 @@ struct TabRow {
     index: usize,
     label: String,
     path: String,
-    /// Whether `label` is a name someone gave the tab. When it is not, the
-    /// label is already derived from the working directory and showing `path`
-    /// next to it just prints the same place twice.
+    /// Whether the label alone leaves the location ambiguous: a custom name,
+    /// an agent label, or a directory reduced to its last component. Show the
+    /// path underneath when the git status does not already occupy that line.
     named: bool,
     agent: Option<crate::core::cli_agent::CLIAgent>,
     status: Option<crate::core::cli_agent::AgentStatus>,
@@ -965,7 +966,8 @@ impl Tty7App {
                         index: i,
                         label: self.tab_label(tab, i, None, cx),
                         named: tab.name.as_deref().is_some_and(|n| !n.trim().is_empty())
-                            || tab.agent(cx).is_some(),
+                            || tab.agent(cx).is_some()
+                            || !cx.global::<Config>().tab_full_path,
                         path: tab
                             .title_leaf(None, cx)
                             .and_then(|leaf| {
@@ -1008,11 +1010,13 @@ impl Tty7App {
             .into_iter()
             .enumerate()
             .map(|(i, v)| TabRow {
-                label: tab_view_label(&v, i, home.as_deref()),
+                label: tab_view_label(&v, i, home.as_deref(), cx.global::<Config>().tab_full_path),
                 // The label only stands in for the path when it came *from* the
                 // path; a name or an agent leaves the location still worth
                 // printing.
-                named: v.name.as_deref().is_some_and(|n| !n.trim().is_empty()) || v.agent.is_some(),
+                named: v.name.as_deref().is_some_and(|n| !n.trim().is_empty())
+                    || v.agent.is_some()
+                    || !cx.global::<Config>().tab_full_path,
                 path: v
                     .cwd
                     .as_deref()
@@ -2902,6 +2906,12 @@ impl Tty7App {
             list = list.child(
                 h_flex()
                     .id(("switcher-tab", index))
+                    .when(!tab.path.is_empty(), |row| {
+                        let path = tab.path.clone();
+                        row.tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(path.clone()).build(window, cx)
+                        })
+                    })
                     .items_center()
                     .gap(px(8.))
                     .min_h(px(ROW_H))
@@ -3028,8 +3038,9 @@ fn tab_view_label(
     view: &crate::ui::machine_mirror::TabView,
     index: usize,
     home: Option<&std::path::Path>,
+    full_path: bool,
 ) -> String {
-    crate::ui::tab_strip::label_of(view, index, home)
+    crate::ui::tab_strip::label_of(view, index, home, full_path)
 }
 
 impl Group {
@@ -3752,26 +3763,31 @@ mod tests {
             live: true,
             panes: 1,
         };
-        assert_eq!(tab_view_label(&view, 0, None), "build", "a given name wins");
+        assert_eq!(
+            tab_view_label(&view, 0, None, true),
+            "build",
+            "a given name wins"
+        );
 
         view.name = None;
+        assert_eq!(tab_view_label(&view, 0, None, false), "tty7");
         assert_eq!(
-            tab_view_label(&view, 0, None),
-            "tty7",
+            tab_view_label(&view, 0, None, true),
+            "…/x/repo/tty7",
             "agent tabs use the project name in every window"
         );
 
         view.agent = None;
         view.osc_title = Some("user@host:~/repo/025/tty7".to_string());
         assert_eq!(
-            tab_view_label(&view, 0, None),
+            tab_view_label(&view, 0, None, true),
             crate::ui::tab_strip::short_title("user@host:~/repo/025/tty7", None),
             "a shell's title goes through the shortener the strip uses"
         );
 
         view.osc_title = Some("user@host:".to_string());
         assert_eq!(
-            tab_view_label(&view, 0, None),
+            tab_view_label(&view, 0, None, true),
             "zsh",
             "a title that shortens away to nothing falls through"
         );
@@ -3779,27 +3795,27 @@ mod tests {
         view.osc_title = None;
         view.agent = Some(crate::core::cli_agent::CLIAgent::Claude);
         assert_eq!(
-            tab_view_label(&view, 0, None),
-            "tty7",
+            tab_view_label(&view, 0, None, true),
+            "…/x/repo/tty7",
             "the project distinguishes tabs running the same agent"
         );
 
         view.agent = None;
         assert_eq!(
-            tab_view_label(&view, 0, None),
-            "tty7",
+            tab_view_label(&view, 0, None, true),
+            "…/x/repo/tty7",
             "the directory names the project in the strip and switcher"
         );
 
         view.cwd = None;
         assert_eq!(
-            tab_view_label(&view, 0, None),
+            tab_view_label(&view, 0, None, true),
             "zsh",
             "process name is last"
         );
 
         view.title = String::new();
-        assert!(tab_view_label(&view, 2, None).contains('3'));
+        assert!(tab_view_label(&view, 2, None, true).contains('3'));
     }
 }
 

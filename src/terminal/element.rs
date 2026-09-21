@@ -1906,6 +1906,7 @@ impl TerminalElement {
             let button = ev.button;
             let clicks = ev.click_count;
             view.update(cx, |v, cx| {
+                v.begin_link_click(button);
                 if button == MouseButton::Right {
                     // Before anything else: gpui-component builds the popup
                     // from a deferred callback, and by then the pointer is
@@ -1919,8 +1920,24 @@ impl TerminalElement {
                 let link_modifier = mods.secondary() || v.link_modifier_down();
                 if link_modifier
                     && button == MouseButton::Left
-                    && v.open_link_at(col, row, window, cx)
+                    && (v.open_link_at(col, row, window, cx)
+                        || v.defer_file_click(col, row, window, cx, move |v, cx| {
+                            if !should_show_context_menu(v.mouse_mode(), mods.shift) {
+                                v.mouse_press(MouseButton::Left, col, row, &mods);
+                                if !v.link_mouse_is_down() {
+                                    v.mouse_release(MouseButton::Left, col, row, &mods);
+                                }
+                            } else {
+                                if !v.editor_click(col, raw_row, clicks, mods.shift, cx) {
+                                    v.on_select_start(col, row, left, clicks, mods.shift, cx);
+                                }
+                                if !v.link_mouse_is_down() {
+                                    v.on_select_end(cx);
+                                }
+                            }
+                        }))
                 {
+                    v.consume_link_mouse_down();
                     return;
                 }
                 // The mirror image of the context-menu gate in
@@ -1968,6 +1985,9 @@ impl TerminalElement {
                 return;
             };
             view.update(cx, |v, cx| {
+                // Dragging is an immediate selection/application gesture. Stop
+                // waiting for an ambiguous file and give its mouse-down back.
+                v.resume_deferred_link_click(cx);
                 if v.mouse_mode() && !mods.shift {
                     v.mouse_drag(button, col, row, &mods);
                     return;
@@ -1992,6 +2012,9 @@ impl TerminalElement {
             let mods = ev.modifiers;
             let button = ev.button;
             view.update(cx, |v, cx| {
+                if button == MouseButton::Left && v.finish_link_mouse_up() {
+                    return;
+                }
                 if v.mouse_mode() && !mods.shift {
                     v.mouse_release(button, col, row, &mods);
                     return;

@@ -599,6 +599,10 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsTabBarPositionDesc => {
             "タブを上部の横一列または左側の縦サイドバーとして表示"
         }
+        L10nKey::SettingsTabFullPath => "タブ名にディレクトリパスを表示",
+        L10nKey::SettingsTabFullPathDesc => {
+            "タブバー、サイドバー、切り替え画面で末尾のフォルダー名の代わりにパスを表示します。長いパスは省略され、ホバーで全体を確認できます。独自の名前と端末タイトルは変わりません。"
+        }
         L10nKey::SettingsSidebarGrouping => "サイドバーのグループ化",
         L10nKey::SettingsSidebarGroupingDesc => {
             "サイドバータブを git リポジトリごとにまとめます。リポジトリ外のタブはスクラッチに、「リポジトリ／フォルダ別」なら作業ディレクトリごとに。左サイドバーのみ"
@@ -616,7 +620,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         }
         L10nKey::SettingsAgentNotifications => "Agent 通知",
         L10nKey::SettingsAgentNotificationsDesc => {
-            "Agent のタスク完了、権限確認、入力待ちをデスクトップ通知で知らせます。同じウィンドウの別タブやペインに移った場合も非フォーカスに含みます。"
+            "Agent のイベントと端末プログラムが要求するデスクトップ通知を制御します。同じウィンドウの別タブやペインも非フォーカスに含みます。コマンド完了通知は別に設定します。"
         }
         L10nKey::SettingsNotifyThreshold => "通知閾値（秒）",
         L10nKey::SettingsNotifyThresholdDesc => "「長時間」とみなすのに必要なコマンドの実行時間",

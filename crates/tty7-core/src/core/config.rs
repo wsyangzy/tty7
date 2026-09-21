@@ -194,6 +194,10 @@ pub struct Config {
     pub new_tab_position: NewTabPosition,
     #[serde(default, deserialize_with = "de_lenient")]
     pub tab_bar_position: TabBarPosition,
+    /// Directory-derived labels use their last component by default; hover
+    /// still exposes the full path to distinguish projects with the same name.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub tab_full_path: bool,
     #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
     #[serde(default)]
@@ -648,6 +652,7 @@ impl Default for Config {
             scrollback_limit: 10_000,
             new_tab_position: NewTabPosition::AfterCurrent,
             tab_bar_position: TabBarPosition::Left,
+            tab_full_path: false,
             sidebar_width: default_sidebar_width(),
             sidebar_collapsed: false,
             right_panel_visible: false,
@@ -1337,6 +1342,24 @@ mod tests {
         // Unknown values fall back rather than refusing the whole file.
         let garbage: Config = serde_json::from_str(r#"{"link_file_open":"emacs"}"#).unwrap();
         assert_eq!(garbage.file_open_mode(), LinkFileOpen::Internal);
+    }
+
+    #[test]
+    fn tab_full_path_defaults_off_and_round_trips() {
+        assert!(!Config::default().tab_full_path);
+        let old: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        assert!(!old.tab_full_path);
+        for enabled in [false, true] {
+            let cfg = Config {
+                tab_full_path: enabled,
+                ..Config::default()
+            };
+            let json = serde_json::to_string(&cfg).unwrap();
+            let back: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.tab_full_path, enabled);
+        }
+        let invalid: Config = serde_json::from_str(r#"{"tab_full_path": "full"}"#).unwrap();
+        assert!(!invalid.tab_full_path);
     }
 
     #[test]

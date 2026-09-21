@@ -590,6 +590,10 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsTabBarPositionDesc => {
             "Show tabs as a horizontal strip on top or a vertical sidebar on the left."
         }
+        L10nKey::SettingsTabFullPath => "Show paths in tab labels",
+        L10nKey::SettingsTabFullPathDesc => {
+            "Show the directory path instead of its last folder name in the tab bar, sidebar and switcher. Long paths shorten to fit; hover shows the full path. Custom names and terminal titles keep their own text."
+        }
         L10nKey::SettingsSidebarGrouping => "Sidebar grouping",
         L10nKey::SettingsSidebarGroupingDesc => {
             "Group sidebar tabs by git repository. Tabs outside a repo collect under Scratch, or under their working directory with \"By repo or folder\". Left sidebar only."
@@ -607,7 +611,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsAgentNotifications => "Agent notifications",
         L10nKey::SettingsAgentNotificationsDesc => {
-            "Desktop alerts when an agent finishes a task, requests permission, or needs input. Unfocused includes other tabs or panes in this window."
+            "Desktop alerts for agent events and alerts requested by terminal programs. Unfocused includes other tabs or panes in this window. Command-finish notifications are controlled separately."
         }
         L10nKey::SettingsNotifyThreshold => "Notify threshold",
         L10nKey::SettingsNotifyThresholdDesc => {

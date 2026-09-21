@@ -718,6 +718,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
         },
         SearchEntry {
             section: WindowTabs,
+            title: SettingsTabFullPath,
+            keywords: SettingsTabFullPathDesc,
+        },
+        SearchEntry {
+            section: WindowTabs,
             title: SettingsDiffPreviewFromCounts,
             keywords: SettingsSearchDiffPreviewFromCountsKeywords,
         },
@@ -6564,6 +6569,7 @@ impl Tty7App {
             TabBarPosition::Left => 1,
         };
         let sidebar_diff_preview = cfg.sidebar_diff_preview;
+        let tab_full_path = cfg.tab_full_path;
         let sidebar_grouping_idx = match cfg.sidebar_grouping {
             crate::core::config::SidebarGrouping::Repo => 0,
             crate::core::config::SidebarGrouping::RepoOrDirectory => 1,
@@ -6695,6 +6701,12 @@ impl Tty7App {
                 this.set_tab_bar_position(pos, cx);
             },
         );
+        let tab_full_path_switch = crate::ui::theme::switch("wt-tab-full-path", cx)
+            .checked(tab_full_path)
+            .on_click(cx.listener(|this, on: &bool, _w, cx| {
+                this.update_config(cx, |cfg| cfg.tab_full_path = *on);
+            }))
+            .into_any_element();
         let sidebar_diff_switch = crate::ui::theme::switch("wt-sidebar-diff-preview", cx)
             .checked(sidebar_diff_preview)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_sidebar_diff_preview(*on, cx)))
@@ -6762,6 +6774,12 @@ impl Tty7App {
                 t(L10nKey::SettingsSidebarGrouping),
                 t(L10nKey::SettingsSidebarGroupingDesc),
                 sidebar_grouping_radio,
+                cx,
+            ))
+            .child(self.settings_row(
+                t(L10nKey::SettingsTabFullPath),
+                t(L10nKey::SettingsTabFullPathDesc),
+                tab_full_path_switch,
                 cx,
             ))
             .child(self.settings_row(
