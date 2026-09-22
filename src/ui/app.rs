@@ -3339,6 +3339,14 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.sidebar_grouping = grouping);
     }
 
+    pub(crate) fn set_sidebar_git_display(
+        &mut self,
+        display: crate::core::config::SidebarGitDisplay,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_config(cx, |cfg| cfg.sidebar_git_display = display);
+    }
+
     pub(crate) fn set_sidebar_diff_preview(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.sidebar_diff_preview = on);
     }

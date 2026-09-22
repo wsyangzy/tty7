@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::core::config::{
     BellMode, Config, CursorStyle, LinkFileOpen, MouseZoomModifier, NewTabPosition, NotifyMode,
-    TabBarPosition, UI_FONT_SIZE_DEFAULT, UpdateChannel, WindowBackdrop,
+    SidebarGitDisplay, TabBarPosition, UI_FONT_SIZE_DEFAULT, UpdateChannel, WindowBackdrop,
 };
 use crate::core::keychain::{
     CredentialRef, CredentialStore as _, OsCredentialStore, key_account_from_contents,
@@ -720,6 +720,11 @@ fn settings_search_entries() -> &'static [SearchEntry] {
             section: WindowTabs,
             title: SettingsTabFullPath,
             keywords: SettingsTabFullPathDesc,
+        },
+        SearchEntry {
+            section: WindowTabs,
+            title: SettingsSidebarGitDisplay,
+            keywords: SettingsSearchDiffPreviewFromCountsKeywords,
         },
         SearchEntry {
             section: WindowTabs,
@@ -6568,6 +6573,11 @@ impl Tty7App {
             TabBarPosition::Top => 0,
             TabBarPosition::Left => 1,
         };
+        let sidebar_git_display_idx = match cfg.sidebar_git_display {
+            SidebarGitDisplay::Full => 0,
+            SidebarGitDisplay::Counts => 1,
+            SidebarGitDisplay::Hidden => 2,
+        };
         let sidebar_diff_preview = cfg.sidebar_diff_preview;
         let tab_full_path = cfg.tab_full_path;
         let sidebar_grouping_idx = match cfg.sidebar_grouping {
@@ -6707,6 +6717,24 @@ impl Tty7App {
                 this.update_config(cx, |cfg| cfg.tab_full_path = *on);
             }))
             .into_any_element();
+        let sidebar_git_display_radio = self.segmented(
+            "wt-sidebar-git-display",
+            &[
+                t(L10nKey::SettingsSidebarGitFull),
+                t(L10nKey::SettingsSidebarGitCounts),
+                t(L10nKey::SettingsSidebarGitHidden),
+            ],
+            sidebar_git_display_idx,
+            cx,
+            |this, ix, _w, cx| {
+                let display = match ix {
+                    0 => SidebarGitDisplay::Full,
+                    1 => SidebarGitDisplay::Counts,
+                    _ => SidebarGitDisplay::Hidden,
+                };
+                this.set_sidebar_git_display(display, cx);
+            },
+        );
         let sidebar_diff_switch = crate::ui::theme::switch("wt-sidebar-diff-preview", cx)
             .checked(sidebar_diff_preview)
             .on_click(cx.listener(|this, on: &bool, _w, cx| this.set_sidebar_diff_preview(*on, cx)))
@@ -6783,11 +6811,17 @@ impl Tty7App {
                 cx,
             ))
             .child(self.settings_row(
+                t(L10nKey::SettingsSidebarGitDisplay),
+                t(L10nKey::SettingsSidebarGitDisplayDesc),
+                sidebar_git_display_radio,
+                cx,
+            ))
+            .child(div().pl_4().child(self.settings_row(
                 t(L10nKey::SettingsDiffPreviewFromCounts),
                 t(L10nKey::SettingsDiffPreviewFromCountsDesc),
                 sidebar_diff_switch,
                 cx,
-            ))
+            )))
             .child(self.section_rule(cx))
             .child(self.section_header(t(L10nKey::SettingsNotifications), cx))
             .child(self.settings_row(

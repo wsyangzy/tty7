@@ -48,9 +48,18 @@ tabs whose shell has not reported a directory yet.
   </Card>
 </CardGroup>
 
-If you would rather the counts not be clickable, turn off **Settings → Window &
-Tabs → Open diff preview from sidebar counts**. The branch and the numbers stay;
-they simply stop opening the overlay.
+**Settings → Window & Tabs → Sidebar git display** controls both rows and group
+headers:
+
+- **Full** shows the branch icon, branch name and `+N −M` counts (the default).
+- **Only +N −N** shows just the counts. A clean repository leaves no empty git line.
+- **Hidden** removes the branch and counts from the sidebar.
+
+The indented **Allow clicks to open diff preview** option controls whether counts
+open the [diff overlay](/git/diffs). It also controls the Info panel's counts.
+Changing the display mode preserves this click preference, including when the
+sidebar's git information is hidden. The Info panel keeps showing its git details.
+Existing configurations keep the full display and their previous click preference.
 
 ## Rearranging
 

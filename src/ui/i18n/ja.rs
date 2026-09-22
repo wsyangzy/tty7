@@ -607,9 +607,16 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsSidebarGroupingDesc => {
             "サイドバータブを git リポジトリごとにまとめます。リポジトリ外のタブはスクラッチに、「リポジトリ／フォルダ別」なら作業ディレクトリごとに。左サイドバーのみ"
         }
-        L10nKey::SettingsDiffPreviewFromCounts => "サイドバーのカウントから Diff プレビューを開く",
+        L10nKey::SettingsSidebarGitDisplay => "サイドバーの Git 情報表示",
+        L10nKey::SettingsSidebarGitDisplayDesc => {
+            "サイドバーの行とグループ見出しの Git 情報を、ブランチと行数・行数のみ・非表示から選びます。"
+        }
+        L10nKey::SettingsSidebarGitFull => "すべて表示",
+        L10nKey::SettingsSidebarGitCounts => "+N −N のみ",
+        L10nKey::SettingsSidebarGitHidden => "非表示",
+        L10nKey::SettingsDiffPreviewFromCounts => "クリックで Diff プレビューを開く",
         L10nKey::SettingsDiffPreviewFromCountsDesc => {
-            "行の +N −N をクリックすると、オーバーレイでワーキングツリーの Diff を開きます。オフならカウントは表示されたまま、クリックだけできません"
+            "サイドバーや情報パネルの +N −N をクリックして Diff を開きます。この設定は表示モードとは独立して保存されます。"
         }
         L10nKey::DocumentDock => "ターミナルの隣にドック",
         L10nKey::DocumentFill => "ウィンドウ全体",
@@ -850,7 +857,7 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
             "リンク ハイパーリンク クリック可能 開く detect urls links hyperlink clickable open"
         }
         L10nKey::SettingsSearchDiffPreviewFromCountsKeywords => {
-            "diff オーバーレイ プレビュー サイドバー カウント git 変更 クリック ブランチ 行数 diff preview overlay sidebar counts git changes"
+            "diff オーバーレイ プレビュー サイドバー カウント git 変更 クリック ブランチ 行数 表示 非表示 すべて diff preview overlay sidebar counts git changes display full only hidden"
         }
         L10nKey::SettingsSearchDimInactivePanesKeywords => {
             "非アクティブ ペイン 暗く フォーカス 分割 fade unfocused inactive split pane focus opacity highlight active dimming"
