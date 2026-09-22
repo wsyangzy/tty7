@@ -11358,10 +11358,21 @@ mod gpui_tests {
         let before = window.update(cx, |_, _, cx| cx.entity()).unwrap();
         window
             .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx)
+                // Pane focus alone does not make the test window active.
+                window.activate_window();
+                view.focus_handle.clone().focus(window, cx);
             })
             .unwrap();
         cx.run_until_parked();
+        window
+            .update(cx, |view, window, _| {
+                assert!(
+                    window.is_window_active(),
+                    "the reader is looking at this window"
+                );
+                assert!(view.focus_handle.is_focused(window));
+            })
+            .unwrap();
         report_agent_turn(AgentStatus::Done, 1, &before, cx, &mut before_daemon);
         assert!(
             !poll_unread(window, &before, cx),
@@ -11430,10 +11441,20 @@ mod gpui_tests {
         let before = window.update(cx, |_, _, cx| cx.entity()).unwrap();
         window
             .update(cx, |view, window, cx| {
-                view.focus_handle.clone().focus(window, cx)
+                window.activate_window();
+                view.focus_handle.clone().focus(window, cx);
             })
             .unwrap();
         cx.run_until_parked();
+        window
+            .update(cx, |view, window, _| {
+                assert!(
+                    window.is_window_active(),
+                    "the reader is looking at this window"
+                );
+                assert!(view.focus_handle.is_focused(window));
+            })
+            .unwrap();
         report_agent_turn(AgentStatus::Done, 1, &before, cx, &mut before_daemon);
         assert!(!poll_unread(window, &before, cx));
 
@@ -11505,12 +11526,17 @@ mod gpui_tests {
         // tree, so nothing delivers it the blur that goes with losing it.
         window
             .update(cx, |view, window, cx| {
+                window.activate_window();
                 view.focus_handle.clone().focus(window, cx);
             })
             .unwrap();
         cx.run_until_parked();
         window
             .update(cx, |_, window, cx| {
+                assert!(
+                    window.is_window_active(),
+                    "the reader is looking at another pane in this window"
+                );
                 assert!(
                     !pane.read(cx).focus_handle.is_focused(window),
                     "the focus went back to the pane the reader is on"
@@ -11750,6 +11776,54 @@ mod gpui_tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_finished_turn_in_an_inactive_window_stays_unread_until_activation(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::core::cli_agent::AgentStatus;
+
+        let (window, mut daemon) = harness(cx);
+        let pane = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        window
+            .update(cx, |view, window, cx| {
+                window.activate_window();
+                view.focus_handle.clone().focus(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        gpui::VisualTestContext::from_window(window.into(), cx).deactivate_window();
+        window
+            .update(cx, |view, window, _| {
+                assert!(!window.is_window_active());
+                assert!(
+                    view.focus_handle.is_focused(window),
+                    "the background window still remembers its focused pane"
+                );
+            })
+            .unwrap();
+        report_agent_turn(AgentStatus::Done, 1, &pane, cx, &mut daemon);
+        assert!(
+            poll_unread(window, &pane, cx),
+            "pane focus in a background window does not mean the reader saw the result"
+        );
+
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |view, window, _| {
+                assert!(window.is_window_active());
+                assert!(view.focus_handle.is_focused(window));
+            })
+            .unwrap();
+        assert!(
+            !poll_unread(window, &pane, cx),
+            "returning to the focused pane marks its result as read"
+        );
     }
 
     /// An agent that moves into a git worktree does not `chdir` — the process
