@@ -528,9 +528,16 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
         L10nKey::SettingsSidebarGroupingDesc => {
             "按 git 仓库给侧栏标签页分组。仓库外的标签页归到“草稿”，选“按仓库或文件夹”时则按工作目录分。仅左侧栏。"
         }
-        L10nKey::SettingsDiffPreviewFromCounts => "从侧栏计数打开 diff 预览",
+        L10nKey::SettingsSidebarGitDisplay => "侧栏 Git 信息展示",
+        L10nKey::SettingsSidebarGitDisplayDesc => {
+            "选择侧栏标签行和分组标题的 Git 信息展示方式：分支与计数、仅计数或隐藏。"
+        }
+        L10nKey::SettingsSidebarGitFull => "完全展示",
+        L10nKey::SettingsSidebarGitCounts => "仅展示 +N −N",
+        L10nKey::SettingsSidebarGitHidden => "不展示",
+        L10nKey::SettingsDiffPreviewFromCounts => "允许点击计数打开 diff 预览",
         L10nKey::SettingsDiffPreviewFromCountsDesc => {
-            "点击行上的 +N −N 在浮层中打开 worktree diff。关闭后计数仍显示，只是不可点击。"
+            "允许点击侧栏和右侧信息面板中的 +N −N 打开 diff。此开关独立保存，不受展示模式切换影响。"
         }
         L10nKey::DocumentDock => "停靠在终端旁",
         L10nKey::DocumentFill => "铺满窗口",
@@ -749,7 +756,7 @@ pub fn translate_zh(key: L10nKey) -> Option<&'static str> {
             "检测URL 链接 超链接 可点击 打开 detect urls links hyperlink open"
         }
         L10nKey::SettingsSearchDiffPreviewFromCountsKeywords => {
-            "从侧栏计数打开 diff 预览 diff 预览 侧栏 git diff preview sidebar counts git changes"
+            "从侧栏计数打开 diff 预览 侧栏 Git 信息展示 完全展示 仅展示 +N −N 不展示 隐藏 分支 点击 diff preview sidebar counts git changes display full hidden branch click"
         }
         L10nKey::SettingsSearchDimInactivePanesKeywords => {
             "调暗 非活动窗格 淡化 未聚焦 分屏 高亮 active dimming pane focus"

@@ -45,7 +45,11 @@ Both are stated in the overlay when they apply — nothing is dropped silently.
 
 ## Turning the sidebar shortcut off
 
-If you would rather the sidebar's counts not be clickable, turn off **Settings →
-Window & Tabs → Open diff preview from sidebar counts**
-(`sidebar_diff_preview: false`). The branch and counts stay on the row; they
-just stop opening the overlay.
+Turn off **Settings → Window & Tabs → Sidebar git display → Allow clicks to open
+diff preview** (`sidebar_diff_preview: false`) to disable count clicks in both
+the sidebar and Info panel.
+
+The separate **Sidebar git display** setting (`sidebar_git_display`) chooses
+**Full** (`full`), **Only +N −N** (`counts`), or **Hidden** (`hidden`) for sidebar
+rows and group headers. Switching modes preserves the click preference. These
+settings do not disable opening diffs from Source Control or History.

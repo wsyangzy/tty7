@@ -249,6 +249,10 @@ pub struct Config {
     /// of such a root at worst folds two of them together.
     #[serde(default, deserialize_with = "de_lenient")]
     pub sidebar_collapsed_groups: Vec<String>,
+    /// Git information on sidebar rows and group headers, independent of
+    /// whether visible counts open a diff preview.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub sidebar_git_display: SidebarGitDisplay,
     #[serde(default = "default_true")]
     pub sidebar_diff_preview: bool,
     #[serde(default, deserialize_with = "de_lenient")]
@@ -496,6 +500,15 @@ pub enum SidebarGrouping {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum SidebarGitDisplay {
+    #[default]
+    Full,
+    Counts,
+    Hidden,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum NotifyMode {
     Never,
     #[default]
@@ -664,6 +677,7 @@ impl Default for Config {
             scm_graph_expanded: false,
             sidebar_grouping: SidebarGrouping::Repo,
             sidebar_collapsed_groups: Vec::new(),
+            sidebar_git_display: SidebarGitDisplay::Full,
             sidebar_diff_preview: true,
             notify_on_command_finish: NotifyMode::Unfocused,
             notify_on_agent_event: NotifyMode::Unfocused,
@@ -1378,6 +1392,61 @@ mod tests {
         assert!(json.contains("\"sidebar_diff_preview\":false"), "persisted");
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(!back.sidebar_diff_preview);
+    }
+
+    #[test]
+    fn sidebar_git_display_preserves_legacy_click_preferences() {
+        for click in [false, true] {
+            let old: Config = serde_json::from_value(serde_json::json!({
+                "sidebar_diff_preview": click,
+            }))
+            .unwrap();
+            assert_eq!(old.sidebar_git_display, SidebarGitDisplay::Full);
+            assert_eq!(old.sidebar_diff_preview, click);
+        }
+    }
+
+    #[test]
+    fn sidebar_git_display_round_trips_independently_of_clicks() {
+        for (value, mode) in [
+            ("full", SidebarGitDisplay::Full),
+            ("counts", SidebarGitDisplay::Counts),
+            ("hidden", SidebarGitDisplay::Hidden),
+        ] {
+            for click in [false, true] {
+                let cfg: Config = serde_json::from_value(serde_json::json!({
+                    "sidebar_git_display": value,
+                    "sidebar_diff_preview": click,
+                }))
+                .unwrap();
+                assert_eq!(cfg.sidebar_git_display, mode);
+                assert_eq!(cfg.sidebar_diff_preview, click);
+                let saved = serde_json::to_value(&cfg).unwrap();
+                assert_eq!(saved["sidebar_git_display"], value);
+                let back: Config = serde_json::from_value(saved).unwrap();
+                assert_eq!(back.sidebar_git_display, mode);
+                assert_eq!(back.sidebar_diff_preview, click);
+            }
+        }
+    }
+
+    #[test]
+    fn sidebar_git_display_invalid_values_keep_the_rest_of_the_config() {
+        for value in [
+            serde_json::json!("unknown"),
+            serde_json::json!(false),
+            serde_json::Value::Null,
+        ] {
+            let cfg: Config = serde_json::from_value(serde_json::json!({
+                "sidebar_git_display": value,
+                "sidebar_diff_preview": false,
+                "font_size": 19.0,
+            }))
+            .unwrap();
+            assert_eq!(cfg.sidebar_git_display, SidebarGitDisplay::Full);
+            assert!(!cfg.sidebar_diff_preview);
+            assert_eq!(cfg.font_size, 19.0);
+        }
     }
 
     #[test]

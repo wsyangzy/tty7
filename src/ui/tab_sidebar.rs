@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use std::path::{Path, PathBuf};
 
-use crate::core::config::{Config, SidebarGrouping};
+use crate::core::config::{Config, SidebarGitDisplay, SidebarGrouping};
 use crate::core::group_key::{GroupKey, collapse_key};
 use crate::terminal::git_status::GitStatusCache;
 use crate::ui::app::{TITLE_BAR_HEIGHT, Tab, Tty7App};
@@ -124,6 +124,18 @@ fn counts_width(
     w
 }
 
+/// Both rows and group headers omit an empty counts-only line entirely.
+fn sidebar_git_visible(
+    display: SidebarGitDisplay,
+    status: &crate::terminal::git_status::GitStatus,
+) -> bool {
+    match display {
+        SidebarGitDisplay::Full => true,
+        SidebarGitDisplay::Counts => status.added > 0 || status.removed > 0,
+        SidebarGitDisplay::Hidden => false,
+    }
+}
+
 /// The branch a whole group shares, lifted off its rows and onto its header.
 struct SharedGit {
     status: crate::terminal::git_status::GitStatus,
@@ -215,6 +227,8 @@ impl Tty7App {
         let active = self.active;
         let sf = cx.global::<crate::ui::presets::Surfaces>().sidebar;
         let show_badges = self.mod_hint_badges;
+        let git_display = cx.global::<Config>().sidebar_git_display;
+        let show_branch = git_display == SidebarGitDisplay::Full;
         let width = self.sidebar_px(window, cx);
         let query = self.sidebar_search.read(cx).value().trim().to_lowercase();
         // Blanked here, written again from paint: a row filtered out by the
@@ -546,45 +560,51 @@ impl Tty7App {
                 };
                 let mut branch_shown: Option<(SharedString, SharedString, u32, u32)> = None;
                 let mut cwd_shown: Option<(SharedString, SharedString)> = None;
-                let git_line = match shared_git.is_some() {
+                let git_status = match shared_git.is_some() {
                     true => None,
                     false => tab.git_status(Some(window), cx),
-                }
-                .map(|g| {
+                };
+                let has_git_status = git_status.is_some();
+                let visible_git = git_status.filter(|g| sidebar_git_visible(git_display, g));
+                let git_line = visible_git.map(|g| {
                     let mut line = h_flex()
                         .id(("sidebar-git", i))
                         .w_full()
                         .items_center()
                         .gap_1p5()
                         .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(
+                        .text_color(cx.theme().muted_foreground);
+                    if show_branch {
+                        line = line.child(
                             gpui::svg()
                                 .path("icons/git-branch.svg")
                                 .flex_shrink_0()
                                 .size(px(row_metrics::BRANCH_ICON))
                                 .text_color(cx.theme().muted_foreground),
                         );
-                    let counts_w = counts_width(&window.text_system(), &font, meta_size, &g);
-                    // Branch: keep both ends (`window-…backdrop`) so its
-                    // identifying tail survives a narrow sidebar.
-                    let branch_avail =
-                        (label_avail - row_metrics::BRANCH_ICON - row_metrics::META_GAP - counts_w)
+                        let counts_w = counts_width(&window.text_system(), &font, meta_size, &g);
+                        // Keep both ends so the identifying tail survives
+                        // a narrow sidebar.
+                        let branch_avail = (label_avail
+                            - row_metrics::BRANCH_ICON
+                            - row_metrics::META_GAP
+                            - counts_w)
                             .max(0.);
-                    let shown = elide_keep_edges(
-                        &window.text_system(),
-                        &font,
-                        meta_size,
-                        &g.branch,
-                        branch_avail,
-                    );
-                    branch_shown = Some((
-                        shown.clone(),
-                        SharedString::from(g.branch.clone()),
-                        g.added,
-                        g.removed,
-                    ));
-                    line = line.child(div().flex_1().min_w_0().truncate().child(shown));
+                        let shown = elide_keep_edges(
+                            &window.text_system(),
+                            &font,
+                            meta_size,
+                            &g.branch,
+                            branch_avail,
+                        );
+                        branch_shown = Some((
+                            shown.clone(),
+                            SharedString::from(g.branch.clone()),
+                            g.added,
+                            g.removed,
+                        ));
+                        line = line.child(div().flex_1().min_w_0().truncate().child(shown));
+                    }
                     if g.added > 0 || g.removed > 0 {
                         let mut counts = h_flex()
                             .id(("sidebar-diff", i))
@@ -635,10 +655,9 @@ impl Tty7App {
                 // a second one under it: a group of plain shells was a column
                 // of two-line rows describing paths that mostly agree, which
                 // is twice the height for a line of small grey text nobody
-                // was reading. A row keeps its second line only for a branch.
-                let cwd_full: Option<SharedString> = match git_line.is_none()
-                    && shared_git.is_none()
-                {
+                // was reading. Hiding git details must not turn a repo row
+                // into a non-repo row with a replacement directory label.
+                let cwd_full: Option<SharedString> = match !has_git_status && shared_git.is_none() {
                     false => None,
                     true => tab
                         .title_leaf(Some(window), cx)
@@ -1082,6 +1101,8 @@ impl Tty7App {
                 .as_ref()
                 .filter(|r| Some(&r.key) == group_key.as_ref())
                 .map(|r| r.input.clone());
+            let shared_git =
+                shared_git.filter(|shared| sidebar_git_visible(git_display, &shared.status));
             let header = section.name.clone().map(|name| {
                 // The header packs a heading and the branch its whole group
                 // shares onto one 11px line, and the branch is the unbounded
@@ -1111,10 +1132,14 @@ impl Tty7App {
                 // the branch sits in.
                 let git_want = shared_git.as_ref().map(|shared| {
                     let counts = counts_width(&ts, &font, header_size, &shared.status);
-                    row_metrics::BRANCH_ICON
-                        + 3. * row_metrics::META_GAP
-                        + measure_text(&ts, &font, header_size, &shared.status.branch)
-                        + counts
+                    if show_branch {
+                        row_metrics::BRANCH_ICON
+                            + 3. * row_metrics::META_GAP
+                            + measure_text(&ts, &font, header_size, &shared.status.branch)
+                            + counts
+                    } else {
+                        counts + row_metrics::META_GAP
+                    }
                 });
                 let name_avail = header_name_avail(avail, git_want);
                 let label = elide_label(
@@ -1208,30 +1233,36 @@ impl Tty7App {
                             click,
                             rows,
                         } = shared;
-                        let branch_avail = (avail
-                            - name_w
-                            - row_metrics::BRANCH_ICON
-                            - 3. * row_metrics::META_GAP
-                            - counts_width(&ts, &font, header_size, &status))
-                        .max(0.);
-                        // Both ends, like a row's: the tail is what tells two
-                        // branches off the same prefix apart.
-                        let branch =
-                            elide_keep_edges(&ts, &font, header_size, &status.branch, branch_avail);
                         let mut line = h_flex()
                             .id(("sidebar-group-git", group_ix))
                             .flex_shrink(1.)
                             .min_w_0()
                             .items_center()
                             .gap_1p5()
-                            .child(
-                                gpui::svg()
-                                    .path("icons/git-branch.svg")
-                                    .flex_shrink_0()
-                                    .size(px(row_metrics::BRANCH_ICON))
-                                    .text_color(cx.theme().muted_foreground),
-                            )
-                            .child(div().min_w_0().truncate().child(branch));
+                            .when(show_branch, |line| {
+                                let branch_avail = (avail
+                                    - name_w
+                                    - row_metrics::BRANCH_ICON
+                                    - 3. * row_metrics::META_GAP
+                                    - counts_width(&ts, &font, header_size, &status))
+                                .max(0.);
+                                // Keep both ends, as on a row.
+                                let branch = elide_keep_edges(
+                                    &ts,
+                                    &font,
+                                    header_size,
+                                    &status.branch,
+                                    branch_avail,
+                                );
+                                line.child(
+                                    gpui::svg()
+                                        .path("icons/git-branch.svg")
+                                        .flex_shrink_0()
+                                        .size(px(row_metrics::BRANCH_ICON))
+                                        .text_color(cx.theme().muted_foreground),
+                                )
+                                .child(div().min_w_0().truncate().child(branch))
+                            });
                         if status.added > 0 || status.removed > 0 {
                             let mut counts = h_flex()
                                 .id(("sidebar-group-diff", group_ix))
@@ -2786,18 +2817,26 @@ mod tests {
     fn diff_preview_setting_gates_the_click_target() {
         let mut cfg = Config::default();
         assert!(cfg.sidebar_diff_preview, "default is today's behaviour");
-        assert_eq!(
-            diff_click_cwd(&cfg, Some(p("/w/repo"))),
-            Some(p("/w/repo")),
-            "enabled: the counts are a click target"
-        );
+        for display in [
+            SidebarGitDisplay::Full,
+            SidebarGitDisplay::Counts,
+            SidebarGitDisplay::Hidden,
+        ] {
+            cfg.sidebar_git_display = display;
+            cfg.sidebar_diff_preview = true;
+            assert_eq!(
+                diff_click_cwd(&cfg, Some(p("/w/repo"))),
+                Some(p("/w/repo")),
+                "Info panel counts remain clickable even when sidebar details are hidden"
+            );
 
-        cfg.sidebar_diff_preview = false;
-        assert_eq!(
-            diff_click_cwd(&cfg, Some(p("/w/repo"))),
-            None,
-            "disabled: no cwd, so no cursor and no toggle_diff_overlay"
-        );
+            cfg.sidebar_diff_preview = false;
+            assert_eq!(
+                diff_click_cwd(&cfg, Some(p("/w/repo"))),
+                None,
+                "disabled: no cwd, so no cursor and no toggle_diff_overlay"
+            );
+        }
     }
 
     #[test]

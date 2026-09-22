@@ -598,9 +598,16 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::SettingsSidebarGroupingDesc => {
             "Group sidebar tabs by git repository. Tabs outside a repo collect under Scratch, or under their working directory with \"By repo or folder\". Left sidebar only."
         }
-        L10nKey::SettingsDiffPreviewFromCounts => "Open diff preview from sidebar counts",
+        L10nKey::SettingsSidebarGitDisplay => "Sidebar git display",
+        L10nKey::SettingsSidebarGitDisplayDesc => {
+            "Choose git information on sidebar rows and group headers: branch and counts, counts only, or hidden."
+        }
+        L10nKey::SettingsSidebarGitFull => "Full",
+        L10nKey::SettingsSidebarGitCounts => "Only +N −N",
+        L10nKey::SettingsSidebarGitHidden => "Hidden",
+        L10nKey::SettingsDiffPreviewFromCounts => "Allow clicks to open diff preview",
         L10nKey::SettingsDiffPreviewFromCountsDesc => {
-            "Click a row's +N −N to open the working-tree diff in an overlay. Off leaves the counts visible, just not clickable."
+            "Click +N −N in the sidebar or Info panel to open a diff. This preference is saved independently of the display mode."
         }
         L10nKey::DocumentDock => "Dock beside terminal",
         L10nKey::DocumentFill => "Fill window",
@@ -823,7 +830,7 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         }
         L10nKey::SettingsSearchDetectUrlsKeywords => "links hyperlink clickable open",
         L10nKey::SettingsSearchDiffPreviewFromCountsKeywords => {
-            "diff overlay preview sidebar counts git changes click branch lines"
+            "open diff overlay preview sidebar counts git changes click branch lines display full only hidden hide"
         }
         L10nKey::SettingsSearchDimInactivePanesKeywords => {
             "fade unfocused inactive split pane focus opacity highlight active dimming"
