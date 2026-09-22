@@ -27,6 +27,11 @@ around it — which is what makes a path a build tool printed from the workspace
 root resolve while the shell sits in a member directory. A path that matches
 nothing under either says so rather than doing nothing.
 
+Paths wrapped by the terminal are detected across rows. A path enclosed in
+parentheses, brackets, or quotes can also span explicit line breaks with
+padding or indentation, as in coding-agent output. Hovering, clicking, and
+the file context menu all use the complete path.
+
 Paths in a pane connected to another machine are resolved *on that machine*,
 so the underline appears a moment after the pointer settles rather than
 instantly. A pane running `ssh` typed into a local shell has no host that can

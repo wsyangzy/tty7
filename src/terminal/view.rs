@@ -12750,6 +12750,73 @@ mod gpui_tests {
         }
     }
 
+    #[gpui::test]
+    fn padded_file_link_opens_and_copies_the_absolute_path_from_either_row(
+        cx: &mut TestAppContext,
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = tty7_core::core::path_spelling::local_spelling_buf(dir.path().to_path_buf());
+        let frontend = root.join("frontend").join("risk-insight-ui");
+        let path = frontend
+            .join("output")
+            .join("playwright")
+            .join("mobile-cards.png");
+        let cwd = root.join("backend").join("risk-insight");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(&path, b"test image").unwrap();
+        let output = format!(
+            "see ({}/\r\n  output/playwright/mobile-cards.png)",
+            frontend.to_string_lossy().replace('\\', "/")
+        );
+        let (window, pane, _daemon) = rooted_harness(cx);
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        window
+            .update(cx, |_, _, cx| {
+                pane.update(cx, |view, cx| {
+                    view.terminal.seed_cwd(Some(cwd));
+                    let seen = opened.clone();
+                    cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
+                        seen.borrow_mut().push(event.path.clone());
+                    })
+                    .detach();
+                });
+            })
+            .unwrap();
+
+        // Begin with the continuation, on a cold cache and in a different
+        // project. No relative tail should ever be submitted to the host.
+        for (col, row) in [(3, 1), (6, 0)] {
+            window
+                .update(cx, |_, window, cx| {
+                    pane.update(cx, |view, cx| {
+                        view.set_grid_size(output.chars().count() + 8, 6, px(8.), px(17.), 1., cx);
+                        let mut parser: alacritty_terminal::vte::ansi::Processor =
+                            Default::default();
+                        parser.advance(
+                            &mut *view.terminal.term.lock(),
+                            format!("\x1b[2J\x1b[H{output}").as_bytes(),
+                        );
+                        assert!(view.open_link_at(col, row, window, cx));
+                        view.record_menu_link(col, row, cx);
+                        assert_eq!(view.menu_link_path(), Some(path.as_path()));
+                        view.resolve_menu_link(FileLinkAction::CopyPath, window, cx);
+                    });
+                })
+                .unwrap();
+            settle_link_entity_opens(&pane, cx);
+            assert_eq!(opened.borrow().last(), Some(&path));
+            assert_eq!(
+                cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text())),
+                Some(path.to_string_lossy().into_owned()),
+            );
+        }
+        assert_eq!(opened.borrow().len(), 2);
+    }
+
     /// The case from the bug report: a relative path printed by a tool, sitting
     /// in a pane that reported its directory. It resolves; a name that is not
     /// there does not, and comes back as an unresolved *candidate* so the click
