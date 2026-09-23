@@ -530,16 +530,13 @@ pub(crate) fn caret_ink(caret: Hsla, background: Hsla, foreground: Hsla) -> Hsla
     }
 }
 
-/// A brand colour painted straight onto a theme surface, as ink.
-///
-/// A brand colour is a fixed value; the surface under it is not. Codex and Grok
-/// are both pure black and would be nothing at all on a dark window, so the
-/// value is walked toward whichever end of the range reads on that surface
-/// until it clears `ACCENT_FLOOR` — hue first, legibility enforced. The walk is
-/// a no-op for the colours that already clear it, which is most of them, so an
-/// agent's mark is its own orange or blue in every theme.
-pub(crate) fn mark_ink(brand: u32, surface: Hsla) -> Hsla {
-    gpui::rgb(legible_accent(pack(surface), brand)).into()
+/// Whether a filled shape needs a hairline to stay a shape. A brand colour is a
+/// fixed value; a theme background is not, and pure black on a dark window is
+/// no shape at all.
+pub(crate) fn needs_edge(fill: u32, surface: Hsla) -> bool {
+    let rgb = crate::terminal::palette::hsla_to_rgb(surface);
+    let packed = (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32;
+    contrast(fill, packed) < 1.25
 }
 
 /// Whether a surface is dark enough that a halo cut in its own colour stops

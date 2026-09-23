@@ -1920,24 +1920,38 @@ impl Tty7App {
                 if stated.as_ref().is_some_and(GroupKey::is_custom) {
                     return stated;
                 }
-                let cwd = tab.title_leaf(None, cx).and_then(|leaf| {
+                let resolved = tab.title_leaf(None, cx).and_then(|leaf| {
                     let view = leaf.read(cx);
                     let cwd = view.project_cwd();
-                    // An onward SSH hop reports paths outside this pane's Host.
+                    if let Some(remote) = view.remote_context() {
+                        if remote.kind == crate::daemon::protocol::RemoteKind::NativeSsh {
+                            // Native SSH has no Host that can probe its paths.
+                            // Agents still group by their stable project, not
+                            // the shell/tool cwd that can change during a turn.
+                            let cwd = if view.agent().is_some() {
+                                cwd.filter(|p| p.to_string_lossy().starts_with('/'))
+                            } else {
+                                view.native_ssh_cwd()
+                            };
+                            return Some(
+                                cwd.and_then(|cwd| unprobed_group(grouping, &cwd).flatten()),
+                            );
+                        }
+                        return Some(None);
+                    }
                     // A shell still starting may simply not have reported its
                     // directory yet, so only explicit loss clears its group.
-                    if view.remote_context().is_some() || (view.agent().is_some() && cwd.is_none())
-                    {
-                        *tab.sidebar_group.borrow_mut() = None;
-                        return None;
+                    if view.agent().is_some() && cwd.is_none() {
+                        return Some(None);
                     }
-                    Some((view.host_id(), cwd?))
+                    let cwd = cwd?;
+                    let known = cx
+                        .global::<GitStatusCache>()
+                        .known_repo_for(view.host_id(), &cwd);
+                    resolved_group(grouping, known, &cwd)
                 });
-                if let Some((id, cwd)) = cwd {
-                    let known = cx.global::<GitStatusCache>().known_repo_for(id, &cwd);
-                    if let Some(group) = resolved_group(grouping, known, &cwd) {
-                        *tab.sidebar_group.borrow_mut() = group;
-                    }
+                if let Some(group) = resolved {
+                    *tab.sidebar_group.borrow_mut() = group;
                 }
                 tab.sidebar_group.borrow().clone()
             })
@@ -2027,6 +2041,20 @@ fn resolved_group(
         }
         None => None,
     })
+}
+
+/// The group for a cwd no repo probe can ever run in — a native SSH pane's.
+/// "Never probed" would leave such a tab in Scratch for good, so it is read
+/// as a settled "no repo": repo-or-directory grouping files it under the
+/// folder, the same as a local shell in a plain directory, and repo grouping
+/// leaves it in Scratch. A remote repo therefore groups by the folder the
+/// shell is in, not its root — there is nothing to ask for the root.
+///
+/// The key is the bare path, the same as every other derived group: a remote
+/// `/home/ubuntu` and a local one share a header, as two remote workspaces'
+/// identical paths already would.
+fn unprobed_group(grouping: SidebarGrouping, cwd: &Path) -> Option<Option<GroupKey>> {
+    resolved_group(grouping, Some(None), cwd)
 }
 
 #[derive(Debug, PartialEq)]
@@ -2404,6 +2432,92 @@ mod fold_tests {
             assert_eq!(app.sidebar_group_keys(cx)[0], None);
             assert_eq!(*app.tabs[0].sidebar_group.borrow(), None);
         });
+    }
+
+    #[gpui::test]
+    fn native_ssh_grouping_preserves_agent_project_identity(cx: &mut TestAppContext) {
+        use crate::core::cli_agent::{AgentSessionState, CLIAgent};
+        use crate::daemon::protocol::{DaemonMsg, RemoteContext, RemoteKind};
+        use std::io::Write as _;
+
+        let (app, mut vcx, mut streams) = harness_with_tabs(cx, 1);
+        let pane = app.update(&mut vcx, |app, cx| {
+            app.tabs[0].title_leaf(None, cx).unwrap()
+        });
+        let project = PathBuf::from("/work/project");
+        for (kind, agent, trusted_project, folder) in [
+            (RemoteKind::NativeSsh, None, None, "/home/dev"),
+            (
+                RemoteKind::NativeSsh,
+                Some(CLIAgent::Codex),
+                Some(project.clone()),
+                "/work/tool-a",
+            ),
+            (
+                RemoteKind::NativeSsh,
+                Some(CLIAgent::Codex),
+                Some(project.clone()),
+                "/work/tool-b",
+            ),
+            (
+                RemoteKind::NativeSsh,
+                Some(CLIAgent::Codex),
+                None,
+                "/work/untrusted",
+            ),
+            (RemoteKind::Ssh, None, None, "/work/onward"),
+        ] {
+            let cwd = PathBuf::from(folder);
+            DaemonMsg::RemoteContext(Some(RemoteContext {
+                kind,
+                argv: Vec::new(),
+                target: "dev@remote".into(),
+            }))
+            .encode(&mut streams[0])
+            .unwrap();
+            DaemonMsg::Agent(agent).encode(&mut streams[0]).unwrap();
+            DaemonMsg::AgentStatus(agent.map(|_| AgentSessionState {
+                cwd: Some(cwd.clone()),
+                project_cwd: trusted_project.clone(),
+                ..Default::default()
+            }))
+            .encode(&mut streams[0])
+            .unwrap();
+            // Last frame is also the barrier before inspecting the view.
+            DaemonMsg::Cwd(cwd.clone()).encode(&mut streams[0]).unwrap();
+            streams[0].flush().unwrap();
+            for _ in 0..200 {
+                if pane.read_with(&vcx, |view, _| view.cwd()) == Some(cwd.clone()) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(
+                pane.read_with(&vcx, |view, _| view.cwd()),
+                Some(cwd.clone())
+            );
+
+            app.update(&mut vcx, |app, cx| {
+                cx.update_global::<Config, _>(|cfg, _| {
+                    cfg.sidebar_grouping = SidebarGrouping::RepoOrDirectory;
+                });
+                let expected = if kind != RemoteKind::NativeSsh {
+                    None
+                } else if agent.is_some() {
+                    trusted_project.clone()
+                } else {
+                    Some(cwd.clone())
+                };
+                assert_eq!(app.sidebar_group_keys(cx)[0], expected.map(GroupKey::Repo));
+                cx.update_global::<Config, _>(|cfg, _| {
+                    cfg.sidebar_grouping = SidebarGrouping::Repo;
+                });
+                assert_eq!(app.sidebar_group_keys(cx)[0], None);
+                *app.tabs[0].sidebar_group.borrow_mut() = GroupKey::custom("Pinned");
+                assert_eq!(app.sidebar_group_keys(cx)[0], GroupKey::custom("Pinned"));
+                *app.tabs[0].sidebar_group.borrow_mut() = None;
+            });
+        }
     }
 
     /// The way out. A stated group locks the probe out of that tab, so if
@@ -2852,6 +2966,24 @@ mod tests {
             resolved_group(SidebarGrouping::RepoOrDirectory, None, &cwd),
             None
         );
+    }
+
+    #[test]
+    fn a_native_ssh_cwd_groups_by_its_remote_folder() {
+        let home = p("/home/ubuntu");
+        assert_eq!(
+            unprobed_group(SidebarGrouping::RepoOrDirectory, &home),
+            Some(Some(g("/home/ubuntu")))
+        );
+        assert_eq!(
+            unprobed_group(SidebarGrouping::Repo, &home),
+            Some(None),
+            "under Repo there is no repo to find, so Scratch"
+        );
+        // Named by the last segment, like a local folder group.
+        let keys = [Some(g("/home/ubuntu")), None];
+        let sections = sidebar_sections(&keys);
+        assert_eq!(sections[0].name.as_deref(), Some("ubuntu"));
     }
 
     #[test]
