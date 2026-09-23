@@ -647,19 +647,46 @@ pub(crate) fn chrome_tile(button: Button, selected: bool, cx: &gpui::App) -> But
     chrome_tile_sized(button, TILE_SIZE, TILE_GLYPH, selected, cx)
 }
 
-/// Secondary panel navigation stays neutral; workspace selection owns accent.
-pub(crate) fn chrome_tile_marked(button: Button, current: bool, cx: &gpui::App) -> Button {
-    button
-        .custom(chrome_tile_variant_for(current, cx))
-        .when(current, |button| {
-            button
-                .bg(cx.theme().secondary)
-                .text_color(cx.theme().foreground)
-        })
-        .with_size(px(TILE_GLYPH / BUTTON_ICON_SCALE))
-        .w(px(TILE_SIZE))
-        .h(px(TILE_SIZE))
+const RIGHT_PANEL_TABS: [(RightPanelTab, L10nKey); 3] = [
+    (RightPanelTab::Info, L10nKey::PanelInfoTitle),
+    (RightPanelTab::Scm, L10nKey::PanelChangesTitle),
+    (RightPanelTab::Files, L10nKey::PanelFilesTitle),
+];
+
+fn right_panel_tab_size(window: &Window) -> f32 {
+    window.rem_size().as_f32() * crate::ui::right_panel::META
 }
+
+fn right_panel_tab_font(cx: &gpui::App) -> gpui::Font {
+    gpui::Font {
+        family: cx.theme().font_family.clone(),
+        features: Default::default(),
+        fallbacks: None,
+        weight: FontWeight::SEMIBOLD,
+        style: Default::default(),
+    }
+}
+
+/// What the three bare tab labels take, padding included, at the live
+/// interface size and language. The panel's floor is built on it, so a larger
+/// UI font widens the panel instead of pushing its chrome tiles off the edge.
+pub(crate) fn right_panel_tab_labels_w(window: &Window, cx: &gpui::App) -> f32 {
+    let size = right_panel_tab_size(window);
+    let font = right_panel_tab_font(cx);
+    RIGHT_PANEL_TABS
+        .iter()
+        .map(|(_, key)| {
+            measure_text(window.text_system(), &font, size, t(*key))
+                + 2. * (TAB_OUTER_PAD + TAB_INNER_PAD)
+        })
+        .sum()
+}
+
+/// Right panel tab geometry: the gap between two tabs' hover pills, the pill's
+/// own inset around its label, and the gap before the Changes count.
+const TAB_OUTER_PAD: f32 = 2.;
+const TAB_INNER_PAD: f32 = 8.;
+const TAB_COUNT_GAP: f32 = 5.;
 
 /// How wide the two chrome tiles at the trailing end of the title bar are, with
 /// the padding around them.
@@ -1001,7 +1028,7 @@ pub(crate) fn workspace_avatar(
                 .text_color(cx.theme().foreground.opacity(0.65))
                 .child(initial),
         )
-        .children(dot.map(|rgb| Tty7App::status_dot(rgb, 0, size, cx.theme().popover)))
+        .children(dot.map(|rgb| Tty7App::status_dot(rgb, 0, size, cx.theme().popover, false)))
 }
 
 pub(crate) fn select_workspace_action(index: usize) -> Option<Box<dyn gpui::Action>> {
@@ -1028,9 +1055,9 @@ impl Tty7App {
                 .id("workspace-rename")
                 .flex_shrink_0()
                 .items_center()
-                .h(px(30.))
+                .h(px(28.))
                 .w_full()
-                .px(px(7.))
+                .px(px(9.))
                 .rounded_md()
                 .bg(cx.theme().sidebar_accent)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1097,8 +1124,9 @@ impl Tty7App {
                                     .flex_shrink(1.)
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(12.5))
+                                    .text_size(px(13.))
                                     .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().foreground)
                                     .child(SharedString::from(current.clone())),
                             )
                             .child(
@@ -1112,7 +1140,7 @@ impl Tty7App {
                     )
                     .xsmall()
                     .w_full()
-                    .h(px(30.))
+                    .h(px(28.))
                     .rounded_md()
                     .tooltip_element(chord_tooltip(
                         t(L10nKey::HomeSwitchWorkspace),
@@ -1205,7 +1233,18 @@ impl Tty7App {
             .child(self.app_menu_tile(window, cx))
     }
 
-    pub(crate) fn right_panel_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// The right panel's word tabs, laid out in `avail` px.
+    ///
+    /// A label is never elided — "C…" is not a tab anyone can read — so when
+    /// the row runs short the Changes count is what gives way: it repeats what
+    /// the panel body says, the label does not. `right_panel::MIN_WIDTH` is
+    /// what guarantees the three bare labels always fit.
+    pub(crate) fn right_panel_tabs(
+        &self,
+        avail: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let active_tab = self.right_panel_tab;
         // The count the source control tile carries. It reads the same status
         // the panel draws, so the badge and the group headers can never
@@ -1218,81 +1257,114 @@ impl Tty7App {
             .and_then(|repo| crate::terminal::git_data::status_of(cx, repo.host, &repo.root))
             .map(|status| status.entries.len())
             .filter(|n| *n > 0);
-        [
-            (
-                RightPanelTab::Info,
-                Icon::empty().path("icons/info.svg"),
-                L10nKey::PanelInfoTitle,
-            ),
-            (
-                RightPanelTab::Scm,
-                Icon::empty().path("icons/git-branch.svg"),
-                L10nKey::PanelChangesTitle,
-            ),
-            (
-                RightPanelTab::Files,
-                Icon::new(IconName::FolderClosed),
-                L10nKey::PanelFilesTitle,
-            ),
-        ]
-        .into_iter()
-        .map(|(tab, icon, label_key)| {
-            let current = active_tab == tab;
-            let tile = chrome_tile_marked(
-                Button::new(("right-panel-tab", tab as usize)).icon(icon),
-                current,
-                cx,
-            )
-            .rounded_lg()
-            .tooltip(match (tab, changed) {
-                (RightPanelTab::Scm, Some(n)) => {
-                    SharedString::from(format!("{} · {n}", t(label_key)))
-                }
-                _ => SharedString::from(t(label_key)),
+        let hover = gpui::rgb(cx.global::<crate::ui::presets::Surfaces>().sidebar.hover);
+        let size = right_panel_tab_size(window);
+        let font = right_panel_tab_font(cx);
+        let ts = window.text_system();
+        let labels_w = right_panel_tab_labels_w(window, cx);
+        let changed = changed.filter(|n| {
+            let regular = gpui::Font {
+                weight: FontWeight::NORMAL,
+                ..font.clone()
+            };
+            labels_w + TAB_COUNT_GAP + measure_text(ts, &regular, size, &n.to_string()) <= avail
+        });
+        RIGHT_PANEL_TABS
+            .into_iter()
+            .map(|(tab, label_key)| {
+                let current = active_tab == tab;
+                // Words, not glyphs: three tabs is few enough to name, and a name
+                // is what a new user has to guess at when the tab is an icon. The
+                // current one is told apart by ink and the bar under it, both
+                // neutral — this is secondary navigation, not an action.
+                let ink = match current {
+                    true => cx.theme().foreground,
+                    false => cx.theme().muted_foreground,
+                };
+                let count = match tab {
+                    RightPanelTab::Scm => changed,
+                    _ => None,
+                };
+                div()
+                    .id(("right-panel-tab", tab as usize))
+                    // The press must not start a window drag from the title bar
+                    // the tabs sit in.
+                    .occlude()
+                    .flex_shrink_0()
+                    // Full height and `relative` so the bar below can be pinned to
+                    // the row's own bottom edge, where it lands on the hairline
+                    // that closes the row rather than floating under the label.
+                    .h_full()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .px(px(TAB_OUTER_PAD))
+                    .cursor_pointer()
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .h(px(crate::ui::app::TILE_SIZE_SM + 2.))
+                            .px(px(TAB_INNER_PAD))
+                            .gap(px(TAB_COUNT_GAP))
+                            .items_center()
+                            .rounded_full()
+                            .hover(|s| s.bg(hover))
+                            .text_size(gpui::rems(crate::ui::right_panel::META))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(ink)
+                            .child(div().flex_shrink_0().child(t(label_key)))
+                            .when_some(count, |row, n| {
+                                row.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .font_weight(FontWeight::NORMAL)
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(n.to_string()),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom(px(-1.))
+                            .left(px(TAB_OUTER_PAD + TAB_INNER_PAD))
+                            .right(px(TAB_OUTER_PAD + TAB_INNER_PAD))
+                            .h(px(2.))
+                            .rounded_full()
+                            .when(current, |bar| bar.bg(cx.theme().foreground)),
+                    )
+                    // Another tab switches to it; the current one puts the panel
+                    // away, the way an activity bar behaves everywhere else.
+                    // (These only exist while the panel is open, so
+                    // `ToggleRightPanel` and the chrome tile beside them are still
+                    // what brings it back.)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        match this.right_panel_open(cx) && this.right_panel_tab == tab {
+                            true => {
+                                this.toggle_right_panel(cx);
+                                // These tabs live inside the panel, so closing
+                                // from one destroys the element that holds the
+                                // focus and leaves it nowhere — and a keymap whose
+                                // bindings are scoped to a focused thing goes
+                                // quiet with it. Hand the terminal back what it
+                                // lost.
+                                this.focus_active(window, cx);
+                            }
+                            false => this.set_right_panel_tab(tab, cx),
+                        }
+                    }))
+                    .into_any_element()
             })
-            // A tile for another tab switches to it; the lit one puts
-            // the panel away, the way an activity bar behaves
-            // everywhere else. Pressing it used to do nothing at all
-            // — a dead click on the one control in the row that looks
-            // like it should undo itself. (These tiles only exist
-            // while the panel is open, so `ToggleRightPanel` and the
-            // chrome tile beside them are still what brings it back.)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                match this.right_panel_open(cx) && this.right_panel_tab == tab {
-                    true => {
-                        this.toggle_right_panel(cx);
-                        // These tiles live inside the panel, so
-                        // closing from one destroys the element that
-                        // holds the focus and leaves it nowhere —
-                        // and a keymap whose bindings are scoped to a
-                        // focused thing goes quiet with it, so the
-                        // ⌘J that would undo this did nothing at all.
-                        // Hand the terminal back what it lost.
-                        this.focus_active(window, cx);
-                    }
-                    false => this.set_right_panel_tab(tab, cx),
-                }
-            }));
-            div()
-                .flex_shrink_0()
-                // Full height and `relative` so the bar below can be pinned to
-                // the row's own bottom edge, where it lands on the hairline
-                // that closes the row rather than floating under the glyph.
-                // The `occlude` that keeps a press from dragging the window
-                // stays on the tile: grown to the whole row it would take the
-                // few pixels above and below each glyph out of the drag
-                // region and hand them to nothing.
-                .h_full()
-                .relative()
-                .flex()
-                .items_center()
-                .child(div().occlude().flex_shrink_0().child(tile))
-                .into_any_element()
-        })
-        .collect()
+            .collect()
     }
 
-    fn status_dot(rgb: u32, unread: usize, size: f32, ring: gpui::Hsla) -> gpui::AnyElement {
+    fn status_dot(
+        rgb: u32,
+        unread: usize,
+        size: f32,
+        ring: gpui::Hsla,
+        faded: bool,
+    ) -> gpui::AnyElement {
         let d = (size * 0.42).max(7.);
         // The halo was the surface itself, which is only a ring while the
         // surface is light — on a dark theme it went near-black and read as a
@@ -1302,6 +1374,12 @@ impl Tty7App {
         let bg = match crate::ui::presets::surface_is_dark(ring) {
             true => gpui::white(),
             false => ring,
+        };
+        // The dim beat of a blink is a paler fill, still opaque: fading the
+        // whole badge let the avatar show through the dot and its ring.
+        let fill: gpui::Hsla = match faded {
+            true => bg.blend(gpui::Hsla::from(gpui::rgb(rgb)).opacity(0.4)),
+            false => gpui::rgb(rgb).into(),
         };
         if unread > 0 {
             let nd = (size * 0.72).max(13.0);
@@ -1314,7 +1392,7 @@ impl Tty7App {
                 .rounded_full()
                 .border_1()
                 .border_color(bg)
-                .bg(gpui::rgb(rgb))
+                .bg(fill)
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1332,7 +1410,7 @@ impl Tty7App {
                 .rounded_full()
                 .border_2()
                 .border_color(bg)
-                .bg(gpui::rgb(rgb))
+                .bg(fill)
                 .into_any_element()
         }
     }
@@ -1374,11 +1452,14 @@ impl Tty7App {
                     status
                 };
                 let dot = dot_status.and_then(|s| s.dot_rgb()).map(|rgb| {
+                    // Attention keeps the solid orange dot; only Working blinks.
+                    let faded = dot_status == Some(AgentStatus::Working) && !self.working_dot_on;
                     Self::status_dot(
                         rgb,
                         if needs_attention { 0 } else { unread },
                         size,
                         cx.theme().background,
+                        faded,
                     )
                 });
                 // Which agent this is, and what it wants, were carried entirely
@@ -1433,7 +1514,7 @@ impl Tty7App {
                     ),
                 )
                 .when_some(ssh, |b, rgb| {
-                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background))
+                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background, false))
                 })
                 .into_any_element(),
         }

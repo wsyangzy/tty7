@@ -31,6 +31,10 @@ const GRAB_HANDLE_W: f32 = 48.;
 
 const ROW_GAP: f32 = 2.;
 
+/// A single-line tab row: one line of `text_sm` and a little air, the same
+/// 28px the search field and the workspace chip above it stand at.
+const ROW_HEIGHT: f32 = 28.;
+
 /// The row chrome the text budget has to be measured around. These are the
 /// numbers the layout below is built from, not a second guess at it — a row
 /// that elides against a budget wider than it really has falls back to CSS
@@ -43,7 +47,7 @@ mod row_metrics {
     /// `pl_2` + `pr_2` on the row.
     pub(super) const ROW_PAD: f32 = 8.;
     /// The avatar handed to `tab_avatar`.
-    pub(super) const AVATAR: f32 = 22.;
+    pub(super) const AVATAR: f32 = 18.;
     /// `gap_2` between the row's children.
     pub(super) const GAP: f32 = 8.;
     /// The ⌘N badge, when one is shown.
@@ -193,9 +197,9 @@ impl Tty7App {
     }
 
     /// What the right panel has reserved, from the sidebar's point of view.
-    pub(crate) fn right_panel_floor(&self, cx: &gpui::App) -> f32 {
+    pub(crate) fn right_panel_floor(&self, window: &Window, cx: &gpui::App) -> f32 {
         if self.right_panel_open(cx) {
-            crate::ui::right_panel::MIN_WIDTH
+            self.right_panel_min_px(window, cx)
         } else {
             0.
         }
@@ -205,7 +209,7 @@ impl Tty7App {
         crate::ui::app::side_panel_max(
             window.viewport_size().width.as_f32(),
             MIN_SIDEBAR_WIDTH,
-            self.right_panel_floor(cx) + self.document_floor(cx),
+            self.right_panel_floor(window, cx) + self.document_floor(cx),
         )
     }
 
@@ -331,7 +335,7 @@ impl Tty7App {
         // it as regular would let the one row the user is looking at overflow
         // into the truncation this is here to avoid.
         let title_font_active = gpui::Font {
-            weight: FontWeight::MEDIUM,
+            weight: FontWeight::SEMIBOLD,
             ..font.clone()
         };
         let rem = window.rem_size().as_f32();
@@ -733,6 +737,9 @@ impl Tty7App {
                 let success = added_ink;
                 let danger = removed_ink;
 
+                // A row that grows a branch line under its title pads itself
+                // out; a one-line row sits at `ROW_HEIGHT`.
+                let two_line = git_line.is_some();
                 let label_region = match rename_input {
                     Some(input) => div()
                         .id(("sidebar-rename", i))
@@ -849,7 +856,7 @@ impl Tty7App {
                                         .min_w_0()
                                         .truncate()
                                         .text_sm()
-                                        .when(is_active, |d| d.font_weight(FontWeight::MEDIUM))
+                                        .when(is_active, |d| d.font_weight(FontWeight::SEMIBOLD))
                                         .child(shown_title),
                                 )
                                 // The path is elided to the room the title
@@ -896,7 +903,8 @@ impl Tty7App {
                         }
                     })
                     .w_full()
-                    .py_2()
+                    .min_h(px(ROW_HEIGHT))
+                    .when(two_line, |s| s.py_1p5())
                     .items_center()
                     .justify_between()
                     .gap_2()
@@ -952,7 +960,7 @@ impl Tty7App {
                         agent_unread,
                         agent_attention,
                         ssh_dot,
-                        22.,
+                        row_metrics::AVATAR,
                         cx,
                     ))
                     // Leading, like the chip's: the trailing end of a row is
@@ -990,7 +998,10 @@ impl Tty7App {
                         row.child(
                             h_flex()
                                 .absolute()
-                                .top(px(4.))
+                                .top(px(match two_line {
+                                    true => 4.,
+                                    false => (ROW_HEIGHT - crate::ui::tab_strip::MIN_TARGET) / 2.,
+                                }))
                                 .right(px(6.))
                                 .opacity(0.)
                                 .group_hover(SharedString::from(format!("tab-row-{i}")), |s| {
@@ -1179,15 +1190,16 @@ impl Tty7App {
                             }
                         })
                     })
-                    .child(
-                        div().flex_shrink_0().child(
-                            Icon::new(match folded {
-                                true => IconName::ChevronRight,
-                                false => IconName::ChevronDown,
-                            })
-                            .xsmall(),
-                        ),
-                    )
+                    // The heading names the group; the chevron only says
+                    // something when there is something behind it. An open
+                    // group shows its rows, which is its own answer.
+                    .when(folded, |header| {
+                        header.child(
+                            div()
+                                .flex_shrink_0()
+                                .child(Icon::new(IconName::ChevronRight).xsmall()),
+                        )
+                    })
                     .when(pinned, |header| {
                         header.child(
                             div()
@@ -1216,6 +1228,10 @@ impl Tty7App {
                             .min_w_0()
                             .truncate()
                             .font_weight(FontWeight::SEMIBOLD)
+                            // Body ink, not caption grey: the heading is the
+                            // name of what sits under it, and the branch and
+                            // counts beside it are the metadata.
+                            .text_color(cx.theme().foreground)
                             .child(label)
                             .into_any_element(),
                     })
@@ -1490,11 +1506,12 @@ impl Tty7App {
             .flex_shrink_0()
             .items_center()
             .gap(px(6.))
-            .h(px(34.))
+            .h(px(ROW_HEIGHT))
             .mx_2()
-            .mt_1()
+            .mt_1p5()
             .mb_1()
-            .px_2()
+            .pl(px(6.))
+            .pr_1()
             .rounded_lg()
             .bg(cx.theme().muted)
             .child(
@@ -1524,7 +1541,7 @@ impl Tty7App {
         // below only ever sees a `Window`, and the cap it clamps against has to
         // be the same one the layout applies or the sidebar springs back from
         // wherever it was dropped.
-        let others_floor = self.right_panel_floor(cx) + self.document_floor(cx);
+        let others_floor = self.right_panel_floor(window, cx) + self.document_floor(cx);
         let backing = canvas(
             {
                 let container = container.clone();

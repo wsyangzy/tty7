@@ -85,8 +85,6 @@ pub struct Interactions {
     pub primary: Semantic,
     pub primary_hover: u32,
     pub primary_pressed: u32,
-    pub navigation: u32,
-    pub navigation_ink: u32,
     pub choice: u32,
     pub choice_ink: u32,
     pub input_border: u32,
@@ -101,16 +99,6 @@ pub mod state {
     pub const CURSOR: f32 = 1.70;
     pub const TEXT_RESTING: f32 = 4.6;
     pub const TEXT_STEP: f32 = 1.4;
-
-    /// The sidebar's selection ladder sits one rung above the window's. The
-    /// window paints a selected row inside a list the user is already looking
-    /// at; the sidebar paints the one tab out of twenty that owns the pane
-    /// area, and at 1.30:1 that tint measured as the faintest mark in the
-    /// column — fainter than a group header's count. `PRESSED` and `CURSOR`
-    /// climb with it so the ladder keeps its spacing.
-    pub const SIDEBAR_SELECTED: f32 = 1.50;
-    pub const SIDEBAR_PRESSED: f32 = 1.75;
-    pub const SIDEBAR_CURSOR: f32 = 1.92;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,6 +107,9 @@ pub struct Surface {
     pub hover: u32,
     pub selected: u32,
     pub pressed: u32,
+    /// The top rung. No surface paints it today; the ladder tests hold the
+    /// rungs below it apart against it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub cursor: u32,
     pub text_resting: u32,
     pub text_selected: u32,
@@ -177,7 +168,10 @@ impl Theme {
     pub fn neutrals(&self) -> Neutrals {
         let bg = self.background_color();
         let fg = legible_foreground(bg, self.foreground);
-        let sidebar = mix(bg, fg, 0.03);
+        // One continuous surface: the rails share the window's fill and are
+        // told apart from the pane area by a hairline alone. A tinted rail
+        // made the workspace read as three boxes set side by side.
+        let sidebar = bg;
         // Light overlays sit above the grey rail; dark overlays lift toward
         // the foreground. A light menu must not be darker than its backdrop.
         let popover = if self.dark { mix(bg, fg, 0.06) } else { bg };
@@ -267,15 +261,8 @@ impl Theme {
         }
     }
 
-    /// One selection treatment for workspace, settings and panel navigation.
-    pub(crate) fn navigation_colors(&self) -> (u32, u32) {
-        let colors = self.interactions();
-        (colors.navigation, colors.navigation_ink)
-    }
-
     pub(crate) fn interactions(&self) -> Interactions {
         let m = self.neutrals();
-        let navigation = mix(m.sidebar, 0x2878df, if self.dark { 0.28 } else { 0.14 });
         // Menus use a blue wash; the switcher uses the solid companion fill.
         // Keep labels and shortcut hints readable on the shared menu surface.
         let choice = mix(m.popover, 0x2878df, if self.dark { 0.34 } else { 0.20 });
@@ -296,8 +283,6 @@ impl Theme {
             },
             primary_hover: mix(fill, away, 0.08),
             primary_pressed: mix(fill, away, 0.16),
-            navigation,
-            navigation_ink: legible_foreground(navigation, m.foreground),
             choice,
             choice_ink: legible_foreground(choice, m.foreground),
             input_border: m.border,
@@ -392,10 +377,12 @@ impl Theme {
     pub fn surfaces(&self) -> Surfaces {
         let m = self.neutrals();
         let fg = legible_foreground(self.background_color(), self.foreground);
+        // The rail climbs the window's ladder. It used to take a rung above
+        // (1.50) because a regular-weight current tab measured as the faintest
+        // mark in its column; the current title is SEMIBOLD now and carries
+        // that on its own, and at 1.50 on a white rail the row read as a
+        // pressed button rather than as a place.
         let mut sidebar = self.surface(m.sidebar);
-        sidebar.selected = raise(sidebar.base, fg, state::SIDEBAR_SELECTED);
-        sidebar.pressed = raise(sidebar.base, fg, state::SIDEBAR_PRESSED);
-        sidebar.cursor = raise(sidebar.base, fg, state::SIDEBAR_CURSOR);
         sidebar.text_resting = m.sidebar_fg;
         sidebar.text_selected =
             stepped_ink(sidebar.selected, sidebar.base, fg, sidebar.text_resting);
@@ -1214,9 +1201,9 @@ static BUILTINS: [BuiltinSpec; 13] = [
         id: "light",
         name: "Light",
         background: 0xffffff,
-        foreground: 0x111111,
-        accent: 0x007aff,
-        caret: Some(0xf5a15c),
+        foreground: 0x0f1419,
+        accent: 0x1f6bf0,
+        caret: None,
         ansi16: [
             (0x24, 0x29, 0x2e),
             (0xd1, 0x24, 0x2f),
@@ -1557,15 +1544,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn navigation_labels_remain_legible_in_every_builtin_theme() {
+    fn the_current_tab_row_stays_legible_in_every_builtin_theme() {
         for theme in builtins() {
-            let (fill, ink) = theme.navigation_colors();
+            let s = theme.surfaces().sidebar;
             assert!(
-                contrast(fill, ink) >= 4.5,
-                "{} navigation contrast",
+                contrast(s.selected, s.text_selected) >= 4.5,
+                "{} current tab contrast",
                 theme.id
             );
-            assert_ne!(fill, theme.neutrals().sidebar, "{} selection", theme.id);
+            assert_ne!(s.selected, s.base, "{} selection", theme.id);
         }
     }
 
@@ -1794,16 +1781,16 @@ mod tests {
         let bg = dracula.background_color();
         let s = dracula.surfaces();
         // The resting rung is checked as `state::SELECTED` on the sidebar
-        // fill — the surface it was signed off on — rather than as the rail's
-        // own fill: the rail was lifted off this value on purpose
-        // (`state::SIDEBAR_SELECTED`) once the tab that owns the pane area
-        // measured as the faintest mark in its own column, and this pin is
-        // here to catch the constant drifting, not that decision.
+        // fill it was signed off on — the old rail, 3% toward the foreground —
+        // rather than on today's rail, which has since gone flat onto the
+        // window fill. This pin is here to catch the constant drifting, not
+        // that decision.
         let fg = legible_foreground(bg, dracula.foreground);
+        let signed_off_rail = mix(bg, fg, 0.03);
         for (what, now, legacy) in [
             (
                 "resting",
-                raise(s.sidebar.base, fg, state::SELECTED),
+                raise(signed_off_rail, fg, state::SELECTED),
                 mix(bg, dracula.foreground, 0.12),
             ),
             ("cursor", s.window.cursor, mix(bg, dracula.foreground, 0.17)),
@@ -2113,11 +2100,6 @@ mod tests {
                 "{} choice",
                 theme.id
             );
-            assert!(
-                contrast(c.navigation, c.navigation_ink) >= 4.5,
-                "{} navigation",
-                theme.id
-            );
             assert_ne!(
                 c.input_border, c.choice,
                 "{} field boundaries must not use selected-row fills",
@@ -2215,10 +2197,10 @@ mod tests {
                 m.caret
             );
         }
-        // The default theme is the one that used to fail: an orange caret on
-        // pure white read at 2.07:1.
+        // The default theme used to ship an orange caret that read at 2.07:1
+        // on pure white. It now takes the accent, like the focus ring.
         let light = builtins().into_iter().find(|t| t.id == DEFAULT_ID).unwrap();
-        assert_ne!(light.neutrals().caret, light.caret.unwrap());
+        assert_eq!(light.neutrals().caret, light.neutrals().accent);
     }
 
     #[test]

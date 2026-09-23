@@ -4664,8 +4664,9 @@ impl Tty7App {
         let Some(qc) = crate::core::ssh_profile::parse_quick_connect(&target) else {
             return;
         };
-        self.close_settings(window, cx);
-        self.quick_connect(qc, window, cx);
+        self.close_settings_then(window, cx, move |this, window, cx| {
+            this.quick_connect(qc, window, cx)
+        });
     }
 
     fn render_ssh_defaults_detail(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -4729,8 +4730,9 @@ impl Tty7App {
                 let app = app.clone();
                 move |_, window, cx| {
                     let _ = app.update(cx, |this, cx| {
-                        this.close_settings(window, cx);
-                        this.connect_ssh_profile(id, window, cx);
+                        this.close_settings_then(window, cx, move |this, window, cx| {
+                            this.connect_ssh_profile(id, window, cx)
+                        });
                     });
                 }
             }))
@@ -5449,8 +5451,9 @@ impl Tty7App {
 
     pub(crate) fn save_and_connect_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = self.save_editing_profile(window, cx) {
-            self.close_settings(window, cx);
-            self.connect_ssh_profile(id, window, cx);
+            self.close_settings_then(window, cx, move |this, window, cx| {
+                this.connect_ssh_profile(id, window, cx)
+            });
         }
     }
 

@@ -16,7 +16,32 @@ use crate::ui::app::{
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::scrollbar::with_vertical_scrollbar;
 
-pub(crate) const MIN_WIDTH: f32 = 216.;
+/// Wide enough for the three word tabs, bare, beside the two chrome tiles at
+/// the default interface size — the Changes count is dropped before a label is
+/// ever cut. A larger UI font raises the floor past this; see
+/// [`right_panel_tabs_floor`].
+pub(crate) const MIN_WIDTH: f32 = 240.;
+
+/// What the tab row needs with the count dropped: the labels, the row's lead,
+/// its 2px gaps, and the chrome tiles at the trailing end.
+fn right_panel_tabs_floor(window: &Window, cx: &gpui::App) -> f32 {
+    let chrome = match cfg!(target_os = "macos") {
+        true => crate::ui::tab_strip::trailing_chrome_tiles_w() + TAB_ROW_GAPS,
+        false => tile_trailing_inset(),
+    };
+    (TAB_ROW_LEAD + crate::ui::tab_strip::right_panel_tab_labels_w(window, cx) + chrome).ceil()
+}
+
+/// The tab row's leading inset, and the 2px gaps it puts between the three
+/// tabs, the spacer and the chrome.
+const TAB_ROW_LEAD: f32 = 4.;
+
+/// How tall the tab row is where it sits below the title bar (Windows and
+/// Linux): the tab's 26px hover pill plus 2px either side. A full title-bar
+/// height here stacked a second 40px band under the first and left the labels
+/// sitting well down from the window's top edge.
+const TAB_ROW_HEIGHT: f32 = TILE_SIZE_SM + 6.;
+const TAB_ROW_GAPS: f32 = 4. * 2.;
 
 /// How wide a panel edge is to grab. Both edges a window can drag — the tab
 /// sidebar's and this panel's — are the same target, so they are one number.
@@ -385,18 +410,26 @@ impl Tty7App {
         }
     }
 
+    /// The narrowest the panel may be drawn: `MIN_WIDTH`, or wider when the
+    /// interface font or the language makes the three tab labels and the two
+    /// chrome tiles beside them need more than that.
+    pub(crate) fn right_panel_min_px(&self, window: &Window, cx: &gpui::App) -> f32 {
+        MIN_WIDTH.max(right_panel_tabs_floor(window, cx))
+    }
+
     pub(crate) fn right_panel_max_px(&self, window: &Window, cx: &gpui::App) -> f32 {
         crate::ui::app::side_panel_max(
             window.viewport_size().width.as_f32(),
-            MIN_WIDTH,
+            self.right_panel_min_px(window, cx),
             self.sidebar_floor(cx) + self.document_floor(cx),
         )
     }
 
     pub(crate) fn right_panel_px(&self, window: &Window, cx: &gpui::App) -> f32 {
-        self.right_panel_width
-            .get()
-            .clamp(MIN_WIDTH, self.right_panel_max_px(window, cx))
+        self.right_panel_width.get().clamp(
+            self.right_panel_min_px(window, cx),
+            self.right_panel_max_px(window, cx),
+        )
     }
 
     pub(crate) fn toggle_right_panel(&mut self, cx: &mut Context<Self>) {
@@ -439,7 +472,7 @@ impl Tty7App {
             RightPanelTab::Scm => self.render_panel_scm(window, cx),
             RightPanelTab::Files => self.render_panel_files(window, cx),
         };
-        let (backing, handle) = self.right_panel_resize(cx);
+        let (backing, handle) = self.right_panel_resize(window, cx);
 
         Some(
             v_flex()
@@ -466,16 +499,25 @@ impl Tty7App {
                     .on_double_click(|_, window, _| window.titlebar_double_click())
                     .items_center()
                     .gap(px(2.))
-                    .pl(px(tile_trailing_inset()))
+                    .pl(px(TAB_ROW_LEAD))
+                    // The tab bar is a strip of labels over a body, so it
+                    // closes on a hairline the current tab's bar sits on.
+                    .border_b_1()
+                    .border_color(cx.theme().sidebar_border)
                     .relative()
-                    .children(self.right_panel_tabs(cx))
+                    .children(self.right_panel_tabs(
+                        width
+                            - TAB_ROW_LEAD
+                            - crate::ui::tab_strip::trailing_chrome_tiles_w()
+                            - TAB_ROW_GAPS,
+                        window,
+                        cx,
+                    ))
                     .child(div().flex_1())
                     // Navigation controls stay visible on both sidebars.
                     .child(self.window_chrome(window, cx))
                 }))
-                // Separate navigation from content with space, matching the
-                // left sidebar's continuous surface.
-                .children(cfg!(target_os = "macos").then(|| div().flex_none().h(px(8.))))
+                .children(cfg!(target_os = "macos").then(|| div().flex_none().h(px(10.))))
                 .child(body)
                 .children(self.sftp_transfers_footer(cx))
                 .child(handle)
@@ -483,7 +525,11 @@ impl Tty7App {
         )
     }
 
-    fn right_panel_resize(&self, cx: &mut Context<Self>) -> (AnyElement, AnyElement) {
+    fn right_panel_resize(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, AnyElement) {
         use gpui::{Bounds, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, canvas};
         use std::cell::Cell as StdCell;
         use std::rc::Rc;
@@ -494,6 +540,7 @@ impl Tty7App {
         // be the same one the layout applies or the panel springs back from
         // wherever it was dropped.
         let others_floor = self.sidebar_floor(cx) + self.document_floor(cx);
+        let own_floor = self.right_panel_min_px(window, cx);
         let backing = canvas(
             {
                 let container = container.clone();
@@ -519,10 +566,10 @@ impl Tty7App {
                             let raw = (right - ev.position.x).as_f32();
                             let max = crate::ui::app::side_panel_max(
                                 window.viewport_size().width.as_f32(),
-                                MIN_WIDTH,
+                                own_floor,
                                 others_floor,
                             );
-                            width_cell.set(raw.clamp(MIN_WIDTH, max));
+                            width_cell.set(raw.clamp(own_floor, max));
                             window.refresh();
                         }
                     });
@@ -590,8 +637,16 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let tabs = (!cfg!(target_os = "macos")).then(|| self.right_panel_tabs(cx));
         let has_trailing = trailing.is_some();
+        let tabs = (!cfg!(target_os = "macos")).then(|| {
+            let width = self.right_panel_px(window, cx);
+            let trailing_w = match has_trailing {
+                true => 2. * TILE_SIZE_SM + 6.,
+                false => 0.,
+            };
+            let avail = width - TAB_ROW_LEAD - tile_trailing_inset() - trailing_w;
+            self.right_panel_tabs(avail, window, cx)
+        });
         if tabs.is_none() && !has_trailing {
             return div().flex_none().into_any_element();
         }
@@ -602,11 +657,7 @@ impl Tty7App {
             cx,
         );
         row.flex_none()
-            .h(px(if tabs.is_some() {
-                crate::ui::app::TITLE_BAR_HEIGHT
-            } else {
-                32.
-            }))
+            .h(px(if tabs.is_some() { TAB_ROW_HEIGHT } else { 32. }))
             .items_center()
             .pl(px(CONTENT_INSET))
             .pr(px(match (&tabs, has_trailing) {
@@ -614,35 +665,45 @@ impl Tty7App {
                 (None, true) => tile_trailing_inset_sm(),
                 (None, false) => CONTENT_INSET,
             }))
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .items_baseline()
-                    .gap(px(7.))
-                    .child(
-                        // The title step of the panel ramp, SEMIBOLD and
-                        // uppercased. It reads as a label rather than as
-                        // content because of the weight and the caps.
-                        div()
-                            .text_size(rems(META))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(cx.theme().secondary_foreground)
-                            .child(text.to_uppercase()),
-                    )
-                    .when_some(count, |this, c| {
-                        this.child(
-                            // A count is a token hanging off the heading, not
-                            // part of it: one step down, mono, regular weight.
+            // Where the tabs live in this row, they are the heading: the
+            // current one already names the panel, and the Changes tab carries
+            // the count. The row closes on the hairline their bar sits on.
+            .when(tabs.is_some(), |row| {
+                row.pl(px(TAB_ROW_LEAD))
+                    .border_b_1()
+                    .border_color(cx.theme().sidebar_border)
+            })
+            .when(tabs.is_none(), |row| {
+                row.child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .items_baseline()
+                        .gap(px(7.))
+                        .child(
+                            // The title step of the panel ramp, SEMIBOLD and
+                            // uppercased. It reads as a label rather than as
+                            // content because of the weight and the caps.
                             div()
-                                .text_size(rems(META_MONO))
-                                .font_family(cx.theme().mono_font_family.clone())
+                                .text_size(rems(META))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_color(cx.theme().muted_foreground)
-                                .child(c),
+                                .child(text.to_string()),
                         )
-                    }),
-            )
-            .child(div().flex_1().min_w_0())
-            .when_some(trailing, |this, t| this.child(t))
+                        .when_some(count, |this, c| {
+                            this.child(
+                                // A count is a token hanging off the heading, not
+                                // part of it: one step down, mono, regular weight.
+                                div()
+                                    .text_size(rems(META_MONO))
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(c),
+                            )
+                        }),
+                )
+            })
+            // Leading, as on macOS: the tabs open the row and whatever the
+            // panel adds trails at the far end.
             .when_some(tabs, |this, tiles| {
                 this.child(
                     h_flex()
@@ -655,10 +716,11 @@ impl Tty7App {
                         .h_full()
                         .items_center()
                         .gap(px(2.))
-                        .when(has_trailing, |this| this.ml(px(6.)))
                         .children(tiles),
                 )
             })
+            .child(div().flex_1().min_w_0())
+            .when_some(trailing, |this, t| this.child(t))
             .into_any_element()
     }
 
@@ -1113,12 +1175,12 @@ impl Tty7App {
             }))
             .pb(px(if trailing.is_some() { 0. } else { 4. }))
             .child(
-                // Weight and capitalization distinguish compact group headings.
+                // Weight and ink, not capitals, set a compact heading apart.
                 div()
                     .text_size(rems(HEADING))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(cx.theme().muted_foreground)
-                    .child(text.to_uppercase()),
+                    .child(text.to_string()),
             )
             .when_some(trailing, |this, t| this.child(t))
             .into_any_element()

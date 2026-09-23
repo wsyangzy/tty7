@@ -1124,8 +1124,8 @@ pub fn translate_en(key: L10nKey) -> &'static str {
         L10nKey::EditorFileTooLarge => "\"{path}\" is too large for the editor ({size} MB)",
         L10nKey::EditorBinaryFile => "\"{path}\" looks like a binary file",
         L10nKey::PanelInfoTitle => "Info",
-        L10nKey::PanelChangesTitle => "Source Control",
-        L10nKey::PanelScmTitle => "Source Control",
+        L10nKey::PanelChangesTitle => "Changes",
+        L10nKey::PanelScmTitle => "Changes",
         L10nKey::PanelFilesTitle => "Files",
         L10nKey::PanelNoSession => "No active session.",
         L10nKey::PanelNoSessionHint => {

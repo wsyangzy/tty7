@@ -266,6 +266,17 @@ fn copy_file(host: &dyn Host, src: &Path, dest: &Path, len: u64) -> io::Result<(
     // One syscall path locally, and the one that keeps the mode bits:
     // `write_file` would drop the executable bit off every script copied in.
     if host.id().is_local() {
+        // Except onto a WSL share: `fs::copy` is `CopyFileEx` on Windows, which
+        // brings a downloaded file's `Zone.Identifier` stream along, and the
+        // share keeps that as a second file beside the first (#942). The
+        // distro has no use for the mark, and Linux mode bits are the share's
+        // to pick anyway, so only the contents go.
+        if tty7_core::host::local::is_wsl_share(dest) {
+            let mut from = std::fs::File::open(src)?;
+            let mut to = std::fs::File::create(dest)?;
+            io::copy(&mut from, &mut to)?;
+            return Ok(());
+        }
         std::fs::copy(src, dest)?;
         return Ok(());
     }

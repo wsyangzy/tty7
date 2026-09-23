@@ -2319,15 +2319,12 @@ impl Tty7App {
 
         let theme = cx.theme();
         let (fg, muted, warn) = (theme.foreground, theme.muted_foreground, theme.warning);
-        let fg = if picked {
-            gpui::rgb(0xffffff).into()
-        } else {
-            fg
-        };
-        let muted = if picked { fg } else { muted };
-        let warn = if picked { fg } else { warn };
+        // The picked row is a neutral step of the popover's own ladder, not
+        // a solid accent slab: it is where the cursor is, not an action, and
+        // a saturated block with white text was the loudest thing on screen.
+        // The row keeps its own inks, so a warning still reads as one.
         let sf = rungs(cx);
-        let hover = gpui::rgb(sf.hover);
+        let (hover, picked_bg) = (gpui::rgb(sf.hover), gpui::rgb(sf.selected));
         let rref = RowRef::of(group, row);
         let click_ref = rref.clone();
         let menu_ref = rref.clone();
@@ -2384,9 +2381,9 @@ impl Tty7App {
             .rounded(crate::ui::rounding::ROW_RADIUS)
             .overflow_hidden()
             .cursor_pointer()
-            .when(picked, |r| r.bg(gpui::rgb(0x1768cf)))
+            .when(picked, |r| r.bg(picked_bg))
             .anchor_scroll(self.switcher_anchor(Column::Left, picked))
-            .hover(move |r| r.bg(if picked { gpui::rgb(0x1768cf) } else { hover }))
+            .hover(move |r| r.bg(if picked { picked_bg } else { hover }))
             .child(crate::ui::tab_strip::workspace_avatar(
                 &row.name, row.live, ROW_AVATAR, cx,
             ))
@@ -2538,7 +2535,7 @@ impl Tty7App {
         let border = theme.border;
         let (fg, muted) = (theme.foreground, theme.muted_foreground);
         let sf = rungs(cx);
-        let (hover, picked_bg) = (gpui::rgb(sf.hover), gpui::rgb(0x1768cf));
+        let (hover, picked_bg) = (gpui::rgb(sf.hover), gpui::rgb(sf.selected));
         let viewport = window.viewport_size();
         let card_w = FORM_W
             .min(viewport.width.as_f32() - 2. * CARD_MARGIN)
@@ -2669,12 +2666,6 @@ impl Tty7App {
             let mut list = v_flex().gap(px(1.)).p(px(4.));
             for (i, item) in items.iter().enumerate() {
                 let picked = i == form.sel;
-                let fg = if picked {
-                    gpui::rgb(0xffffff).into()
-                } else {
-                    fg
-                };
-                let muted = if picked { fg } else { muted };
                 let base = h_flex()
                     .id(("switcher-form-item", i))
                     .items_center()
@@ -2852,7 +2843,7 @@ impl Tty7App {
         }
 
         let sf = rungs(cx);
-        let (hover, picked_bg) = (gpui::rgb(sf.hover), gpui::rgb(0x1768cf));
+        let (hover, picked_bg) = (gpui::rgb(sf.hover), gpui::rgb(sf.selected));
         let right_sel = self.switcher.as_ref().map(|sw| sw.right_sel).unwrap_or(0);
         let holding = self.switcher.as_ref().is_some_and(|sw| sw.hold.is_some());
         let ws = row.id;
@@ -2887,14 +2878,6 @@ impl Tty7App {
         for (nth, i) in hits.iter().enumerate() {
             let tab = &row.tabs[*i];
             let picked = nth == right_sel && column == Column::Right;
-            let fg = if picked {
-                gpui::rgb(0xffffff).into()
-            } else {
-                fg
-            };
-            let muted = if picked { fg } else { muted };
-            let added_ink = if picked { fg } else { added_ink };
-            let removed_ink = if picked { fg } else { removed_ink };
             let (id, index) = (tab.id, tab.index);
             // The second line is what tells two tabs on the same repo apart —
             // the branch, then the diff counts, mirroring the tab sidebar.

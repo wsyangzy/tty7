@@ -1189,8 +1189,8 @@ pub fn translate_ja(key: L10nKey) -> Option<&'static str> {
         L10nKey::EditorFileTooLarge => "「{path}」はエディタで開くには大きすぎます（{size} MB）",
         L10nKey::EditorBinaryFile => "「{path}」はバイナリファイルのようです",
         L10nKey::PanelInfoTitle => "情報",
-        L10nKey::PanelChangesTitle => "ソース管理",
-        L10nKey::PanelScmTitle => "ソース管理",
+        L10nKey::PanelChangesTitle => "変更",
+        L10nKey::PanelScmTitle => "変更",
         L10nKey::PanelFilesTitle => "ファイル",
         L10nKey::PanelNoSession => "アクティブなセッションがありません",
         L10nKey::PanelNoSessionHint => {

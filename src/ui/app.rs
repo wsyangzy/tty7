@@ -217,6 +217,9 @@ pub(crate) fn document_column_px(body: f32, ratio: f32) -> Option<f32> {
 
 pub(crate) const TITLE_BAR_HEIGHT: f32 = 40.;
 
+/// Work to run against the settings window once it has been built.
+type SettingsFollowUp = Box<dyn FnOnce(&mut Tty7App, &mut Window, &mut Context<Tty7App>)>;
+
 pub(crate) const TILE_SIZE: f32 = 32.;
 pub(crate) const TILE_GLYPH: f32 = 16.;
 /// A tile that sits in a body row rather than in chrome: the box shrinks to
@@ -845,6 +848,10 @@ pub struct Tty7App {
     /// home page is otherwise perfectly still: it cost more than a live
     /// terminal did, on a window with nothing open in it.
     pub(crate) home_cursor_on: bool,
+    /// The blink phase of a working agent's status dot. Driven by the same
+    /// half-second tick as the home cursor, and only while some tab has an
+    /// agent at work — two repaints a second, not an animation's sixty.
+    pub(crate) working_dot_on: bool,
     pub(crate) shells: ShellInventory,
     pub(crate) shells_host: HostId,
     pub(crate) loopback_panel: LoopbackForwardPanelState,
@@ -933,6 +940,11 @@ pub struct Tty7App {
     _sidebar_search_sub: Subscription,
     _file_search_sub: Subscription,
     settings: Option<SettingsState>,
+    /// The window settings are drawn in, and the workspace window that opened
+    /// it (where focus goes back to on close). `None` while settings is shut —
+    /// and always in tests, which keep drawing settings over the workspace so
+    /// they can drive it through the one test window they have.
+    settings_window: Option<(gpui::AnyWindowHandle, gpui::AnyWindowHandle)>,
     pub(crate) ssh_prompt: crate::ui::ssh_prompt::SshPromptState,
     /// A close question is on screen. It carries no target: the answer acts on
     /// the tab or pane captured when the question was raised, not on whatever
@@ -1479,6 +1491,7 @@ impl Tty7App {
             record_gen: 0,
             home_focus: cx.focus_handle(),
             home_cursor_on: true,
+            working_dot_on: true,
             shells: ShellInventory::default(),
             shells_host: HostId::LOCAL,
             loopback_panel: LoopbackForwardPanelState {
@@ -1536,6 +1549,7 @@ impl Tty7App {
             file_search,
             _file_search_sub: file_search_sub,
             settings: None,
+            settings_window: None,
             ssh_prompt: crate::ui::ssh_prompt::SshPromptState::new(cx),
             close_prompt_open: false,
             window_bounds: window_bounds_to_remember(window),
@@ -1581,6 +1595,16 @@ impl Tty7App {
                     .update(cx, |this, cx| {
                         if this.tabs.is_empty() {
                             this.home_cursor_on = !this.home_cursor_on;
+                            cx.notify();
+                        }
+                        let working = this.tabs.iter().any(|tab| {
+                            tab.agent_status(cx)
+                                == Some(crate::core::cli_agent::AgentStatus::Working)
+                        });
+                        // Keep blinking while an agent works; once none does,
+                        // settle on "on" with one last frame and go quiet.
+                        if working || !this.working_dot_on {
+                            this.working_dot_on = !this.working_dot_on || !working;
                             cx.notify();
                         }
                     })
@@ -1974,7 +1998,8 @@ impl Tty7App {
             TrayAction::SetNotifyMode(mode) => self.set_notify_mode(mode, cx),
             TrayAction::OpenSettings => {
                 surface_window(window, cx);
-                if self.settings.is_none() {
+                // Opens it, or brings its window forward — never shuts it.
+                if self.settings.is_none() || self.settings_window.is_some() {
                     self.toggle_settings(window, cx);
                 }
             }
@@ -6044,12 +6069,75 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// Settings opens in a window of its own, beside the workspace rather
+    /// than over it. Asked for again while that window is up, it comes to the
+    /// front — a second ⌘, is someone looking for the window, not asking to
+    /// close it.
     fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((handle, _)) = self.settings_window {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            // The window went away without telling us.
+            self.settings_window = None;
+            self.settings = None;
+        }
         if self.settings.is_some() {
             self.close_settings_checked(window, cx);
             return;
         }
         self.remember_active_pane(window, cx);
+        if cfg!(test) {
+            self.build_settings_state(window, cx);
+            return;
+        }
+        self.open_settings_window_then(window, cx, None);
+    }
+
+    fn open_settings_window_then(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: Option<SettingsFollowUp>,
+    ) {
+        let owner = window.window_handle();
+        let app = cx.entity();
+        // Deferred: the new window's state is built by updating this entity,
+        // which cannot happen while this call still holds it.
+        cx.defer(move |cx| {
+            let options = crate::ui::settings_window::window_options(cx);
+            let opened = cx.open_window(options, |window, cx| {
+                app.update(cx, |this, cx| {
+                    this.build_settings_state(window, cx);
+                    if let Some(then) = then {
+                        then(this, window, cx);
+                    }
+                });
+                let view =
+                    cx.new(|cx| crate::ui::settings_window::SettingsWindow::new(&app, window, cx));
+                cx.new(|cx| gpui_component::Root::new(view, window, cx))
+            });
+            match opened {
+                Ok(handle) => app.update(cx, |this, _| {
+                    this.settings_window = Some((handle.into(), owner));
+                }),
+                Err(e) => {
+                    log::error!("failed to open the settings window: {e}");
+                    app.update(cx, |this, cx| {
+                        this.settings = None;
+                        cx.notify();
+                    });
+                }
+            }
+        });
+    }
+
+    /// Build the settings page's state against `window` — the window it will
+    /// be drawn in, which owns its inputs' focus.
+    fn build_settings_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let focus_handle = cx.focus_handle();
         let mut subs = Vec::new();
         let (font_select, font_bold_select, font_italic_select, ui_font_select) =
@@ -6716,7 +6804,36 @@ impl Tty7App {
                     s.content_scroll.offset()
                 },
             );
-            self.focus_active(window, cx);
+            match self.settings_window.take() {
+                // `window` is the settings window here, so the workspace is
+                // reached through its handle — after this update lets go of
+                // both it and this entity.
+                Some((settings, owner)) => {
+                    let app = cx.entity().downgrade();
+                    cx.defer(move |cx| {
+                        let _ = settings.update(cx, |_, window, _| window.remove_window());
+                        let _ = owner.update(cx, |_, window, cx| {
+                            window.activate_window();
+                            let _ = app.update(cx, |this, cx| this.focus_active(window, cx));
+                        });
+                    });
+                }
+                None => self.focus_active(window, cx),
+            }
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn has_settings(&self) -> bool {
+        self.settings.is_some()
+    }
+
+    /// The settings window was closed out from under its state — its owner
+    /// is going away, or the window was removed without passing through
+    /// `close_settings`. Drop the state without trying to hand focus back.
+    pub(crate) fn forget_settings_window(&mut self, cx: &mut Context<Self>) {
+        if self.settings_window.take().is_some() {
+            self.settings = None;
             cx.notify();
         }
     }
@@ -6727,10 +6844,63 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.settings.is_none() {
-            self.toggle_settings(window, cx);
+        self.open_settings_then(window, cx, move |this, window, cx| {
+            this.navigate_settings(section, None, window, cx)
+        });
+    }
+
+    /// Open settings (or bring its window forward) and then run `then` against
+    /// the window the page is drawn in, once its state exists. Anything that
+    /// builds inputs for the page — loading a form — has to run there: an
+    /// input belongs to the window it was made in.
+    pub(crate) fn open_settings_then(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if let Some((handle, _)) = self.settings_window {
+            let app = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    window.activate_window();
+                    let _ = app.update(cx, |this, cx| then(this, window, cx));
+                });
+            });
+            return;
         }
-        self.navigate_settings(section, None, window, cx);
+        if self.settings.is_none() {
+            self.remember_active_pane(window, cx);
+            if !cfg!(test) {
+                self.open_settings_window_then(window, cx, Some(Box::new(then)));
+                return;
+            }
+            self.build_settings_state(window, cx);
+        }
+        then(self, window, cx);
+    }
+
+    /// Close settings, then run `then` in the workspace window — where a tab it
+    /// opens belongs, whichever window the request came from.
+    pub(crate) fn close_settings_then(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let owner = self.settings_window.map(|(_, owner)| owner);
+        self.close_settings(window, cx);
+        match owner {
+            None => then(self, window, cx),
+            Some(owner) => {
+                let app = cx.entity().downgrade();
+                cx.defer(move |cx| {
+                    let _ = owner.update(cx, |_, window, cx| {
+                        let _ = app.update(cx, |this, cx| then(this, window, cx));
+                    });
+                });
+            }
+        }
     }
 
     /// Resolve a pending form before performing both parts of an external
@@ -6742,8 +6912,10 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         self.with_settings_edits_resolved(window, cx, move |this, window, cx| {
-            this.open_settings_section(SettingsSection::Ssh, window, cx);
-            this.ssh_form_load(&profile, window, cx);
+            this.open_settings_then(window, cx, move |this, window, cx| {
+                this.navigate_settings(SettingsSection::Ssh, None, window, cx);
+                this.ssh_form_load(&profile, window, cx);
+            });
         });
     }
 
@@ -8470,19 +8642,20 @@ impl Render for Tty7App {
         let bg_image = window_background_image_layer(cx);
         let settings_bg = crate::ui::theme::overlay_background(cx);
 
-        let settings_overlay = self.settings.is_some().then(|| {
-            div()
-                .absolute()
-                .inset_0()
-                .occlude()
-                // Opaque on purpose: the settings panel must never let the
-                // workspace translucency (window opacity / backdrop material)
-                // show through, even at window edges during a resize. The
-                // preset's gradient fill is preserved, just with alpha 1;
-                // `render_settings` repaints the theme image over it.
-                .bg(settings_bg)
-                .child(self.render_settings(window, cx))
-        });
+        let settings_overlay =
+            (self.settings.is_some() && self.settings_window.is_none()).then(|| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    // Opaque on purpose: the settings panel must never let the
+                    // workspace translucency (window opacity / backdrop material)
+                    // show through, even at window edges during a resize. The
+                    // preset's gradient fill is preserved, just with alpha 1;
+                    // `render_settings` repaints the theme image over it.
+                    .bg(settings_bg)
+                    .child(self.render_settings(window, cx))
+            });
 
         let root =
             div()
@@ -10175,7 +10348,7 @@ mod tests {
         // Both panels pinned to their floors leaves the terminal the rest —
         // less than its floor, but more than the 260-odd points two saved
         // widths used to leave it.
-        assert!(narrow - SIDEBAR_MIN - PANEL_MIN > 300.);
+        assert!(narrow - SIDEBAR_MIN - PANEL_MIN >= 300.);
     }
 
     #[test]

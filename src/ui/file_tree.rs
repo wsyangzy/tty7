@@ -1920,6 +1920,21 @@ impl Tty7App {
                     }
                 }),
             )
+            // The menu acts on the row it was opened on, so that row is the
+            // one lit while it is up (#942) — selected without being opened,
+            // the way Explorer and every editor's tree do it.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener({
+                    let path = path.clone();
+                    move |this, _, _window, cx| {
+                        if let Some(code) = this.tab_code_mut() {
+                            code.selected = Some(path.clone());
+                        }
+                        cx.notify();
+                    }
+                }),
+            )
             .on_drag(ExternalPaths(vec![path.clone()].into()), {
                 let name = row.entry.name.clone();
                 move |_, _, _, cx| {
