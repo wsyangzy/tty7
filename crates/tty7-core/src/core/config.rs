@@ -167,6 +167,15 @@ pub struct Config {
     pub window_backdrop: WindowBackdrop,
     #[serde(default = "default_true")]
     pub dim_inactive_panes: bool,
+    /// Lenient one entry at a time, for the same reason the nested keys below
+    /// are: this is hand-edited, and it used to be all-or-nothing. A single
+    /// value serde could not read — `"ActivateTab1": null`, a number, an object
+    /// — failed the whole `Config`, which quarantines `config.json` and starts
+    /// the app on built-in defaults; every rebinding in the file then read as
+    /// its shipped default, and the next settings write persisted those
+    /// defaults over what the user wrote (#901). A line that cannot be read is
+    /// skipped with a warning, and the rest of the map still binds.
+    #[serde(default, deserialize_with = "de_keybindings")]
     pub keybindings: HashMap<String, KeybindingOverride>,
     #[serde(default = "default_preset")]
     pub keybinding_preset: String,
@@ -890,28 +899,25 @@ impl Config {
     }
 
     pub fn save(&self) {
+        if let Err(error) = self.try_save() {
+            log::warn!("failed to save config: {error}");
+        }
+    }
+
+    /// Persist without hiding a failure from an interactive settings editor.
+    pub fn try_save(&self) -> std::io::Result<()> {
         if self.quarantined {
-            // The file this instance stands in for could not be read, so what
-            // the user wrote is still on disk — writing these defaults over it
-            // is the wholesale loss #537 is about. The fix is to repair the
-            // file; the next load that parses produces a writable config.
-            log::warn!("not saving over a config file that failed to load; fix or remove it first");
-            return;
+            return Err(std::io::Error::other(
+                "the existing configuration could not be read; repair it before saving",
+            ));
         }
-        let Some(path) = Self::path() else {
-            return;
-        };
+        let path = Self::path()
+            .ok_or_else(|| std::io::Error::other("configuration directory is unavailable"))?;
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
-        match serde_json::to_string_pretty(self) {
-            Ok(text) => {
-                if let Err(e) = write_atomic(&path, text.as_bytes()) {
-                    log::warn!("failed to write config at {}: {e}", path.display());
-                }
-            }
-            Err(e) => log::warn!("failed to serialize config: {e}"),
-        }
+        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        write_atomic(&path, text.as_bytes())
     }
 
     fn path() -> Option<PathBuf> {
@@ -1036,6 +1042,11 @@ pub fn write_atomic_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Re
 
 fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
     use std::io::Write as _;
+    // Renaming over a symlink replaces the link itself, so a config.json
+    // symlinked into a dotfiles repo would silently turn into a plain file and
+    // stop syncing. Write next to (and rename over) the file it points at.
+    let resolved = resolve_symlinks(path);
+    let path = resolved.as_path();
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp.{}",
@@ -1064,6 +1075,25 @@ fn write_atomic_mode(path: &std::path::Path, bytes: &[u8], private: bool) -> std
             Err(e)
         }
     }
+}
+
+/// Follows `path` through any chain of symlinks to the file it finally names,
+/// which need not exist yet. Gives up after a bounded number of hops, so a
+/// symlink loop falls back to writing over the last link reached.
+fn resolve_symlinks(path: &std::path::Path) -> PathBuf {
+    const MAX_HOPS: usize = 40;
+
+    let mut resolved = path.to_path_buf();
+    for _ in 0..MAX_HOPS {
+        let Ok(target) = std::fs::read_link(&resolved) else {
+            break;
+        };
+        resolved = match resolved.parent() {
+            Some(parent) => parent.join(target),
+            None => target,
+        };
+    }
+    resolved
 }
 
 pub fn config_dir_path() -> Option<PathBuf> {
@@ -1240,10 +1270,41 @@ fn default_ui_font_size() -> f32 {
 }
 
 fn default_sidebar_width() -> f32 {
-    220.0
+    260.0
 }
 
 pub const MAX_SCROLLBACK: usize = 100_000;
+
+/// `keybindings`, read one line at a time.
+///
+/// [`de_lenient`] is all-or-nothing per field, which for a map means one bad
+/// line throwing away every good one. Here each entry stands on its own: the
+/// ones that name a shortcut or a list of shortcuts bind, the ones that do not
+/// are logged and dropped. A `keybindings` that is not an object at all falls
+/// back to an empty map rather than failing the file.
+fn de_keybindings<'de, D>(deserializer: D) -> Result<HashMap<String, KeybindingOverride>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let serde_json::Value::Object(entries) = value else {
+        log::warn!("ignoring `keybindings` {value}: expected an object of action name to shortcut");
+        return Ok(HashMap::new());
+    };
+    let mut bindings = HashMap::with_capacity(entries.len());
+    for (action, raw) in entries {
+        match KeybindingOverride::deserialize(&raw) {
+            Ok(binding) => {
+                bindings.insert(action, binding);
+            }
+            Err(e) => log::warn!(
+                "ignoring keybinding for {action:?}: {raw} is not a shortcut, \
+                 a list of shortcuts, or \"\" to unbind ({e})"
+            ),
+        }
+    }
+    Ok(bindings)
+}
 
 pub(crate) fn de_lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -1723,6 +1784,52 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_writes_through_a_symlink_instead_of_replacing_it() {
+        let dir = TestDir::new("symlink");
+        let real = dir.path().join("dotfiles-config.json");
+        std::fs::write(&real, b"old").unwrap();
+        let link = dir.path().join("config.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config.json must stay a symlink"
+        );
+        assert_eq!(std::fs::read(&real).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_follows_relative_and_dangling_symlinks() {
+        let dir = TestDir::new("symlink-relative");
+        std::fs::create_dir(dir.path().join("dotfiles")).unwrap();
+        let link = dir.path().join("config.json");
+        // Relative to the link's own directory, and not created yet.
+        std::os::unix::fs::symlink("dotfiles/config.json", &link).unwrap();
+        write_atomic(&link, b"fresh").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("dotfiles/config.json")).unwrap(),
+            b"fresh"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(dir.path().join("dotfiles"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "temp file should be renamed away");
+    }
+
     #[test]
     fn write_atomic_replaces_contents_and_leaves_no_temp() {
         let dir = TestDir::new("atomic");
@@ -2099,6 +2206,34 @@ mod tests {
                 .expect("both shapes load");
         assert_eq!(cfg.keybindings.len(), 4);
         assert_eq!(serde_json::to_value(&cfg.keybindings).unwrap(), written);
+    }
+
+    #[test]
+    fn a_keybinding_line_that_cannot_be_read_does_not_take_the_config_with_it() {
+        // #901: one unreadable line used to fail the whole `Config`. The loader
+        // then quarantines config.json and starts on built-in defaults, so
+        // every rebinding in the file — the point of the file — came back as
+        // the shipped default, and the next settings write made that permanent.
+        let cfg: Config = serde_json::from_str(
+            r#"{"font_size": 20.0,
+                "keybindings": {"ActivateTab1": null, "ActivateTab2": 2,
+                                "ActivateTab3": {"key": "alt-shift-3"},
+                                "ActivateTab4": [], "NextTab": "ctrl-alt-]"}}"#,
+        )
+        .expect("a bad keybinding line must not fail the file");
+        assert_eq!(cfg.font_size, 20.0, "the rest of the file still loads");
+        assert_eq!(
+            serde_json::to_value(&cfg.keybindings).unwrap(),
+            serde_json::json!({"ActivateTab4": [], "NextTab": "ctrl-alt-]"}),
+            "the readable lines survive and the unreadable ones are dropped"
+        );
+
+        // And a `keybindings` that is not a map at all is no reason to hand
+        // the user back default fonts, themes and everything else.
+        let odd: Config = serde_json::from_str(r#"{"font_size": 20.0, "keybindings": []}"#)
+            .expect("a keybindings of the wrong shape must not fail the file");
+        assert_eq!(odd.font_size, 20.0);
+        assert!(odd.keybindings.is_empty());
     }
 
     fn pin_config_dir() {

@@ -75,17 +75,24 @@ between whichever two the caret lands between. See
 
 ## Naming
 
-Almost no tab has a name of its own, so the sidebar falls back:
+A name you set (right-click → **Rename Tab…**) always wins. Otherwise, a
+recognized agent is named after its stable project directory; if that directory
+is unknown, its agent name is used. Titles written by agent tools or child
+processes do not replace the project label.
 
-1. a name you set (right-click → **Rename Tab…**)
-2. the title the shell is reporting — the running command, usually
-3. **Shell 3**, numbered by position, when there is no title at all
+For ordinary shells, a useful terminal title takes precedence over the working
+directory, followed by the foreground process or **Shell 3**, numbered by
+position. With shell integration, a title set by a running command expires when
+that command finishes; a title set by the shell at its prompt is preserved.
 
-`tty7 tab ls` answers the same question with more evidence, because a script has
-no screen to look at. Its `label` falls back through the name, then the coding
-agent running in the tab ("Claude Code"), then the last segment of the working
-directory, then the foreground process — while `name` stays literal, so a script
-can tell a real name from a stand-in.
+**Settings → Window & Tabs → Show paths in tab labels** (`tab_full_path`)
+controls directory labels in the sidebar, top tab strip, and workspace switcher.
+By default they show the last directory segment; enabling the option includes
+the path. Hovering an abbreviated label reveals its full path.
+
+`tty7 tab ls` uses the same custom-name and agent-project priorities for its
+`label`, shortening paths to their last segment. Its `name` remains literal,
+so a script can tell a real name from a stand-in.
 
 ## The switcher
 
