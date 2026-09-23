@@ -48,8 +48,8 @@ pub enum CommandKind {
     ResizePaneDown,
     SwapPaneNext,
     SwapPanePrev,
-    NextTab,
-    PrevTab,
+    SelectNextTab,
+    SelectPrevTab,
     ToggleMaximizePane,
     ToggleFullscreen,
     ToggleTabSidebar,
@@ -83,6 +83,8 @@ pub enum CommandKind {
     DocumentWidthThird,
     DocumentWidthHalf,
     DocumentWidthTwoThirds,
+    ToggleDocumentPreview,
+    ToggleDocumentWrap,
     RestartSshSession,
     ScmCommit,
     ScmStageAll,
@@ -154,8 +156,8 @@ impl CommandKind {
             ResizePaneDown => "resize-pane-down",
             SwapPaneNext => "swap-pane-next",
             SwapPanePrev => "swap-pane-prev",
-            NextTab => "next-tab",
-            PrevTab => "prev-tab",
+            SelectNextTab => "next-tab",
+            SelectPrevTab => "prev-tab",
             ToggleMaximizePane => "zoom-pane",
             ToggleFullscreen => "full-screen",
             ToggleTabSidebar => "tab-bar-position",
@@ -193,6 +195,8 @@ impl CommandKind {
             DocumentWidthThird => "document-width-third",
             DocumentWidthHalf => "document-width-half",
             DocumentWidthTwoThirds => "document-width-two-thirds",
+            ToggleDocumentPreview => "document-preview",
+            ToggleDocumentWrap => "document-wrap",
             RestartSshSession => "ssh-reconnect",
             ScmCommit => "git-commit",
             ScmStageAll => "git-stage-all",
@@ -264,8 +268,10 @@ impl CommandKind {
             ResizePaneDown => "ResizePaneDown",
             SwapPaneNext => "SwapPaneNext",
             SwapPanePrev => "SwapPanePrev",
-            NextTab => "NextTab",
-            PrevTab => "PrevTab",
+            // What the palette runs is the plain next/previous step, not the
+            // MRU switcher `NextTab` opens, so its chord hint is that one's.
+            SelectNextTab => "SelectNextTab",
+            SelectPrevTab => "SelectPrevTab",
             ToggleMaximizePane => "ToggleMaximizePane",
             ToggleFullscreen => "ToggleFullscreen",
             ToggleTabSidebar => "ToggleTabSidebar",
@@ -297,6 +303,8 @@ impl CommandKind {
             DocumentWidthThird => "DocumentWidthThird",
             DocumentWidthHalf => "DocumentWidthHalf",
             DocumentWidthTwoThirds => "DocumentWidthTwoThirds",
+            ToggleDocumentPreview => "ToggleDocumentPreview",
+            ToggleDocumentWrap => "ToggleDocumentWrap",
             RestartSshSession => "RestartSshSession",
             OpenSshProfiles => "OpenSshProfiles",
             ScmCommit => "ScmCommit",
@@ -458,8 +466,8 @@ impl Command {
             Command::localized(L10nKey::CmdResizePaneDown, ResizePaneDown),
             Command::localized(L10nKey::CmdSwapPaneNext, SwapPaneNext),
             Command::localized(L10nKey::CmdSwapPanePrevious, SwapPanePrev),
-            Command::localized(L10nKey::CmdNextTab, NextTab),
-            Command::localized(L10nKey::CmdPreviousTab, PrevTab),
+            Command::localized(L10nKey::CmdNextTab, SelectNextTab),
+            Command::localized(L10nKey::CmdPreviousTab, SelectPrevTab),
             Command::localized(L10nKey::CmdCopyWorkingDirectory, CopyWorkingDirectory),
             Command::localized(L10nKey::CmdCopySessionId, CopyAgentSessionId)
                 .with_subtitle(t(L10nKey::CmdCopySessionIdSubtitle)),
@@ -511,6 +519,8 @@ impl Command {
             Command::localized(L10nKey::CmdDocumentWidthThird, DocumentWidthThird),
             Command::localized(L10nKey::CmdDocumentWidthHalf, DocumentWidthHalf),
             Command::localized(L10nKey::CmdDocumentWidthTwoThirds, DocumentWidthTwoThirds),
+            Command::localized(L10nKey::CmdToggleDocumentPreview, ToggleDocumentPreview),
+            Command::localized(L10nKey::CmdToggleDocumentWrap, ToggleDocumentWrap),
             Command::localized(
                 if tab_bar_left {
                     L10nKey::CmdTabBarMoveToTop
@@ -1086,8 +1096,8 @@ impl ListDelegate for PaletteDelegate {
                 .selected(Some(ix) == self.selected)
                 .h(px(PALETTE_ROW_H))
                 .mx(px(PALETTE_ROW_MX))
-                .rounded(px(6.))
-                .text_sm()
+                .rounded(crate::ui::rounding::ROW_RADIUS)
+                .text_size(gpui::rems(13. / 16.))
                 .child(row),
         )
     }
@@ -1317,7 +1327,7 @@ impl PaletteView {
 
 impl EventEmitter<PaletteEvent> for PaletteView {}
 
-const PALETTE_ROW_H: f32 = 36.;
+const PALETTE_ROW_H: f32 = 34.;
 
 /// Left inset of a row's *label*, so a section header can start on the same
 /// pixel column as the rows it introduces. A row is a `ListItem` inset by
@@ -1353,8 +1363,6 @@ const RECENT_ROWS: usize = 5;
 
 impl Render for PaletteView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (border, popover) = (theme.border, theme.popover);
         let scrim = crate::ui::presets::scrim_fill(cx);
 
         let viewport = window.viewport_size();
@@ -1366,11 +1374,7 @@ impl Render for PaletteView {
             .min(PALETTE_ROW_H * PALETTE_VISIBLE_ROWS + 4.));
         let card = v_flex()
             .w(px((viewport.width.as_f32() - 32.).clamp(0., 600.)))
-            .bg(popover)
-            .border_1()
-            .border_color(border)
-            .rounded(px(12.))
-            .shadow_xl()
+            .map(|panel| crate::ui::theme::floating_surface(panel, cx))
             .overflow_hidden()
             .pb_1()
             .child(

@@ -1,5 +1,5 @@
 use gpui::{
-    App, Background, Hsla, Menu, MenuItem, OsAction, Pixels, Point, SystemMenuType, Window,
+    App, Background, Hsla, Menu, MenuItem, OsAction, Pixels, Point, Styled, SystemMenuType, Window,
     WindowBackgroundAppearance, linear_color_stop, linear_gradient, point, px, rgb,
 };
 use gpui_component::scroll::ScrollbarShow;
@@ -144,18 +144,14 @@ fn window_menu_items(cx: &App) -> Vec<MenuItem> {
         MenuItem::separator(),
     ];
     let workspace_start = items.len();
-    let mut separated = false;
+    // Slot order, open and closed interleaved: the item's position is its
+    // number and its shortcut, so it cannot move when a window closes (#760).
+    // A closed one says so with its age instead.
     for (i, (id, open)) in order.iter().enumerate() {
         let Some(workspace) = store.get(*id) else {
             continue;
         };
         let Some(action) = slot_action(i) else { break };
-        if !open && !separated {
-            separated = true;
-            if items.len() > workspace_start {
-                items.push(MenuItem::Separator);
-            }
-        }
         let name = crate::ui::machine_mirror::display_name(cx, workspace)
             .unwrap_or_else(|| t(L10nKey::WindowUntitled).to_string());
         let label = if *open {
@@ -912,6 +908,19 @@ pub(crate) fn apply_theme(mut window: Option<&mut Window>, cx: &mut App) {
     if let Some(window) = window.as_deref_mut() {
         window.set_traffic_light_position(traffic_light_position());
     }
+}
+
+/// Shared opaque floating surface. In-window GPUI layers cannot blur the
+/// terminal beneath them, so depth comes from the edge and shadow instead.
+pub(crate) fn floating_surface<T: Styled>(element: T, cx: &App) -> T {
+    let theme = cx.theme();
+    element
+        .bg(theme.popover)
+        .text_color(theme.popover_foreground)
+        .border_1()
+        .border_color(theme.border.opacity(0.65))
+        .rounded(crate::ui::rounding::POPOVER_RADIUS)
+        .shadow_xl()
 }
 
 /// On-state shares the accent role with sliders and primary actions.

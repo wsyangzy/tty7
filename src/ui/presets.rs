@@ -205,6 +205,14 @@ impl Theme {
         };
         let border = hairline(0.16, BORDER_FLOOR);
         let divider = hairline(0.16, DIVIDER_FLOOR);
+        // This shared caption role is painted on all three opaque surfaces.
+        // Calibrating only against the window loses contrast on raised fills.
+        let muted_foreground = [bg, sidebar, popover]
+            .into_iter()
+            .fold(dim(fg, bg, state::TEXT_RESTING), |ink, surface| {
+                legible_ink(surface, ink, TEXT_FLOOR)
+            });
+        let title_floor = TITLE_FLOOR.max(contrast(muted_foreground, sidebar) * state::TEXT_STEP);
         Neutrals {
             background: bg,
             foreground: fg,
@@ -212,7 +220,7 @@ impl Theme {
             divider,
             secondary: mix(bg, fg, 0.09),
             muted: mix(bg, fg, 0.06),
-            muted_foreground: dim(fg, bg, state::TEXT_RESTING),
+            muted_foreground,
             popover,
             caret: legible_ink(bg, self.caret.unwrap_or(self.accent), ACCENT_FLOOR),
             selection: self.selection.unwrap_or_else(|| mix(bg, fg, 0.20)),
@@ -227,14 +235,14 @@ impl Theme {
             // the same grey twice, and the column reads as one flat wash with
             // nothing to look at first.
             sidebar_fg: {
-                let title = at_least(mix(fg, bg, 0.10), fg, sidebar, TITLE_FLOOR);
+                let title = legible_ink(sidebar, mix(fg, bg, 0.10), title_floor);
                 // …and capped so the selected label keeps its `TEXT_STEP`
                 // above it: on a white-on-black palette a 10% blend lands so
                 // close to `fg` that there is nothing brighter left to step
                 // to. The floor wins over the cap on a soft palette, where
                 // the step is taken past `fg` instead (see `stepped_ink`).
-                let headroom = (contrast(fg, sidebar) / state::TEXT_STEP).max(TITLE_FLOOR);
-                match headroom > TITLE_FLOOR && contrast(title, sidebar) > headroom {
+                let headroom = (contrast(fg, sidebar) / state::TEXT_STEP).max(title_floor);
+                match headroom > title_floor && contrast(title, sidebar) > headroom {
                     true => dim(title, sidebar, headroom),
                     false => title,
                 }
@@ -267,8 +275,10 @@ impl Theme {
 
     pub(crate) fn interactions(&self) -> Interactions {
         let m = self.neutrals();
-        let navigation = mix(m.sidebar, m.accent, if self.dark { 0.18 } else { 0.10 });
-        let choice = mix(m.popover, m.accent, if self.dark { 0.22 } else { 0.12 });
+        let navigation = mix(m.sidebar, 0x2878df, if self.dark { 0.28 } else { 0.14 });
+        // Menus use a blue wash; the switcher uses the solid companion fill.
+        // Keep labels and shortcut hints readable on the shared menu surface.
+        let choice = mix(m.popover, 0x2878df, if self.dark { 0.34 } else { 0.20 });
         let preferred_label = if self.dark { 0x121418 } else { 0xffffff };
         let fill = self.clear_ink(
             legible_ink(preferred_label, m.accent, TEXT_FLOOR),
@@ -2113,6 +2123,21 @@ mod tests {
                 "{} field boundaries must not use selected-row fills",
                 theme.id
             );
+        }
+    }
+
+    #[test]
+    fn captions_are_readable_on_every_surface_they_are_used_on() {
+        for theme in builtins() {
+            let m = theme.neutrals();
+            for surface in [m.background, m.sidebar, m.popover] {
+                assert!(
+                    contrast(m.muted_foreground, surface) >= TEXT_FLOOR,
+                    "{}: caption {:#08x} on {surface:#08x}",
+                    theme.id,
+                    m.muted_foreground,
+                );
+            }
         }
     }
 

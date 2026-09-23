@@ -1313,6 +1313,52 @@ impl Tty7App {
         cx.notify();
     }
 
+    /// Copy a file of a remote tree into this machine's Downloads folder,
+    /// named and numbered the way the SFTP panel's Download does it.
+    fn file_tree_download(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = self.active_host(cx) else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
+        let src = path.to_path_buf();
+        HostOps::run_in(
+            host,
+            window,
+            cx,
+            move |h| {
+                file_copy::download_file(
+                    h,
+                    &src,
+                    &crate::ui::sftp::local_download_dir(),
+                    file_copy::REMOTE_FILE_MAX,
+                )
+            },
+            move |_app, result: std::io::Result<PathBuf>, window, cx| match result {
+                Ok(local) => window.push_notification(
+                    t_fmt(
+                        L10nKey::FileTreeDownloaded,
+                        &[(
+                            "path",
+                            &crate::ui::path_display::native_separators(&local)
+                                .display()
+                                .to_string(),
+                        )],
+                    ),
+                    cx,
+                ),
+                Err(e) => HostOps::notify_err(
+                    window,
+                    cx,
+                    &t_fmt(L10nKey::FileTreeDownloadFailed, &[("name", &name)]),
+                    &e,
+                ),
+            },
+        );
+    }
+
     fn file_tree_delete(
         &mut self,
         path: PathBuf,
@@ -1807,9 +1853,7 @@ impl Tty7App {
                     cx.theme().sidebar_foreground
                 })
                 .when(selected, |d| d.font_weight(gpui::FontWeight::MEDIUM))
-                .when(row.entry.ignored, |d| {
-                    d.italic().text_color(muted.opacity(0.7))
-                })
+                .when(row.entry.ignored, |d| d.italic().text_color(muted))
                 // Ordinary changes belong in the status badge. Only a conflict
                 // should turn an entire filename into an attention signal.
                 .when_some(deco.tint, |d, status| {
@@ -2081,6 +2125,17 @@ impl Tty7App {
                     }
                 }),
             );
+        } else if !is_dir {
+            // Reveal's place on a remote tree: the file is not here to show in
+            // Finder, so the item that makes sense is the one that brings it
+            // here. A local file is already on this machine and gets Reveal.
+            menu = menu.item(PopupMenuItem::new(t(L10nKey::Download)).on_click({
+                let app = app.clone();
+                let p = p.clone();
+                move |_, window, cx| {
+                    let _ = app.update(cx, |this, cx| this.file_tree_download(&p, window, cx));
+                }
+            }));
         }
 
         menu = menu.separator().item(dotfiles_menu_item(show_hidden, app));

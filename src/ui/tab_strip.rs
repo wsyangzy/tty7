@@ -1870,7 +1870,13 @@ impl Tty7App {
         // macOS that chrome belongs to the panel's own header, which the strip
         // now stops short of, so reserving for it here would charge the chips
         // for it twice.
-        let corner_w = if panel_w > 0. {
+        // On macOS the trailing tiles sit at the end of the terminal column's
+        // strip only while nothing stands to the right of it. A docked document
+        // takes the window's right edge the way the panel does, so the tiles
+        // give way to it instead of hanging in the middle of the window beside
+        // the document's own header. ⌘J and the palette still reach both.
+        let strip_chrome = !cfg!(target_os = "macos") || (panel_w <= 0. && document_w <= 0.);
+        let corner_w = if !strip_chrome || panel_w > 0. {
             0.
         } else {
             chrome_band_w.unwrap_or_else(trailing_chrome_tiles_w)
@@ -2202,10 +2208,9 @@ impl Tty7App {
                 )
         });
 
-        let panel_open = self.right_panel_open(cx);
-        // macOS places these controls in the open panel's own title bar.
-        let right_chrome =
-            (!panel_open || !cfg!(target_os = "macos")).then(|| self.window_chrome(window, cx));
+        // macOS places these controls in the open panel's own title bar, and
+        // drops them while a docked document holds the right edge.
+        let right_chrome = strip_chrome.then(|| self.window_chrome(window, cx));
 
         h_flex()
             .id("tab-strip")

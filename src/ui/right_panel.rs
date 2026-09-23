@@ -42,9 +42,8 @@ pub(crate) const TEXT_MONO: f32 = TEXT - STEP;
 pub(crate) const META: f32 = 12. * STEP;
 pub(crate) const META_MONO: f32 = META - STEP;
 
-/// Uppercase section headings. Deliberately below `META` — it matches the tab
-/// sidebar's group headings, which are the same thing one panel over.
-pub(crate) const HEADING: f32 = 11. * STEP;
+/// Compact section headings share the sidebar group-label size.
+pub(crate) const HEADING: f32 = META;
 
 /// The leading glyph on a panel row — the file tree's folder and file marks.
 ///
@@ -81,7 +80,7 @@ pub(crate) const ROW_GLYPH: f32 = crate::ui::app::TILE_GLYPH;
 /// in one tab because every tab of this panel is the same list of rows seen
 /// from a different angle, and a fill that bleeds 4px under Source Control and
 /// 6px under Info is a panel whose rows visibly do not belong to each other.
-pub(crate) const ROW_INSET: f32 = 4.;
+pub(crate) const ROW_INSET: f32 = 6.;
 
 /// Whether this forward is the one that reaches `port` on the far side.
 ///
@@ -429,6 +428,7 @@ impl Tty7App {
             self.sftp_close_browser(cx);
         }
         if !panel_open {
+            self.sftp_panel.panel_was_closed = true;
             return None;
         }
         let width = self.right_panel_px(window, cx);
@@ -636,7 +636,7 @@ impl Tty7App {
                             div()
                                 .text_size(rems(META_MONO))
                                 .font_family(cx.theme().mono_font_family.clone())
-                                .text_color(cx.theme().muted_foreground.opacity(0.75))
+                                .text_color(cx.theme().muted_foreground)
                                 .child(c),
                         )
                     }),
@@ -731,7 +731,7 @@ impl Tty7App {
             .children(hint.map(|h| {
                 div()
                     .text_size(rems(META))
-                    .text_color(muted.opacity(0.75))
+                    .text_color(muted)
                     .child(h.to_string())
             }))
             .into_any_element()
@@ -1041,8 +1041,8 @@ impl Tty7App {
             .items_baseline()
             .gap(px(9.))
             .px(px(ROW_INSET))
-            .py(px(2.))
-            .rounded(px(5.))
+            .py(px(4.))
+            .rounded(crate::ui::rounding::ROW_RADIUS)
             .text_size(rems(TEXT))
             // Only rows that can do something light up, so the fill is never a
             // promise the row cannot keep.
@@ -1053,7 +1053,7 @@ impl Tty7App {
                 div()
                     .flex_none()
                     .w(label_w)
-                    .text_size(rems(META))
+                    .text_size(rems(TEXT))
                     .whitespace_nowrap()
                     .text_color(cx.theme().muted_foreground)
                     .child(row.label),
@@ -1093,7 +1093,9 @@ impl Tty7App {
     ) -> AnyElement {
         h_flex()
             .when(divider, |d| {
-                d.mt(px(6.)).border_t_1().border_color(cx.theme().border)
+                d.mt(px(6.))
+                    .border_t_1()
+                    .border_color(cx.theme().sidebar_border)
             })
             .items_center()
             .justify_between()
@@ -1111,9 +1113,7 @@ impl Tty7App {
             }))
             .pb(px(if trailing.is_some() { 0. } else { 4. }))
             .child(
-                // A group header sits below the panel's own title in the
-                // hierarchy, so it sits below it in the ramp too: the smallest
-                // step, carried by weight and caps rather than by size.
+                // Weight and capitalization distinguish compact group headings.
                 div()
                     .text_size(rems(HEADING))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -1156,12 +1156,14 @@ impl Tty7App {
                             .when(!p.foreground, |d| d.text_color(cx.theme().muted_foreground))
                             .child(p.name.clone()),
                     )
-                    .child(info_chip(
-                        &p.pid.to_string(),
-                        cx.theme().accent,
-                        cx.theme().muted_foreground,
-                        &mono,
-                    )),
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(rems(META_MONO))
+                            .font_family(mono.clone())
+                            .text_color(cx.theme().muted_foreground)
+                            .child(p.pid.to_string()),
+                    ),
             );
         }
         Some(
@@ -1298,7 +1300,7 @@ impl Tty7App {
                     .gap(px(8.))
                     .px(px(ROW_INSET))
                     .py(px(1.))
-                    .rounded(px(5.))
+                    .rounded(crate::ui::rounding::ROW_RADIUS)
                     .hover(|s| s.bg(gpui::rgb(sf.hover)))
                     .child(info_chip(
                         &p.port.to_string(),
@@ -1329,7 +1331,7 @@ impl Tty7App {
                             .flex_none()
                             .text_size(rems(META_MONO))
                             .font_family(mono.clone())
-                            .text_color(cx.theme().muted_foreground.opacity(0.8))
+                            .text_color(cx.theme().muted_foreground)
                             .child(format!("→ :{local}"))
                     }))
                     .child(actions),

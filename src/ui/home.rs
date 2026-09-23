@@ -204,7 +204,7 @@ impl Tty7App {
 
         let closed_hint = self.closed.last().and_then(closed_tab_label);
         let nothing_to_reopen = self.closed.is_empty();
-        let mut list = v_flex().gap_1().w(px(320.)).text_sm().text_color(muted);
+        let mut list = v_flex().gap_2().w(px(340.)).text_sm().text_color(muted);
         for action in HOME_SHORTCUTS {
             if action == "ReopenClosedTab" && nothing_to_reopen {
                 continue;
@@ -215,7 +215,8 @@ impl Tty7App {
                 Button::new(action)
                     .ghost()
                     .w_full()
-                    .h(px(38.))
+                    .min_h(gpui::rems(2.625))
+                    .rounded(crate::ui::rounding::CARD_RADIUS)
                     .child(
                         h_flex()
                             .w_full()
