@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history + tags — needed for the skip check and version math
+          fetch-depth: 0 # full history + tags — needed for the published-HEAD skip check
 
       - id: plan
         run: |
@@ -54,8 +54,13 @@ jobs:
           # offers to the people who took the morning build. Still one numeric
           # identifier, which is what `parse_version` orders nightlies by — it
           # compares them all, so this stays sound if a segment is ever added.
-          LAST=$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
-          BASE=${LAST#v}
+          # Use the checked-out source version: a fork can have current code
+          # without the upstream release tags. Tags only drive the skip check.
+          BASE=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [[ ! "$BASE" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Cargo.toml [workspace.package].version must be a stable X.Y.Z version (got '$BASE')"
+            exit 1
+          fi
           NEXT="${BASE%.*}.$(( ${BASE##*.} + 1 ))"
           VERSION="${NEXT}-nightly.$(date -u +%Y%m%d%H%M)"
           echo "building $VERSION from ${GITHUB_SHA::7}"
