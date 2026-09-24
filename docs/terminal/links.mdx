@@ -32,6 +32,18 @@ parentheses, brackets, or quotes can also span explicit line breaks with
 padding or indentation, as in coding-agent output. Hovering, clicking, and
 the file context menu all use the complete path.
 
+Unquoted file paths can also cross small TUI margins (up to eight columns of
+trailing padding or leading indentation). The continuation must keep the
+same text colors and form one path with a file extension or line number;
+short independent lines and a new absolute path are not joined. These
+additional checks inspect at most 32 rows and 4096 cells, without filesystem
+access on the UI thread.
+
+Chinese sentence punctuation can touch a path: `src/main.rs:12。说明` opens
+`src/main.rs` at line 12, resolved against the pane's directory and repository
+root as usual. The sentence is excluded from the link's underline and target.
+File existence checks still use the bounded asynchronous probe cache.
+
 Paths in a pane connected to another machine are resolved *on that machine*,
 so the underline appears a moment after the pointer settles rather than
 instantly. A pane running `ssh` typed into a local shell has no host that can

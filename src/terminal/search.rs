@@ -1017,8 +1017,45 @@ pub(super) fn file_candidates_at(text: &str, col: usize) -> Vec<FileCandidate> {
     };
     let chars: Vec<char> = token.chars().collect();
     let mut out: Vec<FileCandidate> = Vec::new();
-    for cut in left_cuts(&chars) {
-        push_candidates(base, &chars, cut, col, &mut out);
+    // `:880。说明` is an explicit location followed by prose, not a literal
+    // filename. Never submit that malformed colon suffix to the host: on
+    // Windows an invalid-name error would abort a click before its fallback.
+    let location_before_prose = chars.iter().enumerate().any(|(i, &c)| {
+        if !is_file_prose_boundary(c) {
+            return false;
+        }
+        let digits = chars[..i]
+            .iter()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        digits > 0 && i > digits && chars[i - digits - 1] == ':'
+    });
+    if !location_before_prose {
+        for cut in left_cuts(&chars) {
+            push_candidates(base, &chars, cut, col, &mut out);
+        }
+    }
+    // Chinese prose need not put a space after a path: `src/main.rs:12。说明`.
+    // Keep the literal reading first (punctuation can belong to a filename),
+    // then try only the punctuation-delimited segment under the pointer. Do
+    // not enumerate every substring or split Chinese directory names.
+    let at = col - base;
+    if !is_file_prose_boundary(chars[at]) {
+        let start = chars[..at]
+            .iter()
+            .rposition(|&c| is_file_prose_boundary(c))
+            .map_or(0, |i| i + 1);
+        let end = chars[at..]
+            .iter()
+            .position(|&c| is_file_prose_boundary(c))
+            .map_or(chars.len(), |i| at + i);
+        if start > 0 || end < chars.len() {
+            let segment = &chars[start..end];
+            for cut in left_cuts(segment) {
+                push_candidates(base + start, segment, cut, col, &mut out);
+            }
+        }
     }
     // Longest path first: `/srv/app/log` beats the `/srv/app` inside it when
     // both exist, and a peeled reading only gets its turn once the one that
@@ -1245,8 +1282,29 @@ fn non_ws_token_at(text: &str, col: usize) -> Option<(usize, usize, String)> {
 fn is_left_wrapper(c: char) -> bool {
     matches!(
         c,
-        '(' | '[' | '<' | '{' | '\'' | '"' | '`' | '（' | '［' | '｛' | '《' | '「' | '『' | '【'
+        '(' | '['
+            | '<'
+            | '{'
+            | '\''
+            | '"'
+            | '`'
+            | '（'
+            | '［'
+            | '｛'
+            | '《'
+            | '「'
+            | '『'
+            | '【'
+            | '“'
+            | '‘'
     ) || ('\u{2500}'..='\u{257F}').contains(&c)
+}
+
+pub(super) fn is_file_prose_boundary(c: char) -> bool {
+    matches!(
+        c,
+        '。' | '，' | '、' | '；' | '：' | '！' | '？' | '“' | '”' | '‘' | '’'
+    )
 }
 
 /// Where the path stops and the sentence around it starts again, as an
@@ -1267,7 +1325,7 @@ fn trim_token_end(chars: &[char]) -> usize {
                 None | Some('.' | '/' | '\\')
             ),
             ',' | ';' | '\'' | '"' | '>' | '`' | '）' | '］' | '】' | '》' | '」' | '』' | '。'
-            | '，' | '、' | '；' | '：' => true,
+            | '，' | '、' | '；' | '：' | '！' | '？' | '”' | '’' => true,
             _ => false,
         };
         if !strip {
@@ -2530,6 +2588,124 @@ mod tests {
             local_link_at("note:main/keep.txt", 6, &one_root(labelled), true).is_some(),
             "a label in front of something written like a path still peels"
         );
+    }
+
+    #[test]
+    fn file_links_in_chinese_prose_keep_the_path_location_and_span() {
+        for style in [PathStyle::Windows, PathStyle::Posix] {
+            let roots = LinkRoots {
+                dirs: vec![match style {
+                    PathStyle::Windows => "D:/project".into(),
+                    PathStyle::Posix => "/project".into(),
+                }],
+                style,
+                local_home: false,
+            };
+            for (prefix, token, suffix, path, line, column) in [
+                (
+                    "见 ",
+                    "src/terminal/smart_select.rs:880",
+                    "。当时这个限制是为了避免",
+                    "src/terminal/smart_select.rs",
+                    880,
+                    None,
+                ),
+                (
+                    "详见：",
+                    "src/main.rs:12:4",
+                    "，已经修复",
+                    "src/main.rs",
+                    12,
+                    Some(4),
+                ),
+                (
+                    "见 “",
+                    "文档/说明.rs:8",
+                    "”。后续说明",
+                    "文档/说明.rs",
+                    8,
+                    None,
+                ),
+            ] {
+                let text = format!("{prefix}{token}{suffix}");
+                let start = prefix.chars().count();
+                let end = start + token.chars().count() - 1;
+                let expected = style.join(&roots.dirs[0], path);
+                for col in start..=end {
+                    let mut probes = 0;
+                    let link = link_at(&text, col, &roots, true, &mut |path, require_file| {
+                        probes += 1;
+                        assert_eq!(path, expected, "prose must not reach the filesystem");
+                        assert!(require_file);
+                        Probe::Hit { is_dir: false }
+                    })
+                    .unwrap();
+                    assert_eq!((link.start, link.end), (start, end));
+                    assert_eq!(probes, 1);
+                    assert!(matches!(link.target, LinkTarget::File {
+                        path, line: Some(actual_line), column: actual_column, is_dir: false
+                    } if path == expected && actual_line == line && actual_column == column));
+                }
+                for col in end + 1..text.chars().count() {
+                    assert!(
+                        file_candidates_at(&text, col)
+                            .iter()
+                            .all(|c| { !c.looks_like_a_path(style) && c.line.is_none() }),
+                        "prose outside the link at {col}: {text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chinese_prose_fallback_preserves_literal_punctuation_in_filenames() {
+        let roots = LinkRoots {
+            dirs: vec!["/project".into()],
+            style: PathStyle::Posix,
+            ..Default::default()
+        };
+        let text = "见 文档/报告，最终版.md";
+        let expected = PathBuf::from("/project/文档/报告，最终版.md");
+        for col in 2..text.chars().count() {
+            let mut probes = 0;
+            let link = link_at(text, col, &roots, true, &mut |path, _| {
+                probes += 1;
+                assert_eq!(path, expected);
+                Probe::Hit { is_dir: false }
+            })
+            .unwrap();
+            assert!(matches!(link.target, LinkTarget::File { path, .. } if path == expected));
+            assert_eq!(probes, 1);
+        }
+
+        let text = "见 src/main.rs。当时已经修复";
+        let mut probes = 0;
+        let link = link_at(text, 3, &roots, true, &mut |path, _| {
+            probes += 1;
+            if path == Path::new("/project/src/main.rs") {
+                Probe::Hit { is_dir: false }
+            } else {
+                Probe::Miss
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            probes, 2,
+            "only the literal and pointed-at segment are probed"
+        );
+        assert!(matches!(link.target, LinkTarget::File { path, .. }
+            if path == Path::new("/project/src/main.rs")));
+    }
+
+    #[test]
+    fn punctuation_dense_prose_does_not_expand_the_probe_ladder() {
+        let text = "src/main.rs:12。".repeat(256);
+        let col = text.chars().count() / 2;
+        let candidates = file_candidates_at(&text, col);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, "src/main.rs");
+        assert_eq!(candidates[0].line, Some(12));
     }
 
     /// Every reading of one token is worth at most a handful of questions.

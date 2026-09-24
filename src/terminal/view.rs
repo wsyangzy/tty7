@@ -12666,22 +12666,26 @@ mod gpui_tests {
                 pane.update(cx, |view, cx| {
                     let seen = opened.clone();
                     cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
-                        seen.borrow_mut().push(event.path.clone())
+                        seen.borrow_mut()
+                            .push((event.path.clone(), event.line, event.column))
                     })
                     .detach();
                     view.terminal.seed_cwd(Some(cwd.clone()));
                     // Deliberately prevent hover's independent lookup from winning the race.
                     view.link_repo_root_pending = true;
                     let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
-                    parser.advance(&mut *view.terminal.term.lock(), b"src/main.rs:3");
+                    parser.advance(
+                        &mut *view.terminal.term.lock(),
+                        "见 src/main.rs:3。当时这个限制".as_bytes(),
+                    );
                     assert_eq!(view.link_roots(cx).dirs, vec![cwd]);
-                    assert!(view.open_link_at(0, 0, window, cx));
+                    assert!(view.open_link_at(3, 0, window, cx));
                     parser.advance(&mut *view.terminal.term.lock(), b"\x1b[2J\x1b[Hnew output");
                 })
             })
             .unwrap();
         settle_link_entity_opens(&pane, cx);
-        assert_eq!(*opened.borrow(), vec![path]);
+        assert_eq!(*opened.borrow(), vec![(path, Some(3), None)]);
     }
 
     #[gpui::test]
@@ -13099,10 +13103,20 @@ mod gpui_tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::write(&path, b"test image").unwrap();
-        let output = format!(
+        let enclosed = format!(
             "see ({}/\r\n  output/playwright/mobile-cards.png)",
             frontend.to_string_lossy().replace('\\', "/")
         );
+        let head = format!("see {}/", frontend.to_string_lossy().replace('\\', "/"));
+        let bare = format!("{head}\r\n  output/playwright/mobile-cards.png:262，检查已通过");
+        let layouts = [
+            (enclosed.clone(), enclosed.chars().count() + 8, None),
+            (
+                bare,
+                unicode_width::UnicodeWidthStr::width(head.as_str()) + 4,
+                Some(262),
+            ),
+        ];
         let (window, pane, _daemon) = rooted_harness(cx);
         let opened = Rc::new(RefCell::new(Vec::new()));
         window
@@ -13111,7 +13125,8 @@ mod gpui_tests {
                     view.terminal.seed_cwd(Some(cwd));
                     let seen = opened.clone();
                     cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
-                        seen.borrow_mut().push(event.path.clone());
+                        seen.borrow_mut()
+                            .push((event.path.clone(), event.line, event.is_dir));
                     })
                     .detach();
                 });
@@ -13120,32 +13135,34 @@ mod gpui_tests {
 
         // Begin with the continuation, on a cold cache and in a different
         // project. No relative tail should ever be submitted to the host.
-        for (col, row) in [(3, 1), (6, 0)] {
-            window
-                .update(cx, |_, window, cx| {
-                    pane.update(cx, |view, cx| {
-                        view.set_grid_size(output.chars().count() + 8, 6, px(8.), px(17.), 1., cx);
-                        let mut parser: alacritty_terminal::vte::ansi::Processor =
-                            Default::default();
-                        parser.advance(
-                            &mut *view.terminal.term.lock(),
-                            format!("\x1b[2J\x1b[H{output}").as_bytes(),
-                        );
-                        assert!(view.open_link_at(col, row, window, cx));
-                        view.record_menu_link(col, row, cx);
-                        assert_eq!(view.menu_link_path(), Some(path.as_path()));
-                        view.resolve_menu_link(FileLinkAction::CopyPath, window, cx);
-                    });
-                })
-                .unwrap();
-            settle_link_entity_opens(&pane, cx);
-            assert_eq!(opened.borrow().last(), Some(&path));
-            assert_eq!(
-                cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text())),
-                Some(path.to_string_lossy().into_owned()),
-            );
+        for (output, cols, line) in layouts {
+            for (col, row) in [(3, 1), (6, 0)] {
+                window
+                    .update(cx, |_, window, cx| {
+                        pane.update(cx, |view, cx| {
+                            view.set_grid_size(cols, 6, px(8.), px(17.), 1., cx);
+                            let mut parser: alacritty_terminal::vte::ansi::Processor =
+                                Default::default();
+                            parser.advance(
+                                &mut *view.terminal.term.lock(),
+                                format!("\x1b[2J\x1b[H{output}").as_bytes(),
+                            );
+                            assert!(view.open_link_at(col, row, window, cx));
+                            view.record_menu_link(col, row, cx);
+                            assert_eq!(view.menu_link_path(), Some(path.as_path()));
+                            view.resolve_menu_link(FileLinkAction::CopyPath, window, cx);
+                        });
+                    })
+                    .unwrap();
+                settle_link_entity_opens(&pane, cx);
+                assert_eq!(opened.borrow().last(), Some(&(path.clone(), line, false)));
+                assert_eq!(
+                    cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text())),
+                    Some(path.to_string_lossy().into_owned()),
+                );
+            }
         }
-        assert_eq!(opened.borrow().len(), 2);
+        assert_eq!(opened.borrow().len(), 4);
     }
 
     /// The case from the bug report: a relative path printed by a tool, sitting

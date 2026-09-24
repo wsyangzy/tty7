@@ -8,6 +8,10 @@ use alacritty_terminal::term::cell::Flags;
 use regex::Regex;
 
 const MAX_WRAP_ROWS: usize = 32;
+// A bare token has no closing delimiter to prove where it ends. Only bridge
+// small TUI margins, and cap the amount of grid text inspected on each hover.
+const MAX_FILE_WRAP_PADDING: usize = 8;
+const MAX_FILE_WRAP_CELLS: usize = 4096;
 
 const MATCH_WINDOW: usize = 2000;
 
@@ -290,6 +294,9 @@ pub(super) fn logical_line_at<T: EventListener>(
     if bridge_hard_wrap && let Some(link) = enclosed_file_line_at(term, click) {
         return Some(link);
     }
+    if bridge_hard_wrap && let Some(link) = padded_file_line_at(term, click) {
+        return Some(link);
+    }
     let grid = term.grid();
     let last_col = Column(cols - 1);
     let top = term.topmost_line();
@@ -349,9 +356,152 @@ pub(super) fn logical_line_at<T: EventListener>(
     Some((text, points, click_idx))
 }
 
-/// TUIs can wrap inside their own margins, leaving no WRAPLINE flag. Only
-/// bridge those gaps for a complete, enclosed file token: trimming arbitrary
-/// adjacent rows would turn independent output into invented paths.
+/// Restore an unquoted file path wrapped near the right edge of a TUI's text
+/// area. A short row, a new rooted path, a style change, or prose ends the
+/// continuation. This only reads grid cells; existence checks stay in the
+/// shared asynchronous link resolver.
+fn padded_file_line_at<T: EventListener>(
+    term: &Term<T>,
+    mut click: Point,
+) -> Option<(String, Vec<Point>, usize)> {
+    use super::search::{PathStyle, file_candidates_at, url_span_at};
+
+    let cols = term.columns();
+    if cols > MAX_FILE_WRAP_CELLS {
+        return None;
+    }
+    let grid = term.grid();
+    let wraps = |line: Line| grid[line][Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+    let spacer = Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER;
+    let path_char = |c: char| {
+        c.is_alphanumeric()
+            || matches!(
+                c,
+                '/' | '\\' | '.' | '_' | '-' | ':' | '#' | '~' | '+' | '%' | '@'
+            )
+    };
+    // Inclusive end of this row, then start of the next. Inspect just the
+    // margins here; only a plausible run pays for lifting full rows.
+    let join = |line: Line| -> Option<(usize, usize)> {
+        if line >= term.bottommost_line() {
+            return None;
+        }
+        if wraps(line) {
+            return Some((cols - 1, 0));
+        }
+        let end = (cols.saturating_sub(MAX_FILE_WRAP_PADDING + 2)..cols)
+            .rev()
+            .find(|&col| {
+                let cell = &grid[line][Column(col)];
+                !cell.c.is_whitespace() && !cell.flags.intersects(spacer)
+            })?;
+        let next = Line(line.0 + 1);
+        let start = (0..cols.min(MAX_FILE_WRAP_PADDING + 1)).find(|&col| {
+            let cell = &grid[next][Column(col)];
+            !cell.c.is_whitespace() && !cell.flags.intersects(spacer)
+        })?;
+        let last = &grid[line][Column(end)];
+        let first = &grid[next][Column(start)];
+        let last_width = if last.flags.contains(Flags::WIDE_CHAR) {
+            2
+        } else {
+            1
+        };
+        if cols.saturating_sub(end + last_width) > MAX_FILE_WRAP_PADDING
+            || !path_char(last.c)
+            || !path_char(first.c)
+            || matches!(first.c, '/' | '\\' | '~' | '@')
+            || last.fg != first.fg
+            || last.bg != first.bg
+        {
+            return None;
+        }
+        // A drive-qualified or explicitly relative path starts a new token.
+        let second = (start + 1 < cols).then(|| grid[next][Column(start + 1)].c);
+        let third = (start + 2 < cols).then(|| grid[next][Column(start + 2)].c);
+        if (first.c.is_ascii_alphabetic() && second == Some(':'))
+            || (first.c == '.'
+                && (matches!(second, Some('/' | '\\'))
+                    || (second == Some('.') && matches!(third, Some('/' | '\\')))))
+        {
+            return None;
+        }
+        Some((end, start))
+    };
+
+    if grid[click.line][click.column]
+        .flags
+        .contains(Flags::WIDE_CHAR_SPACER)
+    {
+        click.column.0 = click.column.0.checked_sub(1)?;
+    }
+    if grid[click.line][click.column].c.is_whitespace() {
+        return None;
+    }
+    let mut start = click.line;
+    let mut end = click.line;
+    while start > term.topmost_line() && join(start - 1).is_some() {
+        start -= 1;
+        if (end.0 - start.0) as usize >= MAX_WRAP_ROWS
+            || (end.0 - start.0 + 1) as usize * cols > MAX_FILE_WRAP_CELLS
+        {
+            return None;
+        }
+    }
+    while join(end).is_some() {
+        end += 1;
+        if (end.0 - start.0) as usize >= MAX_WRAP_ROWS
+            || (end.0 - start.0 + 1) as usize * cols > MAX_FILE_WRAP_CELLS
+        {
+            return None;
+        }
+    }
+    if start == end || (start.0..end.0).all(|row| wraps(Line(row))) {
+        return None;
+    }
+
+    let mut text = String::new();
+    let mut points = Vec::new();
+    let mut seams = Vec::new();
+    for row in start.0..=end.0 {
+        let line = Line(row);
+        let first = if line == start { 0 } else { join(line - 1)?.1 };
+        let last = if line == end { cols - 1 } else { join(line)?.0 };
+        for col in first..=last {
+            let cell = &grid[line][Column(col)];
+            if !cell.flags.intersects(spacer) {
+                text.push(cell.c);
+                points.push(Point::new(line, Column(col)));
+            }
+        }
+        if line < end && !wraps(line) {
+            seams.push(points.len());
+        }
+    }
+    let click_idx = points.iter().position(|&point| point == click)?;
+    if url_span_at(&text, click_idx).is_some() {
+        return None;
+    }
+    let spans_seams = file_candidates_at(&text, click_idx)
+        .iter()
+        .any(|candidate| {
+            let file_name = candidate.path.rsplit(['/', '\\']).next().unwrap_or("");
+            let has_extension = file_name.rsplit_once('.').is_some_and(|(name, ext)| {
+                !name.is_empty() && !ext.is_empty() && ext.chars().all(char::is_alphanumeric)
+            });
+            candidate.looks_like_a_path(PathStyle::Windows)
+            && (candidate.line.is_some() || has_extension)
+            // Nearby prose may also fill its row. Only the seams inside the
+            // pointed-at token matter, not every row inspected around it.
+            && seams
+                    .iter()
+                    .any(|&seam| candidate.start < seam && candidate.end >= seam)
+        });
+    spans_seams.then_some((text, points, click_idx))
+}
+
+/// Enclosures prove that a path continues even across a short row or a wide
+/// margin, where the bare-token heuristic deliberately stops.
 fn enclosed_file_line_at<T: EventListener>(
     term: &Term<T>,
     mut click: Point,
@@ -788,10 +938,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A newline is only read as a wrap when the text ran into the right
-    /// edge. Anything else is two lines that happen to sit next to each
-    /// other, and gluing those together would invent paths out of unrelated
-    /// output.
+    /// A short row outside the bounded TUI margin is still an independent
+    /// line; a following filename alone does not prove a continuation.
     #[test]
     fn a_newline_short_of_the_right_edge_is_not_a_wrap() {
         let dir = std::env::temp_dir().join(format!("tty7-nowrap-{}", std::process::id()));
@@ -799,7 +947,7 @@ mod tests {
         std::fs::write(dir.join("a/bb/ccc/dddd/notes.md"), b"x").expect("create file");
         let roots = crate::terminal::search::LinkRoots::local(vec![dir.clone()]);
 
-        let term = term_with(20, 5, "see a/bb/ccc/dddd/\r\nnotes.md here");
+        let term = term_with(40, 5, "see a/bb/ccc/dddd/\r\nnotes.md here");
         let click = Point::new(Line(0), Column(6));
         let (text, _points, idx) = logical_line_at(&term, click, true).expect("logical line");
         let link = crate::terminal::search::link_at(
@@ -892,6 +1040,178 @@ mod tests {
                 logical_line_at(&term, Point::new(Line(0), Column(6)), true).unwrap();
             assert!(!text.contains("two.png"), "unrelated rows joined: {text}");
             assert!(!text.contains("evil.com"), "URL authority changed: {text}");
+        }
+    }
+
+    #[test]
+    fn bare_file_links_cross_tui_margins_from_every_path_cell() {
+        use super::super::search::{LinkRoots, LinkTarget, PathStyle, Probe, link_at};
+        use unicode_width::UnicodeWidthStr;
+
+        let roots = LinkRoots {
+            dirs: vec!["D:/workspace/code/backend/tty7".into()],
+            style: PathStyle::Windows,
+            local_home: false,
+        };
+        for (head, tail, token, expected, line, column) in [
+            (
+                "修改位于 D:/workspace/code/frontend/risk-insight-ui/src/views/dashboard/overview/components/",
+                "KpiStrip.vue:262，文件级检查已通过。",
+                "D:/workspace/code/frontend/risk-insight-ui/src/views/dashboard/overview/components/",
+                "D:/workspace/code/frontend/risk-insight-ui/src/views/dashboard/overview/components/KpiStrip.vue",
+                262,
+                None,
+            ),
+            (
+                "查看 D:/项目/报",
+                "告/main.rs:12。说明",
+                "D:/项目/报",
+                "D:/项目/报告/main.rs",
+                12,
+                None,
+            ),
+            (
+                "见 src/terminal/smart_se",
+                "lect.rs:880。当时这个限制",
+                "src/terminal/smart_se",
+                "src/terminal/smart_select.rs",
+                880,
+                None,
+            ),
+            (
+                "查看 D:\\项目\\报告\\",
+                "说明.rs:12:3。已修复",
+                "D:\\项目\\报告\\",
+                "D:\\项目\\报告\\说明.rs",
+                12,
+                Some(3),
+            ),
+        ] {
+            for padding in [1, 4, MAX_FILE_WRAP_PADDING] {
+                for indent in [0, 2, MAX_FILE_WRAP_PADDING] {
+                    let cols = head.width() + padding;
+                    let input = format!("{head}\r\n{}{tail}", " ".repeat(indent));
+                    let term = term_with(cols, 8, &input);
+                    let click =
+                        Point::new(Line(0), Column(head[..head.find(token).unwrap()].width()));
+                    let (text, points, idx) = logical_line_at(&term, click, true).unwrap();
+                    let expected = if roots.style.is_absolute(expected) {
+                        std::path::PathBuf::from(expected)
+                    } else {
+                        roots.style.join(&roots.dirs[0], expected)
+                    };
+                    let mut probe = |path: &std::path::Path, require_file: bool| {
+                        assert_eq!(
+                            path, expected,
+                            "a directory prefix or relative tail escaped: {text}"
+                        );
+                        assert!(require_file);
+                        Probe::Hit { is_dir: false }
+                    };
+                    let link = link_at(&text, idx, &roots, true, &mut probe).unwrap();
+                    assert!(points[link.end].line > points[link.start].line);
+                    for point in &points[link.start..=link.end] {
+                        let wide = term.grid()[point.line][point.column]
+                            .flags
+                            .contains(Flags::WIDE_CHAR);
+                        for extra in 0..=usize::from(wide) {
+                            let click = Point::new(point.line, Column(point.column.0 + extra));
+                            let (text, _, idx) = logical_line_at(&term, click, true).unwrap();
+                            let link = link_at(&text, idx, &roots, true, &mut probe).unwrap();
+                            assert!(matches!(link.target, LinkTarget::File {
+                                path, line: Some(actual_line), column: actual_column, is_dir: false
+                            } if path == expected && actual_line == line && actual_column == column));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bare_file_links_keep_multiple_hard_breaks_and_soft_wraps() {
+        use super::super::search::{PathStyle, unresolved_candidate};
+
+        for cols in [26, 30, 34] {
+            let term = term_with(
+                cols,
+                10,
+                "see /srv/abcdefghijklmnop/\r\n    qrstuvwxyzabcdefghijk/\r\n  main.rs:12:3。后续",
+            );
+            let click = Point::new(Line(0), Column(5));
+            let (text, points, idx) = logical_line_at(&term, click, true).unwrap();
+            let candidate = unresolved_candidate(&text, idx, PathStyle::Posix).unwrap();
+            assert_eq!(
+                candidate.path,
+                "/srv/abcdefghijklmnop/qrstuvwxyzabcdefghijk/main.rs"
+            );
+            assert_eq!(candidate.line, Some(12));
+            assert_eq!(candidate.column, Some(3));
+            assert_eq!(points[candidate.end].line, Line(2));
+        }
+
+        let head = "see /srv/project/very-long-directory/";
+        let term = term_with(20, 6, &format!("{head}\r\n  src/main.rs:12。说明"));
+        let click = Point::new(Line(0), Column(5));
+        let (text, _, idx) = logical_line_at(&term, click, true).unwrap();
+        let candidate = unresolved_candidate(&text, idx, PathStyle::Posix).unwrap();
+        assert_eq!(
+            candidate.path,
+            "/srv/project/very-long-directory/src/main.rs"
+        );
+        assert_eq!(candidate.line, Some(12));
+    }
+
+    #[test]
+    fn bare_file_wraps_reject_independent_rows_and_respect_scan_limits() {
+        for tail in [
+            "  /other/file.rs:8",
+            "  D:/other/file.rs:8",
+            "  ./file.rs:8",
+            "  ../file.rs:8",
+            "  @evil.com/x",
+            "",
+            "  unrelated output/file.rs:8",
+        ] {
+            let head = "see /srv/project/";
+            let term = term_with(head.len() + 3, 6, &format!("{head}\r\n{tail}"));
+            assert!(
+                padded_file_line_at(&term, Point::new(Line(0), Column(5))).is_none(),
+                "{tail}"
+            );
+        }
+        let term = term_with(24, 4, "\x1b[32msee /srv/project/\r\n\x1b[31m  main.rs:12");
+        assert!(padded_file_line_at(&term, Point::new(Line(0), Column(5))).is_none());
+        let term = term_with(28, 4, "see https://good.com/path\r\n  more/path.rs:12");
+        assert!(padded_file_line_at(&term, Point::new(Line(0), Column(5))).is_none());
+
+        let row = format!("{}/\r\n", "a".repeat(1015));
+        let term = term_with(1024, 8, &format!("/srv/{}main.rs:12", row.repeat(5)));
+        assert!(padded_file_line_at(&term, Point::new(Line(0), Column(2))).is_none());
+        let row = format!("{}/\r\n", "a".repeat(15));
+        let term = term_with(24, 40, &format!("/srv/{}main.rs:12", row.repeat(34)));
+        assert!(padded_file_line_at(&term, Point::new(Line(0), Column(2))).is_none());
+    }
+
+    #[test]
+    fn prose_on_adjacent_full_rows_does_not_hide_a_wrapped_file() {
+        use super::super::search::{PathStyle, unresolved_candidate};
+
+        let term = term_with(
+            30,
+            6,
+            "previous output aaaaaaaaaaaa\r\nsee /srv/abcdefghijklmnop/\r\n  main.rs:12 explanationxxx\r\nmore prose follows",
+        );
+        for click in [
+            Point::new(Line(1), Column(5)),
+            Point::new(Line(2), Column(3)),
+        ] {
+            let (text, points, idx) = logical_line_at(&term, click, true).unwrap();
+            let candidate = unresolved_candidate(&text, idx, PathStyle::Posix).unwrap();
+            assert_eq!(candidate.path, "/srv/abcdefghijklmnop/main.rs");
+            assert_eq!(candidate.line, Some(12));
+            assert_eq!(points[candidate.start].line, Line(1));
+            assert_eq!(points[candidate.end].line, Line(2));
         }
     }
 
