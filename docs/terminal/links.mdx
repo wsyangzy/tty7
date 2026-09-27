@@ -35,14 +35,22 @@ the file context menu all use the complete path.
 Unquoted file paths can also cross small TUI margins (up to eight columns of
 trailing padding or leading indentation). The continuation must keep the
 same text colors and form one path with a file extension or line number;
-short independent lines and a new absolute path are not joined. These
-additional checks inspect at most 32 rows and 4096 cells, without filesystem
-access on the UI thread.
+short independent lines and a new absolute path are not joined. A path that
+merely ends at the margin looks the same on screen, so the joined path is only
+tried first: when it does not exist, the path on its own row links instead,
+without the words that start the next row. These additional checks inspect at
+most 32 rows and 4096 cells, without filesystem access on the UI thread.
 
-Chinese sentence punctuation can touch a path: `src/main.rs:12。说明` opens
-`src/main.rs` at line 12, resolved against the pane's directory and repository
-root as usual. The sentence is excluded from the link's underline and target.
-File existence checks still use the bounded asynchronous probe cache.
+Chinese and Japanese text can touch a path with no space at all:
+`修改了src/main.rs中的函数` and `见（src/main.rs）` both open `src/main.rs`, and
+sentence punctuation works the same way — `src/main.rs:12。说明` opens it at
+line 12. The sentence is excluded from the link's underline and target, while a
+directory or file named in Chinese (`文档/说明.md`) stays whole. Such a name
+cannot be told apart from Chinese text written straight onto it, so
+`参考文档/说明.md` needs a space or punctuation before the path.
+
+A coding agent's tool call links the file it names: `Update(src/main.rs)` and
+`Read(Cargo.toml)` underline just the path.
 
 Paths in a pane connected to another machine are resolved *on that machine*,
 so the underline appears a moment after the pointer settles rather than

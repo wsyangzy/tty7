@@ -279,24 +279,63 @@ pub(super) fn hyperlink_run<T: EventListener>(
     Some((start, end))
 }
 
+/// A logical line, the grid point of every character in it, and which of
+/// those characters the click landed on.
+pub(super) type LogicalLine = (String, Vec<Point>, usize);
+
 pub(super) fn logical_line_at<T: EventListener>(
     term: &Term<T>,
     click: Point,
     bridge_hard_wrap: bool,
-) -> Option<(String, Vec<Point>, usize)> {
-    let cols = term.columns();
-    if click.column.0 >= cols
-        || click.line < term.topmost_line()
-        || click.line > term.bottommost_line()
-    {
+) -> Option<LogicalLine> {
+    if bridge_hard_wrap {
+        return link_lines_at(term, click).map(|(line, _)| line);
+    }
+    wrapped_line_at(term, click, false)
+}
+
+/// Every line a link under `click` can be read from, best first.
+///
+/// Bridging a bare path across a TUI margin is a guess the grid cannot check.
+/// A path the TUI wrapped mid-name looks exactly like one that ends at the
+/// margin with prose starting the next row: `host_ops.rs` above `中增加了`,
+/// or English that lost its space to the wrap and reads `host_ops.rsand`.
+/// So the line as the terminal wrapped it comes back as well, and the
+/// resolver lets the filesystem choose, the bridged reading first.
+pub(super) fn link_lines_at<T: EventListener>(
+    term: &Term<T>,
+    click: Point,
+) -> Option<(LogicalLine, Option<LogicalLine>)> {
+    if !on_grid(term, click) {
         return None;
     }
-    if bridge_hard_wrap && let Some(link) = enclosed_file_line_at(term, click) {
-        return Some(link);
+    if let Some(link) = enclosed_file_line_at(term, click) {
+        return Some((link, None));
     }
-    if bridge_hard_wrap && let Some(link) = padded_file_line_at(term, click) {
-        return Some(link);
+    let wrapped = wrapped_line_at(term, click, true);
+    match padded_file_line_at(term, click) {
+        Some(padded) => Some((padded, wrapped)),
+        None => wrapped.map(|line| (line, None)),
     }
+}
+
+fn on_grid<T: EventListener>(term: &Term<T>, click: Point) -> bool {
+    click.column.0 < term.columns()
+        && click.line >= term.topmost_line()
+        && click.line <= term.bottommost_line()
+}
+
+/// The line as the terminal itself wrapped it. `bridge_hard_wrap` also joins
+/// a URL cut at the right edge by a hard newline.
+fn wrapped_line_at<T: EventListener>(
+    term: &Term<T>,
+    click: Point,
+    bridge_hard_wrap: bool,
+) -> Option<LogicalLine> {
+    if !on_grid(term, click) {
+        return None;
+    }
+    let cols = term.columns();
     let grid = term.grid();
     let last_col = Column(cols - 1);
     let top = term.topmost_line();
@@ -1213,6 +1252,29 @@ mod tests {
             assert_eq!(points[candidate.start].line, Line(1));
             assert_eq!(points[candidate.end].line, Line(2));
         }
+    }
+
+    /// A path that simply ends at the margin is bridged as well, since the
+    /// grid cannot tell it from one wrapped mid-name. The row as printed comes
+    /// back beside the bridge for the resolver to fall back on; a line that
+    /// nothing bridged has no second reading.
+    #[test]
+    fn a_bridged_bare_path_keeps_the_row_as_printed() {
+        let head = "  updated src/host_ops.rs";
+        let output = format!("{head}\r\n  and the cache");
+        let click = Point::new(Line(0), Column(head.find("host_ops").unwrap()));
+
+        let term = term_with(head.len() + 4, 6, &output);
+        let ((bridged, _, _), wrapped) = link_lines_at(&term, click).unwrap();
+        assert!(bridged.contains("host_ops.rsand"), "{bridged}");
+        let (row, points, idx) = wrapped.expect("the row as printed");
+        assert_eq!(row.trim_end(), head);
+        assert_eq!(points[idx], click);
+
+        let term = term_with(head.len() + MAX_FILE_WRAP_PADDING + 2, 6, &output);
+        let ((row, _, _), wrapped) = link_lines_at(&term, click).unwrap();
+        assert_eq!(row.trim_end(), head);
+        assert!(wrapped.is_none());
     }
 
     #[test]

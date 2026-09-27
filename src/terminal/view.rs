@@ -545,8 +545,15 @@ enum GridLink {
     /// An OSC 8 hyperlink the emitter declared, with the extent it declared.
     Hyperlink(String, Point, Point),
     /// The logical line the cell belongs to, the grid point of every character
-    /// in it, and which of those the cell is.
-    Text(String, Vec<Point>, usize),
+    /// in it, and which of those the cell is. When that line bridged a bare
+    /// path across a TUI margin, the line as the terminal wrapped it follows:
+    /// see [`super::smart_select::link_lines_at`].
+    Text(
+        String,
+        Vec<Point>,
+        usize,
+        Option<super::smart_select::LogicalLine>,
+    ),
 }
 
 /// The outcome of asking what a cell links to.
@@ -569,6 +576,9 @@ struct FileLinkRequest {
     text: String,
     click_idx: usize,
     roots: super::search::LinkRoots,
+    /// The line as the terminal wrapped it, tried once the bridged `text`
+    /// resolves to nothing.
+    wrapped: Option<(String, usize)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6290,12 +6300,12 @@ impl TerminalView {
         let Some(line) = self.link_line_at(col, row) else {
             return false;
         };
-        let (text, points, click_idx) = match line {
+        let (text, points, click_idx, wrapped) = match line {
             GridLink::Hyperlink(url, ..) => {
                 self.open_url(&url, window, cx);
                 return true;
             }
-            GridLink::Text(text, points, click_idx) => (text, points, click_idx),
+            GridLink::Text(text, points, click_idx, wrapped) => (text, points, click_idx, wrapped),
         };
         // URLs require no filesystem answer. Resolve them before submitting
         // a file lookup, including bare localhost links on a remote pane.
@@ -6332,7 +6342,7 @@ impl TerminalView {
         if !explicit_file_candidate(&candidate, roots.style)
             && !matches!(
                 self.resolve_grid_link(
-                    GridLink::Text(text.clone(), points, click_idx),
+                    GridLink::Text(text.clone(), points, click_idx, wrapped.clone()),
                     &roots,
                     true,
                     false,
@@ -6348,6 +6358,7 @@ impl TerminalView {
                 text,
                 click_idx,
                 roots,
+                wrapped: wrapped.map(|(text, _, click_idx)| (text, click_idx)),
             },
             FileLinkAction::Open,
             window,
@@ -6397,7 +6408,7 @@ impl TerminalView {
         if !cx.global::<Config>().link_url || !self.cwd_is_on_host() {
             return false;
         }
-        let Some(GridLink::Text(text, _, click_idx)) = self.link_line_at(col, row) else {
+        let Some(GridLink::Text(text, _, click_idx, wrapped)) = self.link_line_at(col, row) else {
             return false;
         };
         let roots = self.link_roots(cx);
@@ -6408,13 +6419,14 @@ impl TerminalView {
             text,
             click_idx,
             roots,
+            wrapped: wrapped.map(|(text, _, click_idx)| (text, click_idx)),
         };
         let snapshot = request.text.clone();
         // Do not replay a delayed click into output which has replaced its cell.
         self.deferred_link_click = Some((
             request.clone(),
             Box::new(move |view, cx| {
-                if matches!(view.link_line_at(col, row), Some(GridLink::Text(ref text, _, at)) if text == &snapshot && at == click_idx)
+                if matches!(view.link_line_at(col, row), Some(GridLink::Text(ref text, _, at, _)) if text == &snapshot && at == click_idx)
                 {
                     fallback(view, cx);
                 }
@@ -6503,13 +6515,15 @@ impl TerminalView {
             window,
             cx,
             move |host| {
-                super::link_probe::resolve_file(
-                    &work.text,
-                    work.click_idx,
-                    &work.roots,
-                    host,
-                    deadline,
-                )
+                let resolve = |text: &str, click_idx: usize| {
+                    super::link_probe::resolve_file(text, click_idx, &work.roots, host, deadline)
+                };
+                // Only a bridged reading that resolved to nothing gives way;
+                // an unavailable host keeps its error rather than guessing.
+                match (resolve(&work.text, work.click_idx)?, &work.wrapped) {
+                    (None, Some((text, click_idx))) => resolve(text, *click_idx),
+                    (link, _) => Ok(link),
+                }
             },
             move |view, result, window, cx| {
                 if view.link_epoch != epoch {
@@ -6652,7 +6666,7 @@ impl TerminalView {
                 _ => None,
             };
         self.menu_link = path.and_then(|path| {
-            let GridLink::Text(text, _, click_idx) = snapshot else {
+            let GridLink::Text(text, _, click_idx, wrapped) = snapshot else {
                 return None;
             };
             Some((
@@ -6661,6 +6675,7 @@ impl TerminalView {
                     text,
                     click_idx,
                     roots,
+                    wrapped: wrapped.map(|(text, _, click_idx)| (text, click_idx)),
                 },
             ))
         });
@@ -7064,25 +7079,46 @@ impl TerminalView {
         include_loopback: bool,
         cx: &mut Context<Self>,
     ) -> LinkAt {
-        let (text, points, click_idx) = match snapshot {
+        let (text, points, click_idx, wrapped) = match snapshot {
             GridLink::Hyperlink(uri, start, end) => {
                 return LinkAt::Found(LinkTarget::Url(uri), start, end);
             }
-            GridLink::Text(text, points, click_idx) => (text, points, click_idx),
+            GridLink::Text(text, points, click_idx, wrapped) => (text, points, click_idx, wrapped),
         };
         // Before the first probe, not after: `retarget` empties the cache when
         // the host has changed, and doing that between recording a wanted path
         // and draining it would throw the question away unasked.
         self.link_probes.retarget(self.host_id);
         let probes = &mut self.link_probes;
-        let mut pending = false;
-        let mut probe = |path: &std::path::Path, require_file: bool| {
-            let answer = probes.probe(path, require_file);
-            pending |= matches!(answer, super::search::Probe::Unknown);
-            answer
+        let mut look = |text: &str, click_idx: usize| {
+            let mut pending = false;
+            let mut probe = |path: &std::path::Path, require_file: bool| {
+                let answer = probes.probe(path, require_file);
+                pending |= matches!(answer, super::search::Probe::Unknown);
+                answer
+            };
+            let link = super::search::link_at(text, click_idx, roots, files, &mut probe);
+            (link, pending)
         };
-        let link = super::search::link_at(&text, click_idx, roots, files, &mut probe);
-        // `probe` holds the cache borrow; nothing below touches it, so the
+        let (mut link, mut pending) = look(&text, click_idx);
+        // Both readings go out in the same batch, and the bridged one wins
+        // whenever it hits. Until it does, a hit on the row as printed stands
+        // in even while the bridge is being asked again: a miss is re-asked
+        // every couple of seconds, and the underline must not blink out each
+        // time it is.
+        let (text, points, click_idx) = match wrapped {
+            Some((wrapped_text, wrapped_points, wrapped_idx)) => {
+                let fallback = look(&wrapped_text, wrapped_idx);
+                if link.is_none() && (fallback.0.is_some() || !pending) {
+                    (link, pending) = fallback;
+                    (wrapped_text, wrapped_points, wrapped_idx)
+                } else {
+                    (text, points, click_idx)
+                }
+            }
+            None => (text, points, click_idx),
+        };
+        // `look` holds the cache borrow; nothing below touches it, so the
         // borrow ends here and `self` is whole again for the flush.
         self.flush_link_probes(cx);
 
@@ -7128,8 +7164,9 @@ impl TerminalView {
             }
         }
 
-        let (text, points, click_idx) = super::smart_select::logical_line_at(&term, click, true)?;
-        Some(GridLink::Text(text, points, click_idx))
+        let (line, wrapped) = super::smart_select::link_lines_at(&term, click)?;
+        let (text, points, click_idx) = line;
+        Some(GridLink::Text(text, points, click_idx, wrapped))
     }
 
     /// The directories a relative path in this pane is measured from, best
@@ -7280,16 +7317,13 @@ impl TerminalView {
             host,
             cx,
             move |h| {
-                use super::link_probe::Existence;
                 let mut failure = None;
                 for path in wanted {
                     if std::time::Instant::now() >= deadline {
                         return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
                     }
-                    let existence = match h.stat(&path) {
-                        Ok(meta) if meta.is_dir => Existence::Dir,
-                        Ok(_) => Existence::File,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Existence::Missing,
+                    let existence = match super::link_probe::hover_existence_on(h, &path) {
+                        Ok(existence) => existence,
                         Err(e) => {
                             failure.get_or_insert(e);
                             continue;
@@ -12818,6 +12852,37 @@ mod gpui_tests {
             .unwrap();
     }
 
+    /// Hovering a word Windows rejects as a filename — a Rust path, a generic,
+    /// a glob — used to fail the pane's whole probe batch. Its retry failed on
+    /// the same word every two seconds, and a path hovered meanwhile waited
+    /// behind it before it could underline. Each word must settle as a plain
+    /// miss, leaving the next hover free to ask straight away.
+    #[gpui::test]
+    fn a_rejected_filename_does_not_hold_back_the_next_link(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), b"fn main() {}\n").unwrap();
+        let text = "std::io::Error Vec<String> run* main.rs";
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, _| {
+                view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                parser.advance(&mut *view.terminal.term.lock(), text.as_bytes());
+            })
+            .unwrap();
+        for word in ["std::io::Error", "Vec<String>", "run*"] {
+            settle_link_probe(window, text.find(word).unwrap(), 0, cx);
+        }
+        let file = text.find("main.rs").unwrap();
+        settle_link_probe(window, file, 0, cx);
+        window
+            .update(cx, |view, _, cx| {
+                assert!(view.hover_link_at(file, 0, false, cx));
+                assert!(!view.hover_link_at(0, 0, false, cx));
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn link_open_forwarder_panic_releases_pending_and_allows_retry(cx: &mut TestAppContext) {
         let (window, pane, _daemon) = rooted_harness(cx);
@@ -12965,6 +13030,7 @@ mod gpui_tests {
                     text: format!("file-{n}.rs"),
                     click_idx: 0,
                     roots: roots.clone(),
+                    wrapped: None,
                 };
                 view.pending_file_links = (0..8)
                     .map(|n| (request(n), FileLinkAction::Open, false))
@@ -13163,6 +13229,74 @@ mod gpui_tests {
             }
         }
         assert_eq!(opened.borrow().len(), 4);
+    }
+
+    /// A path that simply ends at a TUI's margin is bridged to the next row
+    /// too, since nothing on the grid tells it from a path wrapped mid-name.
+    /// Whatever sits across that margin — English that lost its space to the
+    /// wrap, or Chinese that never had one, below the path or above it — the
+    /// path must still underline on its own row and open.
+    #[gpui::test]
+    fn a_path_ending_at_a_margin_links_without_the_prose_beside_it(cx: &mut TestAppContext) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use unicode_width::UnicodeWidthStr;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = tty7_core::core::path_spelling::local_spelling_buf(dir.path().to_path_buf());
+        let path = root.join("src").join("host_ops.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        let (window, _daemon) = harness(cx);
+        let pane = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        window
+            .update(cx, |view, _, cx| {
+                view.terminal.seed_cwd(Some(root.clone()));
+                let seen = opened.clone();
+                cx.subscribe(&cx.entity(), move |_, _, event: &OpenFileRequested, _| {
+                    seen.borrow_mut().push(event.path.clone());
+                })
+                .detach();
+            })
+            .unwrap();
+        for (head, tail, row) in [
+            ("  updated src/host_ops.rs", "  and the cache", 0),
+            ("  已更新 src/host_ops.rs", "  中增加了缓存。", 0),
+            ("  我在这个文件中修改了", "  src/host_ops.rs 中的", 1),
+        ] {
+            let printed: &str = [head, tail][row];
+            let start = printed[..printed.find("src/").unwrap()].width();
+            let end = start + "src/host_ops.rs".len() - 1;
+            let span = (
+                Point::new(Line(row as i32), Column(start)),
+                Point::new(Line(row as i32), Column(end)),
+            );
+            window
+                .update(cx, |view, _, cx| {
+                    view.set_grid_size(head.width() + 4, 6, px(8.), px(17.), 1., cx);
+                    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                    parser.advance(
+                        &mut *view.terminal.term.lock(),
+                        format!("\x1b[2J\x1b[H{head}\r\n{tail}").as_bytes(),
+                    );
+                })
+                .unwrap();
+            settle_link_probe(window, start, row, cx);
+            window
+                .update(cx, |view, window, cx| {
+                    for col in start..=end {
+                        assert!(view.hover_link_at(col, row, false, cx), "{head} at {col}");
+                        let link = view.hovered_link.as_ref().unwrap();
+                        assert_eq!((link.start, link.end), span, "{head} at {col}");
+                    }
+                    assert!(view.open_link_at(start, row, window, cx));
+                })
+                .unwrap();
+            settle_link_entity_opens(&pane, cx);
+            assert_eq!(opened.borrow().last(), Some(&path), "{head}");
+        }
+        assert_eq!(opened.borrow().len(), 3);
     }
 
     /// The case from the bug report: a relative path printed by a tool, sitting

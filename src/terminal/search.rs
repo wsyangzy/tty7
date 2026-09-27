@@ -1018,8 +1018,8 @@ pub(super) fn file_candidates_at(text: &str, col: usize) -> Vec<FileCandidate> {
     let chars: Vec<char> = token.chars().collect();
     let mut out: Vec<FileCandidate> = Vec::new();
     // `:880。说明` is an explicit location followed by prose, not a literal
-    // filename. Never submit that malformed colon suffix to the host: on
-    // Windows an invalid-name error would abort a click before its fallback.
+    // filename. Asking the host about that spelling would only spend a probe
+    // on a name Windows rejects outright.
     let location_before_prose = chars.iter().enumerate().any(|(i, &c)| {
         if !is_file_prose_boundary(c) {
             return false;
@@ -1050,10 +1050,20 @@ pub(super) fn file_candidates_at(text: &str, col: usize) -> Vec<FileCandidate> {
             .iter()
             .position(|&c| is_file_prose_boundary(c))
             .map_or(chars.len(), |i| at + i);
-        if start > 0 || end < chars.len() {
-            let segment = &chars[start..end];
-            for cut in left_cuts(segment) {
-                push_candidates(base + start, segment, cut, col, &mut out);
+        // Nor any character at all: `修改了src/main.rs中的函数`. The segment
+        // stays a reading of its own, because a wide name can end in ASCII
+        // (`报告v2.md`), and the one without that prose comes after it.
+        let mut segments = vec![(start, end)];
+        let (lead, tail) = wide_prose_margins(&chars[start..end]);
+        if lead + tail > 0 && (start + lead..end - tail).contains(&at) {
+            segments.push((start + lead, end - tail));
+        }
+        for (start, end) in segments {
+            if start > 0 || end < chars.len() {
+                let segment = &chars[start..end];
+                for cut in left_cuts(segment) {
+                    push_candidates(base + start, segment, cut, col, &mut out);
+                }
             }
         }
     }
@@ -1128,6 +1138,21 @@ fn left_cuts(chars: &[char]) -> Vec<usize> {
             && rest[..i]
                 .iter()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+'))
+            && rest[i + 1..]
+                .iter()
+                .any(|c| matches!(c, '/' | '\\' | '.' | '~'))
+        {
+            offsets.push(i + 1);
+        }
+        // `Update(src/main.rs)`, `Read(Cargo.toml)`: how coding agents print a
+        // tool call. The same rule as a label: a plain word in front, and what
+        // follows spelled like a path, so `main.ts(10,2)` stays a location and
+        // `backup(1)` stays a name.
+        if let Some(i) = rest.iter().position(|&c| c == '(')
+            && rest[0].is_ascii_alphabetic()
+            && rest[..i]
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == '_')
             && rest[i + 1..]
                 .iter()
                 .any(|c| matches!(c, '/' | '\\' | '.' | '~'))
@@ -1300,11 +1325,60 @@ fn is_left_wrapper(c: char) -> bool {
     ) || ('\u{2500}'..='\u{257F}').contains(&c)
 }
 
+/// Chinese punctuation a sentence puts right against a path. The full-width
+/// brackets count too: `见（src/main.rs）` has no space on either side, so they
+/// never reach the edge of the token where the wrappers are stripped.
 pub(super) fn is_file_prose_boundary(c: char) -> bool {
     matches!(
         c,
-        '。' | '，' | '、' | '；' | '：' | '！' | '？' | '“' | '”' | '‘' | '’'
+        '。' | '，'
+            | '、'
+            | '；'
+            | '：'
+            | '！'
+            | '？'
+            | '“'
+            | '”'
+            | '‘'
+            | '’'
+            | '（'
+            | '）'
+            | '［'
+            | '］'
+            | '｛'
+            | '｝'
+            | '【'
+            | '】'
+            | '《'
+            | '》'
+            | '「'
+            | '」'
+            | '『'
+            | '』'
     )
+}
+
+/// How many wide letters at each end of `chars` are the sentence around a
+/// path rather than part of it. Only a run that touches the path's own ASCII
+/// counts: `修改了src/main.rs中的函数` loses both ends, while `文档/说明.rs`
+/// keeps its directory, and `说明.md` its name, because a separator or an
+/// extension is what a wide name meets.
+fn wide_prose_margins(chars: &[char]) -> (usize, usize) {
+    let wide =
+        |c: char| c.is_alphanumeric() && unicode_width::UnicodeWidthChar::width(c) == Some(2);
+    let lead = chars.iter().take_while(|&&c| wide(c)).count();
+    let lead = match &chars[lead..] {
+        [c, ..] if lead > 0 && (c.is_ascii_alphanumeric() || *c == '~') => lead,
+        // `./run.sh` and `../lib`, not the `.md` of `说明.md`.
+        ['.', '/' | '\\' | '.', ..] if lead > 0 => lead,
+        _ => 0,
+    };
+    let tail = chars[lead..].iter().rev().take_while(|&&c| wide(c)).count();
+    let tail = match chars[..chars.len() - tail].last() {
+        Some(c) if tail > 0 && c.is_ascii() && !matches!(c, '/' | '\\') => tail,
+        _ => 0,
+    };
+    (lead, tail)
 }
 
 /// Where the path stops and the sentence around it starts again, as an
@@ -2706,6 +2780,99 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].path, "src/main.rs");
         assert_eq!(candidates[0].line, Some(12));
+    }
+
+    /// Checks that `token` inside `text` links to `path` from every one of its
+    /// cells and from none of the prose around it, with only `path` on disk.
+    fn assert_only_token_links(text: &str, token: &str, path: &str, line: Option<u32>) {
+        for style in [PathStyle::Windows, PathStyle::Posix] {
+            let roots = LinkRoots {
+                dirs: vec![match style {
+                    PathStyle::Windows => "D:/project".into(),
+                    PathStyle::Posix => "/project".into(),
+                }],
+                style,
+                local_home: false,
+            };
+            let expected = match style.is_absolute(path) {
+                true => PathBuf::from(path),
+                false => style.join(&roots.dirs[0], path),
+            };
+            let start = text[..text.find(token).unwrap()].chars().count();
+            let end = start + token.chars().count() - 1;
+            for col in 0..text.chars().count() {
+                let link = link_at(text, col, &roots, true, &mut |candidate, _| {
+                    if candidate == expected {
+                        Probe::Hit { is_dir: false }
+                    } else {
+                        Probe::Miss
+                    }
+                });
+                if !(start..=end).contains(&col) {
+                    assert!(link.is_none(), "prose linked at {col}: {text}");
+                    continue;
+                }
+                let link = link.unwrap_or_else(|| panic!("no link at {col}: {text}"));
+                assert_eq!((link.start, link.end), (start, end), "{text}");
+                assert!(
+                    matches!(link.target, LinkTarget::File { path, line: actual, .. }
+                        if path == expected && actual == line),
+                    "{text} at {col}"
+                );
+            }
+        }
+    }
+
+    /// Chinese and Japanese prose need no space on either side of a path. The
+    /// sentence stays out of the link; a wide directory joined by a separator,
+    /// and a wide name carrying an extension, stay in it.
+    #[test]
+    fn file_links_touching_wide_prose_keep_only_the_path() {
+        for (text, token, path, line) in [
+            (
+                "修改了src/main.rs中的函数",
+                "src/main.rs",
+                "src/main.rs",
+                None,
+            ),
+            (
+                "见src/main.rs:12中的实现",
+                "src/main.rs:12",
+                "src/main.rs",
+                Some(12),
+            ),
+            (
+                "在（src/main.rs）里修改",
+                "src/main.rs",
+                "src/main.rs",
+                None,
+            ),
+            ("更新了README.md", "README.md", "README.md", None),
+            ("运行./run.sh即可", "./run.sh", "./run.sh", None),
+            (
+                "见 文档/说明.md的内容",
+                "文档/说明.md",
+                "文档/说明.md",
+                None,
+            ),
+            ("见 报告v2.md，已修复", "报告v2.md", "报告v2.md", None),
+        ] {
+            assert_only_token_links(text, token, path, line);
+        }
+    }
+
+    /// Coding agents print a tool call as `Update(src/main.rs)`. The call is a
+    /// prefix in front of the path, the way a label is.
+    #[test]
+    fn file_links_inside_agent_tool_calls() {
+        for (text, token) in [
+            ("⏺ Update(src/terminal/view.rs)", "src/terminal/view.rs"),
+            ("Read(Cargo.toml)", "Cargo.toml"),
+            ("Write(/srv/app/main.rs)", "/srv/app/main.rs"),
+            ("⏺ Update(src/main.rs)中的改动", "src/main.rs"),
+        ] {
+            assert_only_token_links(text, token, token, None);
+        }
     }
 
     /// Every reading of one token is worth at most a handful of questions.

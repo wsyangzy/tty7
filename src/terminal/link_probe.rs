@@ -222,9 +222,90 @@ impl LinkProbeCache {
     }
 }
 
+/// What `host` says about `path`. An error about the name itself is an
+/// answer; only an error about reaching the host stays an error.
+///
+/// Windows does not report `std::io::Error`, `Vec<String`, `run*` or the
+/// `note:src/main.rs` a `label:` prefix leaves behind as missing: it rejects
+/// them as invalid names, and a remote host sends that back as `InvalidInput`.
+/// Treating that as a failed host made one hover over a Rust path or a
+/// generic fail the pane's whole probe batch, and every path hovered after it
+/// waited out a two-second backoff whose retry failed on the same word again.
+/// A click reads the host through this as it is; a hover goes through
+/// [`hover_existence_on`], which is looser about the errors that remain.
+pub(super) fn existence_on(
+    host: &dyn crate::ui::host_ops::Host,
+    path: &Path,
+) -> std::io::Result<Existence> {
+    use std::io::ErrorKind;
+    match host.stat(path) {
+        Ok(meta) if meta.is_dir => Ok(Existence::Dir),
+        Ok(_) => Ok(Existence::File),
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::NotFound
+                    | ErrorKind::NotADirectory
+                    | ErrorKind::InvalidFilename
+                    | ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(Existence::Missing)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// What a hover files for `path`: [`existence_on`], except that any error
+/// about this one path counts as nothing to underline.
+///
+/// A failed batch backs off for two seconds and then asks for its paths
+/// again, so a path the host keeps refusing (`/root/.bashrc` for a user who
+/// cannot enter `/root`, a Windows drive with no media in it) still held
+/// every later hover in the pane behind a retry that failed on that same path,
+/// forever. Enumerating each refusal as a miss, the way [`existence_on`] does
+/// for invalid names, can never finish. Only a host that could not be asked
+/// at all has earned the backoff. A click keeps the stricter reading: it must
+/// not open a farther root's file because a nearer one would not answer,
+/// whereas an underline is a hint that the click checks again.
+pub(super) fn hover_existence_on(
+    host: &dyn crate::ui::host_ops::Host,
+    path: &Path,
+) -> std::io::Result<Existence> {
+    for_hover(existence_on(host, path))
+}
+
+fn for_hover(answer: std::io::Result<Existence>) -> std::io::Result<Existence> {
+    use std::io::ErrorKind;
+    match answer {
+        // How asking fails rather than how a path does: the deadline this
+        // batch carries, a control link that dropped (`ConnectionReset`,
+        // `BrokenPipe`), and a reply that could not be read (`InvalidData`).
+        Err(e)
+            if !matches!(
+                e.kind(),
+                ErrorKind::TimedOut
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::NotConnected
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::WouldBlock
+                    | ErrorKind::Interrupted
+                    | ErrorKind::InvalidData
+            ) =>
+        {
+            Ok(Existence::Missing)
+        }
+        answer => answer,
+    }
+}
+
 /// Resolve a click entirely on its captured host. Repository discovery is
 /// part of this operation, so a cold hover cache never changes a click's roots.
-/// Only NotFound is negative evidence; unavailable roots retain their error.
+/// Only an answer about the name itself ([`existence_on`]) is negative
+/// evidence; unavailable roots retain their error.
 pub(super) fn resolve_file(
     text: &str,
     click_idx: usize,
@@ -244,16 +325,8 @@ pub(super) fn resolve_file(
                     failure = Some(Error::from(ErrorKind::TimedOut));
                     return Probe::Unknown;
                 }
-                match host.stat(path) {
-                    Ok(meta) if !require_file || !meta.is_dir => Probe::Hit {
-                        is_dir: meta.is_dir,
-                    },
-                    Ok(_) => Probe::Miss,
-                    Err(e)
-                        if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
-                    {
-                        Probe::Miss
-                    }
+                match existence_on(host, path) {
+                    Ok(known) => known.answers(require_file),
                     Err(e) => {
                         failure = Some(e);
                         Probe::Unknown
@@ -323,6 +396,76 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// Windows rejects these spellings as invalid names (`ERROR_INVALID_NAME`)
+    /// rather than missing ones, and POSIX rejects an over-long component and a
+    /// file used as a directory the same way. None of that says the host is
+    /// unwell, so neither a hover batch nor a click may fail over it.
+    #[test]
+    fn names_a_host_rejects_are_answers_rather_than_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        let file = dir.path().join("src").join("main.rs");
+        std::fs::write(&file, b"fn main() {}\n").unwrap();
+        let host = tty7_core::host::local::LocalHost::new();
+        let long = "a".repeat(300);
+        for spelling in [
+            "std::io::Error",
+            "Vec<String",
+            "run*",
+            "note:src/main.rs",
+            "src/main.rs/child",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                existence_on(&*host, &dir.path().join(spelling)).unwrap(),
+                Existence::Missing,
+                "{spelling}"
+            );
+        }
+        assert_eq!(existence_on(&*host, &file).unwrap(), Existence::File);
+        assert_eq!(existence_on(&*host, dir.path()).unwrap(), Existence::Dir);
+
+        // The whole token is tried first. A rejected name must fall through to
+        // the reading behind the label instead of aborting the click.
+        let roots = super::super::search::LinkRoots::local(vec![dir.path().to_path_buf()]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let link = resolve_file("note:src/main.rs", 5, &roots, &*host, deadline)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(link.target, super::super::search::LinkTarget::File { path, .. } if path == file)
+        );
+    }
+
+    /// A path the host refuses is an answer to a hover. Only failing to reach
+    /// the host backs the pane's probe batch off, because the retry after a
+    /// refusal would only fail on the same path again, forever.
+    #[test]
+    fn a_hover_backs_off_only_when_the_host_cannot_be_asked() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::IsADirectory,
+            ErrorKind::ResourceBusy,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                for_hover(Err(Error::from(kind))).unwrap(),
+                Existence::Missing,
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::InvalidData,
+        ] {
+            assert_eq!(for_hover(Err(Error::from(kind))).unwrap_err().kind(), kind);
+        }
+        assert_eq!(for_hover(Ok(Existence::Dir)).unwrap(), Existence::Dir);
     }
 
     #[test]
