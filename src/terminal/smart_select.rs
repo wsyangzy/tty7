@@ -1163,18 +1163,20 @@ mod tests {
             local_home: false,
             style: PathStyle::Windows,
         };
+        // Pin the pane's Windows spelling on every runner. Path equality
+        // treats `/` and `\` as equivalent only on Windows, so compare strings.
         for (input, expected) in [
             (
                 "手机分布卡 (D:/workspace/code/frontend/risk-insight-ui/\r\n  output/playwright/overview-redesign/overview-redesign-mobile-cards.png)",
-                "D:/workspace/code/frontend/risk-insight-ui/output/playwright/overview-redesign/overview-redesign-mobile-cards.png",
+                r"D:\workspace\code\frontend\risk-insight-ui\output\playwright\overview-redesign\overview-redesign-mobile-cards.png",
             ),
             (
                 "查看 (D:/\r\n  workspace/code/frontend/risk-insight-ui/output/\r\n  playwright/overview-redesign/overview-redesign-mobile-cards.png)",
-                "D:/workspace/code/frontend/risk-insight-ui/output/playwright/overview-redesign/overview-redesign-mobile-cards.png",
+                r"D:\workspace\code\frontend\risk-insight-ui\output\playwright\overview-redesign\overview-redesign-mobile-cards.png",
             ),
             (
                 "查看 (D:\\项目\\报告\\\r\n  截图(最终版).png)",
-                "D:\\项目\\报告\\截图(最终版).png",
+                r"D:\项目\报告\截图(最终版).png",
             ),
         ] {
             let term = term_with(100, 6, input);
@@ -1190,15 +1192,15 @@ mod tests {
                 let (text, points, idx) = logical_line_at(&term, click, true).unwrap();
                 let link = link_at(&text, idx, &roots, true, &mut |path, _| {
                     assert_eq!(
-                        path,
-                        std::path::Path::new(expected),
-                        "truncated path: {text}"
+                        path.to_str(),
+                        Some(expected),
+                        "unexpected resolved path: {text}"
                     );
                     Probe::Hit { is_dir: false }
                 })
                 .expect("file link from every row");
                 assert!(
-                    matches!(link.target, LinkTarget::File { ref path, .. } if path == std::path::Path::new(expected))
+                    matches!(link.target, LinkTarget::File { ref path, .. } if path.to_str() == Some(expected))
                 );
                 assert_eq!(points[link.start].line, Line(0));
                 assert_eq!(
@@ -1238,12 +1240,14 @@ mod tests {
             style: PathStyle::Windows,
             local_home: false,
         };
+        // Include the resolved root in the relative case's expected spelling,
+        // independently of the path resolver being exercised.
         for (head, tail, token, expected, line, column) in [
             (
                 "修改位于 D:/workspace/code/frontend/risk-insight-ui/src/views/dashboard/overview/components/",
                 "KpiStrip.vue:262，文件级检查已通过。",
                 "D:/workspace/code/frontend/risk-insight-ui/src/views/dashboard/overview/components/",
-                "D:/workspace/code/frontend/risk-insight-ui/src/views/dashboard/overview/components/KpiStrip.vue",
+                r"D:\workspace\code\frontend\risk-insight-ui\src\views\dashboard\overview\components\KpiStrip.vue",
                 262,
                 None,
             ),
@@ -1251,7 +1255,7 @@ mod tests {
                 "查看 D:/项目/报",
                 "告/main.rs:12。说明",
                 "D:/项目/报",
-                "D:/项目/报告/main.rs",
+                r"D:\项目\报告\main.rs",
                 12,
                 None,
             ),
@@ -1259,7 +1263,7 @@ mod tests {
                 "见 src/terminal/smart_se",
                 "lect.rs:880。当时这个限制",
                 "src/terminal/smart_se",
-                "src/terminal/smart_select.rs",
+                r"D:\workspace\code\backend\tty7\src\terminal\smart_select.rs",
                 880,
                 None,
             ),
@@ -1267,7 +1271,7 @@ mod tests {
                 "查看 D:\\项目\\报告\\",
                 "说明.rs:12:3。已修复",
                 "D:\\项目\\报告\\",
-                "D:\\项目\\报告\\说明.rs",
+                r"D:\项目\报告\说明.rs",
                 12,
                 Some(3),
             ),
@@ -1280,14 +1284,10 @@ mod tests {
                     let click =
                         Point::new(Line(0), Column(head[..head.find(token).unwrap()].width()));
                     let (text, points, idx) = logical_line_at(&term, click, true).unwrap();
-                    let expected = if roots.style.is_absolute(expected) {
-                        std::path::PathBuf::from(expected)
-                    } else {
-                        roots.style.join(&roots.dirs[0], expected)
-                    };
                     let mut probe = |path: &std::path::Path, require_file: bool| {
                         assert_eq!(
-                            path, expected,
+                            path.to_str(),
+                            Some(expected),
                             "a directory prefix or relative tail escaped: {text}"
                         );
                         assert!(require_file);
@@ -1305,7 +1305,7 @@ mod tests {
                             let link = link_at(&text, idx, &roots, true, &mut probe).unwrap();
                             assert!(matches!(link.target, LinkTarget::File {
                                 path, line: Some(actual_line), column: actual_column, is_dir: false
-                            } if path == expected && actual_line == line && actual_column == column));
+                            } if path.to_str() == Some(expected) && actual_line == line && actual_column == column));
                         }
                     }
                 }
