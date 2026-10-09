@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
 use crate::daemon::pane::DaemonPane;
-use crate::daemon::protocol::{ClientMsg, DaemonMsg, DaemonVersion, RemoteKind};
+use crate::daemon::protocol::{ClientMsg, DaemonMsg, DaemonVersion, LeaseRequest, RemoteKind};
 use crate::daemon::ssh::SshConnection;
 use crate::daemon::transport::{self, Stream};
 
@@ -105,11 +105,67 @@ impl crate::host::server::PaneDirectory for Registry {
         self.get(pane_id).map(|p| p.procs()).unwrap_or_default()
     }
 
+    fn hibernate_pane(&self, pane_id: u64) {
+        hibernate_pane(self, pane_id);
+    }
+
+    fn close_pane(&self, pane_id: u64) {
+        kill_pane(self, pane_id);
+    }
+
     fn agent_states(&self) -> Vec<crate::daemon::control::PaneAgentState> {
         let panes: Vec<Arc<DaemonPane>> = self.panes.lock().unwrap().values().cloned().collect();
         let mut states: Vec<_> = panes.iter().filter_map(|p| p.agent_state()).collect();
         states.sort_by_key(|s| s.pane_id);
         states
+    }
+}
+
+/// How often panes are checked for an agent turn that has gone silent past
+/// [`crate::daemon::pane::AGENT_STALE_AFTER`]. The threshold is half an hour,
+/// so being up to a minute late to notice costs nothing.
+const AGENT_STALE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The pane a Codex or jcode hook's report is about, found from the report
+/// itself — where a hook runs says nothing for an agent that runs its hooks in
+/// a shared server (see [`crate::daemon::pane::codex_report_target`]). `None`
+/// for any other agent's report, which goes to the pane the hook named.
+fn codex_report_pane(
+    registry: &Registry,
+    named: u64,
+    body: &str,
+) -> Option<(Arc<DaemonPane>, crate::core::cli_agent::AgentEvent)> {
+    let event = crate::core::cli_agent::parse_agent_event_body(body.as_bytes())?;
+    use crate::core::cli_agent::CLIAgent;
+    let agent = event
+        .agent
+        .filter(|a| matches!(a, CLIAgent::Codex | CLIAgent::Jcode))?;
+    let panes = registry.all();
+    let candidates: Vec<_> = panes.iter().map(|p| p.codex_candidate(agent)).collect();
+    let target = crate::daemon::pane::codex_report_target(
+        &candidates,
+        named,
+        event.session_id.as_deref(),
+        event.cwd.as_deref(),
+        event.source.as_deref() == Some("clear"),
+    )?;
+    let pane = panes.into_iter().find(|p| p.id == target)?;
+    Some((pane, event))
+}
+
+fn spawn_agent_stale_sweep(registry: Arc<Registry>) {
+    let spawned = std::thread::Builder::new()
+        .name("tty7-agent-stale".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(AGENT_STALE_SWEEP_INTERVAL);
+                for pane in registry.all() {
+                    pane.expire_stale_agent();
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("could not start the agent status sweep: {e}");
     }
 }
 
@@ -209,6 +265,14 @@ fn spawn_snapshot_keeper(registry: Arc<Registry>) {
                     crate::daemon::scrollback::save(pane.id, &segments, title.as_deref());
                     marks.insert(pane.id, mark);
                 }
+                // Before the sweep, so a closed tab that has aged out takes its
+                // screens with it on this pass rather than the next.
+                if let Some(store) = crate::core::machine::observed_store() {
+                    let now = crate::core::machine::unix_now();
+                    for pane in store.expire_closed_tabs(now) {
+                        kill_pane(&registry, pane);
+                    }
+                }
                 let restorable = restorable_pane_ids(&registry);
                 crate::daemon::scrollback::sweep(&restorable);
                 crate::daemon::history::sweep(&restorable);
@@ -274,6 +338,22 @@ fn kill_pane(registry: &Registry, pane_id: u64) {
         pane.kill();
     }
     crate::daemon::scrollback::forget(pane_id);
+}
+
+/// Stop a pane whose tab is going to sleep, keeping its screen.
+///
+/// [`kill_pane`] with the other half of the bargain: the screen is written one
+/// last time, exactly, and left on disk rather than dropped, so the pane that
+/// wakes in this one's place opens showing it — the same restore a daemon that
+/// died unannounced gets, asked for the same way. The tree still names this
+/// pane, which is what keeps the sweeps off the file until then.
+fn hibernate_pane(registry: &Registry, pane_id: u64) {
+    let Some(pane) = registry.remove(pane_id) else {
+        return;
+    };
+    let (segments, title, _) = pane.scrollback_snapshot();
+    crate::daemon::scrollback::save(pane_id, &segments, title.as_deref());
+    pane.kill();
 }
 
 fn ssh_connection_for(
@@ -492,12 +572,19 @@ fn hand_over(registry: &Registry, exe: &std::path::Path) -> anyhow::Error {
         store.flush();
     }
 
-    crate::daemon::handoff::take_over(
+    // The new image cannot reap a child it did not start; it starts its own.
+    crate::daemon::mobile::stop_for_handoff();
+
+    let failed = crate::daemon::handoff::take_over(
         exe,
         carried,
         registry.alloc_id(),
         crate::daemon::singleton::held_fd(),
-    )
+    );
+    // Still this program: the exec did not happen, so this daemon goes on
+    // serving, and so does its gateway.
+    crate::daemon::mobile::handoff_failed();
+    failed
 }
 
 #[cfg(not(unix))]
@@ -574,6 +661,9 @@ fn run_with(registry: Arc<Registry>, alone: bool) -> anyhow::Result<()> {
 
     crate::daemon::pidfile::write_current();
 
+    // Phone access, when it is switched on: see `daemon::mobile`.
+    crate::daemon::mobile::supervise();
+
     #[cfg(unix)]
     serve_sigterm(registry.clone());
 
@@ -586,6 +676,7 @@ fn run_with(registry: Arc<Registry>, alone: bool) -> anyhow::Result<()> {
     }
 
     spawn_orphan_sweep(registry.clone());
+    spawn_agent_stale_sweep(registry.clone());
     // No sweeping here, deliberately — of either kind. Startup is the one
     // moment this process knows least: it owns no panes yet, and the windows
     // that know which of a dead daemon's files are still wanted cannot say so
@@ -778,8 +869,13 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
             )
         }
 
-        ClientMsg::SpawnNativeSsh { cwd: _, size, spec } => {
+        ClientMsg::SpawnNativeSsh { cwd, size, spec } => {
             let allow_remote_clipboard_write = spec.remote_clipboard_write;
+            // A far-host path that only travels as a `PathBuf`: taken as the
+            // text it was sent as, never resolved against this machine. One
+            // that is not UTF-8 could only reach the far shell mangled, so it
+            // is dropped and the shell starts where it would have anyway.
+            let remote_start_dir = cwd.and_then(|p| p.into_os_string().into_string().ok());
             let id = registry.alloc_id();
             let on_dead = {
                 let registry = registry.clone();
@@ -792,7 +888,8 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
                         .ok();
                 }
             };
-            let pane = match DaemonPane::spawn_native_ssh(id, size, spec, on_dead) {
+            let pane = match DaemonPane::spawn_native_ssh(id, size, spec, remote_start_dir, on_dead)
+            {
                 Ok(p) => p,
                 Err(e) => {
                     let mut w = write_stream;
@@ -1035,6 +1132,31 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
             Ok(())
         }
 
+        ClientMsg::SetForwardEnabled {
+            pane_id,
+            forward_id,
+            enabled,
+        } => {
+            let mut w = write_stream;
+            // Only switching on needs the connection; switching off has to
+            // work on a pane whose connection is already gone.
+            let conn = match forward_pane_connection(&registry, pane_id) {
+                Ok(conn) => Some(conn),
+                Err(e) if enabled => {
+                    DaemonMsg::Error(e).encode(&mut w)?;
+                    return Ok(());
+                }
+                Err(_) => None,
+            };
+            match crate::daemon::ssh::SshManager::global()
+                .set_forward_enabled(pane_id, conn, forward_id, enabled)
+            {
+                Ok(list) => DaemonMsg::ForwardList(list).encode(&mut w)?,
+                Err(e) => DaemonMsg::Error(e).encode(&mut w)?,
+            }
+            Ok(())
+        }
+
         ClientMsg::QueryProcs { pane_id } => {
             let mut w = write_stream;
             let procs = registry.get(pane_id).map(|p| p.procs()).unwrap_or_default();
@@ -1053,6 +1175,26 @@ fn handle_conn(stream: Stream, registry: Arc<Registry>) -> anyhow::Result<()> {
                     DaemonMsg::Error(format!("pane {pane_id} is not running")).encode(&mut w)?
                 }
                 None => DaemonMsg::Error(format!("no such pane {pane_id}")).encode(&mut w)?,
+            }
+            Ok(())
+        }
+
+        ClientMsg::AgentEvent {
+            pane_id,
+            pid,
+            event,
+        } => {
+            let mut w = write_stream;
+            let applied = match codex_report_pane(&registry, pane_id, &event) {
+                Some((pane, parsed)) => pane.apply_reported_agent_event(parsed),
+                None => match registry.get(pane_id) {
+                    Some(pane) => pane.report_agent_event(pid, &event),
+                    None => Err(format!("no such pane {pane_id}")),
+                },
+            };
+            match applied {
+                Ok(()) => DaemonMsg::InputAck { pane_id }.encode(&mut w)?,
+                Err(message) => DaemonMsg::Error(message).encode(&mut w)?,
             }
             Ok(())
         }
@@ -1119,28 +1261,38 @@ fn stream_observer(
     mut read_stream: Stream,
     write_stream: Stream,
 ) -> anyhow::Result<()> {
+    // The pane holds the channel's only sender, and refusals go through it,
+    // so an observer the pane drops at its budget loses its stream: the writer
+    // runs dry and shuts the read below down, rather than the client sitting
+    // on a connection nothing will ever be sent down again.
     let (tx, rx) = mpsc::channel::<DaemonMsg>();
-    let refusals = tx.clone();
     let gate = Arc::new(crate::daemon::pane::OutputGate::new());
     let observer_id = pane.observe(tx, gate.clone());
     let writer = spawn_writer(rx, write_stream, gate);
 
-    observe_loop(&mut read_stream, &refusals);
+    observe_loop(
+        &mut read_stream,
+        |msg| pane.tell_observer(observer_id, msg),
+        |request| pane.observer_lease(observer_id, request),
+    );
 
     pane.unobserve(observer_id);
-    drop(refusals);
     let _ = writer.join();
     Ok(())
 }
 
-fn observe_loop<R: std::io::Read>(read_stream: &mut R, refusals: &mpsc::Sender<DaemonMsg>) {
+fn observe_loop<R: std::io::Read>(
+    read_stream: &mut R,
+    mut refuse: impl FnMut(DaemonMsg) -> bool,
+    mut lease: impl FnMut(LeaseRequest),
+) {
     loop {
         match ClientMsg::read(read_stream) {
+            Ok(ClientMsg::Lease(request)) => lease(request),
             Ok(ClientMsg::Input(_)) | Ok(ClientMsg::Resize(_)) => {
-                let refused = refusals.send(DaemonMsg::Error(
+                if !refuse(DaemonMsg::Error(
                     "this connection is a read-only observer; attach to write".to_string(),
-                ));
-                if refused.is_err() {
+                )) {
                     break;
                 }
             }
@@ -1193,6 +1345,12 @@ fn run_stream(
                     }
                     pane.resize(size);
                 }
+                ClientMsg::Lease(request) => {
+                    if !pane.controls(epoch) {
+                        break 'conn;
+                    }
+                    pane.controller_lease(request);
+                }
                 ClientMsg::AuthResponse {
                     request_id,
                     response,
@@ -1235,7 +1393,7 @@ fn run_stream(
 
 const OUTPUT_COALESCE_CAP: usize = 256 * 1024;
 
-fn spawn_writer(
+pub(crate) fn spawn_writer(
     rx: Receiver<DaemonMsg>,
     mut write_stream: Stream,
     gate: Arc<crate::daemon::pane::OutputGate>,
@@ -1268,15 +1426,7 @@ fn spawn_writer(
                 } else {
                     msg
                 };
-                let drained = match &msg {
-                    DaemonMsg::Output(b) => b.len(),
-                    // Image frames are lifted from the same PTY read the gate
-                    // credits, so they must debit it too or the reader stays
-                    // throttled against bytes that already left the queue.
-                    DaemonMsg::Image(b) => b.len(),
-                    DaemonMsg::ClipboardWrite(b) => b.len(),
-                    _ => 0,
-                };
+                let drained = crate::daemon::pane::gated_len(&msg);
                 let write_ok = msg.encode(&mut write_stream).is_ok();
                 if drained > 0 {
                     gate.sub(drained);
@@ -1377,7 +1527,11 @@ mod tests {
             .unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
-        observe_loop(&mut std::io::Cursor::new(wire), &tx);
+        observe_loop(
+            &mut std::io::Cursor::new(wire),
+            |m| tx.send(m).is_ok(),
+            |_| {},
+        );
         drop(tx);
 
         assert!(
@@ -1397,7 +1551,11 @@ mod tests {
     #[test]
     fn the_observer_loop_ends_at_stream_eof() {
         let (tx, rx) = std::sync::mpsc::channel();
-        observe_loop(&mut std::io::Cursor::new(Vec::<u8>::new()), &tx);
+        observe_loop(
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+            |m| tx.send(m).is_ok(),
+            |_| {},
+        );
         drop(tx);
         assert!(rx.try_recv().is_err());
     }

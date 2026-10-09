@@ -30,6 +30,9 @@ pub(crate) fn window_options(cx: &mut App) -> WindowOptions {
         ))),
         app_id: Some("tty7".to_owned()),
         titlebar: Some(TitlebarOptions {
+            // Not drawn (the title bar is the window's own), but it is the
+            // name the Window menu, Mission Control and VoiceOver give it.
+            title: Some(crate::ui::i18n::t(crate::ui::i18n::L10nKey::SettingsWindowTitle).into()),
             traffic_light_position: Some(crate::ui::theme::traffic_light_position()),
             ..TitleBar::title_bar_options()
         }),
@@ -41,7 +44,7 @@ pub(crate) fn window_options(cx: &mut App) -> WindowOptions {
 }
 
 pub(crate) struct SettingsWindow {
-    app: WeakEntity<Tty7App>,
+    pub(crate) app: WeakEntity<Tty7App>,
     _observe: Subscription,
     _release: Subscription,
 }
@@ -83,6 +86,7 @@ impl Render for SettingsWindow {
         // The workspace window sets this in its own render; a second window
         // has to, or the page lays out against the default 16px rem.
         window.set_rem_size(px(cx.global::<Config>().ui_font_size));
+        crate::ui::settings::kit::note_scale(window);
         let page = self.app.upgrade().map(|app| {
             let page = app.update(cx, |this, cx| {
                 // The state can be gone for a frame between closing and the
@@ -107,5 +111,10 @@ impl Render for SettingsWindow {
             // ⌘, lands here while this window has focus; it is already open.
             .on_action(cx.listener(|_, _: &OpenSettings, window, _| window.activate_window()))
             .when_some(page.flatten(), |root, page| root.child(page))
+            // This window is a `Root` of its own, and a `Root` only shows the
+            // toasts it is asked to draw: without this, everything the page
+            // reports — an ssh_config import, a passphrase it could not store
+            // — was pushed into a layer nobody rendered.
+            .children(gpui_component::Root::render_notification_layer(window, cx))
     }
 }

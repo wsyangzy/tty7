@@ -31,7 +31,9 @@ pub fn snapshot(shell_pid: u32, fg_pgid: Option<i32>) -> PaneProcs {
     if let PortProbe::Unavailable(detail) = &probe {
         note_probe_failure(shell_pid, detail);
     }
-    finish(procs, ports, probe)
+    let mut out = finish(procs, ports, probe);
+    crate::daemon::procstat::fill(&mut out.procs);
+    out
 }
 
 /// How long the same probe failure waits before it is written down again.
@@ -209,6 +211,7 @@ fn walk(table: &HashMap<u32, Row>, shell_pid: u32, fg_pgid: Option<i32>) -> Vec<
             name: row.name.clone(),
             depth,
             foreground: fg_pgid.is_some_and(|g| g as u32 == row.pgid),
+            ..Default::default()
         });
         if depth + 1 > MAX_DEPTH {
             continue;
@@ -225,23 +228,15 @@ fn walk(table: &HashMap<u32, Row>, shell_pid: u32, fg_pgid: Option<i32>) -> Vec<
 #[cfg(target_os = "macos")]
 fn process_table() -> HashMap<u32, Row> {
     let mut table = HashMap::new();
-    let bytes = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    if bytes <= 0 {
-        return table;
-    }
-    let cap = (bytes as usize / std::mem::size_of::<libc::c_int>()) + 64;
-    let mut pids = vec![0 as libc::c_int; cap];
-    let written = unsafe {
-        libc::proc_listallpids(
-            pids.as_mut_ptr() as *mut libc::c_void,
-            (cap * std::mem::size_of::<libc::c_int>()) as libc::c_int,
-        )
-    };
-    if written <= 0 {
-        return table;
-    }
-    let n = written as usize / std::mem::size_of::<libc::c_int>();
-    for &pid in pids.iter().take(n.min(cap)) {
+    let pids = list_all_pids(|buf| {
+        let ptr = match buf.is_empty() {
+            true => std::ptr::null_mut(),
+            false => buf.as_mut_ptr() as *mut libc::c_void,
+        };
+        let bytes = std::mem::size_of_val(buf) as libc::c_int;
+        unsafe { libc::proc_listallpids(ptr, bytes) }
+    });
+    for &pid in &pids {
         if pid <= 0 {
             continue;
         }
@@ -274,6 +269,37 @@ fn process_table() -> HashMap<u32, Row> {
         );
     }
     table
+}
+
+/// Every pid on the machine, by way of `list`, which has the calling
+/// convention of libproc's `proc_listallpids`: handed a buffer, it fills as
+/// much of it as it can, and it answers with a *count of pids* — not a byte
+/// count, although the size it is given is in bytes. An empty buffer asks
+/// only for the count, padded by the kernel for processes born in between.
+///
+/// Reading that count as bytes was #731. It divided the answer by four twice
+/// over, once sizing the buffer and once reading back how much was filled, so
+/// only about one pid in sixteen made it into the table — and since the kernel
+/// lists its newest processes first, the ones kept were whatever had started
+/// most recently. A `go run` server just launched was in; the pane's shell,
+/// started long before, was not, and a walk from a root the table has never
+/// heard of comes back empty: no processes, no ports, and nothing to say why.
+/// A process tree built moments earlier, which is what a quick check of the
+/// probe builds, is exactly the case that happened to work.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn list_all_pids(mut list: impl FnMut(&mut [i32]) -> i32) -> Vec<i32> {
+    let count = list(&mut []);
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut pids = vec![0; count as usize + 64];
+    let written = list(&mut pids);
+    if written <= 0 {
+        return Vec::new();
+    }
+    pids.truncate(written as usize);
+    pids.retain(|&pid| pid > 0);
+    pids
 }
 
 #[cfg(target_os = "macos")]
@@ -364,6 +390,63 @@ fn process_table() -> HashMap<u32, Row> {
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn process_table() -> HashMap<u32, Row> {
     HashMap::new()
+}
+
+/// Whether `pid` runs under `ancestor`: is it, or is one of its parents.
+///
+/// What an agent hook's report is checked against before it is applied to a
+/// pane: the pane id it names comes from the environment, which a detached
+/// `tmux` server or a shell reached some other way carries into places that
+/// are not that pane any more.
+pub fn descends_from(pid: u32, ancestor: u32) -> bool {
+    runs_under(pid, ancestor, parent_pid)
+}
+
+/// How far up a chain [`descends_from`] climbs before giving up. A hook sits a
+/// handful of levels under the pane's shell: shell, agent, the agent's
+/// `sh -c`, the hook.
+const MAX_ANCESTRY: usize = 64;
+
+fn runs_under(pid: u32, ancestor: u32, parent_of: impl Fn(u32) -> Option<u32>) -> bool {
+    let mut cur = pid;
+    for _ in 0..MAX_ANCESTRY {
+        if cur == ancestor {
+            return true;
+        }
+        match parent_of(cur) {
+            Some(parent) if parent > 1 && parent != cur => cur = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn parent_pid(pid: u32) -> Option<u32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let ret = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    (ret == size).then_some(info.pbi_ppid)
+}
+
+#[cfg(target_os = "linux")]
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    stat[close + 1..].split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn parent_pid(pid: u32) -> Option<u32> {
+    process_table().get(&pid).map(|row| row.ppid)
 }
 
 /// The executable name behind a pid.
@@ -867,6 +950,46 @@ fn parse_listen_addr(name: &str) -> Option<(&str, u16)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_process_runs_under_its_ancestors_only() {
+        // 1 ─ 10 (pane shell) ─ 20 (agent) ─ 30 (hook); 1 ─ 40 (tmux server) ─ 50
+        let parent_of = |pid: u32| match pid {
+            10 | 40 => Some(1),
+            20 => Some(10),
+            30 => Some(20),
+            50 => Some(40),
+            _ => None,
+        };
+        assert!(runs_under(30, 10, parent_of));
+        assert!(runs_under(10, 10, parent_of));
+        assert!(
+            !runs_under(50, 10, parent_of),
+            "a detached server is not the pane's"
+        );
+        assert!(
+            !runs_under(10, 30, parent_of),
+            "a parent is not under its child"
+        );
+        assert!(
+            !runs_under(99, 10, parent_of),
+            "a pid nobody knows is under nothing"
+        );
+        assert!(!runs_under(7, 10, |_| Some(7)), "a loop ends");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn this_process_descends_from_its_parent() {
+        let me = std::process::id();
+        let parent = unsafe { libc::getppid() } as u32;
+        assert_eq!(parent_pid(me), Some(parent));
+        assert!(descends_from(me, me));
+        if parent > 1 {
+            assert!(descends_from(me, parent));
+            assert!(!descends_from(parent, me));
+        }
+    }
+
     /// The uid every fabricated row belongs to unless a test says otherwise.
     const ME: u32 = 501;
 
@@ -968,6 +1091,40 @@ mod tests {
         );
     }
 
+    /// `proc_listallpids` as libproc implements it: the kernel's newest
+    /// processes first, a padded estimate when asked with no buffer, and
+    /// always a count of pids back, never bytes.
+    fn fake_listallpids(live: &[i32]) -> impl FnMut(&mut [i32]) -> i32 + '_ {
+        move |buf: &mut [i32]| {
+            if buf.is_empty() {
+                return live.len() as i32 + 20;
+            }
+            let n = live.len().min(buf.len());
+            buf[..n].copy_from_slice(&live[..n]);
+            n as i32
+        }
+    }
+
+    /// #731 on macOS: a busy Mac has hundreds of processes, and the pane's
+    /// shell is an old one. Every pid has to reach the table, or the walk
+    /// starts from a root it cannot find and the pane shows no processes and
+    /// no ports at all.
+    #[test]
+    fn every_pid_is_listed_not_the_newest_sixteenth() {
+        // Newest first, the way the kernel lists them: the `go run` server
+        // just started, and the shell it runs under from an hour ago.
+        let live: Vec<i32> = (1..=700).rev().collect();
+        let got = list_all_pids(fake_listallpids(&live));
+        assert_eq!(got.len(), 700, "the whole machine, not the newest few");
+        assert!(got.contains(&1), "the oldest process is still there");
+    }
+
+    #[test]
+    fn a_pid_list_that_cannot_be_read_is_empty() {
+        assert!(list_all_pids(|_| -1).is_empty());
+        assert!(list_all_pids(|_| 0).is_empty());
+    }
+
     #[test]
     fn a_pathological_tree_still_stops() {
         let mut table: HashMap<u32, Row> = [(100, row(1, "zsh"))].into_iter().collect();
@@ -1014,18 +1171,21 @@ mod tests {
                 name: "zsh".into(),
                 depth: 0,
                 foreground: false,
+                ..Default::default()
             },
             ProcEntry {
                 pid: 9000,
                 name: "go".into(),
                 depth: 1,
                 foreground: true,
+                ..Default::default()
             },
             ProcEntry {
                 pid: 9001,
                 name: "main".into(),
                 depth: 2,
                 foreground: true,
+                ..Default::default()
             },
         ];
         let report = "p9001\nf3\nn*:8080\nf5\nn[::]:8080\np100\n";

@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-pub const SUPPORTED_GUI_LANGUAGES: &[&str] = &["en", "zh-CN", "ja-JP"];
+pub const SUPPORTED_GUI_LANGUAGES: &[&str] = &["en", "zh-CN", "ja-JP", "ru-RU"];
 
 #[derive(Default, Clone, Eq, PartialEq, Hash)]
 pub struct FontFeatures(pub Arc<Vec<(String, u32)>>);
@@ -177,6 +177,14 @@ pub struct Config {
     pub window_backdrop: WindowBackdrop,
     #[serde(default = "default_true")]
     pub dim_inactive_panes: bool,
+    /// Paint the title bar's buttons — new tab and the two panel toggles —
+    /// only while the pointer is over the bar they sit in. Off by default: a
+    /// button that is not on screen is a button nobody finds, and the switch
+    /// is for those who already know where it is and would rather rest their
+    /// eyes on a bare bar. The struct-level `serde(default)` reads a file
+    /// written before the key existed as off, which is how every window drew
+    /// then.
+    pub auto_hide_titlebar_buttons: bool,
     /// Lenient one entry at a time, for the same reason the nested keys below
     /// are: this is hand-edited, and it used to be all-or-nothing. A single
     /// value serde could not read — `"ActivateTab1": null`, a number, an object
@@ -191,6 +199,7 @@ pub struct Config {
     pub keybinding_preset: String,
     #[serde(default = "default_prefix")]
     pub prefix: String,
+    #[serde(default, deserialize_with = "de_shell")]
     pub shell: Option<ShellConfig>,
     /// Lenient on purpose: this is a hand-edited key with a nested shape, and a
     /// typo in one entry must not fail the whole `Config` and hand the user
@@ -250,6 +259,12 @@ pub struct Config {
     /// impression than one they asked for.
     #[serde(default)]
     pub scm_graph_expanded: bool,
+    /// Whether the source control panel lists changed files as a directory
+    /// tree rather than one flat run per group. Off by default: the flat list
+    /// is what a handful of changes reads best as, and the tree is for the
+    /// agent run that touched sixty files across a dozen modules.
+    #[serde(default)]
+    pub scm_changes_tree: bool,
     /// Whether a file opens in the code panel with soft wrap on. Not a
     /// setting anyone picks up front: it is whatever the status bar's Wrap
     /// toggle (or `ToggleDocumentWrap`) was last left at, so the next file
@@ -283,8 +298,27 @@ pub struct Config {
     /// whether visible counts open a diff preview.
     #[serde(default, deserialize_with = "de_lenient")]
     pub sidebar_git_display: SidebarGitDisplay,
+    /// Whether clicking change counts in the sidebar or Info panel opens the diff preview.
     #[serde(default = "default_true")]
     pub sidebar_diff_preview: bool,
+    /// Whether the code editor starts language servers (rust-analyzer,
+    /// typescript-language-server, …) for the files it opens, for
+    /// diagnostics, completion, hover and go to definition. On by default;
+    /// a language whose server is not installed simply goes without.
+    #[serde(default = "default_true")]
+    pub editor_lsp: bool,
+    /// Whether the code editor marks lines that differ from the file's
+    /// staged (index) version in its gutter. On by default; flipped by the
+    /// `ToggleEditorGitGutter` command and remembered like
+    /// [`Self::editor_soft_wrap`].
+    #[serde(default = "default_true")]
+    pub editor_git_gutter: bool,
+    /// Whether the sidebar files tabs nobody pinned into groups of its own —
+    /// by repository, and by host for an SSH pane. Off, those tabs sit in one
+    /// flat list below the pinned groups, which are the user's and show
+    /// either way.
+    #[serde(default = "default_true")]
+    pub sidebar_auto_grouping: bool,
     #[serde(default, deserialize_with = "de_lenient")]
     pub notify_on_command_finish: NotifyMode,
     #[serde(default, deserialize_with = "de_lenient")]
@@ -304,6 +338,11 @@ pub struct Config {
     /// a check happens every six hours.
     #[serde(default = "default_true")]
     pub auto_download_updates: bool,
+    /// Whether the local daemon runs the mobile gateway, so phones paired in
+    /// Settings → Mobile can reach this machine's panes. Off by default: it
+    /// opens a UDP port, and a paired phone can type into any pane.
+    #[serde(default)]
+    pub mobile_access: bool,
     /// Whether the GUI puts the bundled `tty7` CLI on PATH at launch (see
     /// `core::cli_install`). On by default: the CLI is the agent-facing half of
     /// this product and is worth nothing sitting unreachable inside the bundle.
@@ -311,7 +350,7 @@ pub struct Config {
     /// package manager's copy — and do not want it shadowed.
     #[serde(default = "default_true")]
     pub install_cli_on_path: bool,
-    /// GUI-only locale selection. Values: `en` or `zh-CN`.
+    /// GUI-only locale selection. See `SUPPORTED_GUI_LANGUAGES`.
     /// CLI output stays English so agent/script integrations are stable.
     #[serde(default = "default_gui_language")]
     pub gui_language: String,
@@ -319,6 +358,9 @@ pub struct Config {
     pub notify_threshold_secs: u64,
     #[serde(default = "default_true")]
     pub restore_session: bool,
+    /// When closing a tab or a pane asks first — see [`ConfirmClose`].
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub confirm_close: ConfirmClose,
     #[serde(default = "default_true")]
     pub show_tray_icon: bool,
     #[serde(default, deserialize_with = "de_lenient")]
@@ -342,6 +384,13 @@ pub struct Config {
 
     #[serde(default, deserialize_with = "de_lenient")]
     pub cursor_style: CursorStyle,
+    /// The caret's shape while the shell waits at a prompt, whether tty7's
+    /// inline editor or the shell's own line editor draws it. `follow` keeps
+    /// `cursor_style` everywhere; any other value leaves `cursor_style` to the
+    /// programs the shell runs, which is how kitty and ghostty put a bar at
+    /// the prompt and a block inside a TUI that never sets a shape itself.
+    #[serde(default, deserialize_with = "de_lenient")]
+    pub prompt_cursor_style: PromptCursorStyle,
 
     pub macos_option_as_alt: bool,
     pub mouse_hide_while_typing: bool,
@@ -356,16 +405,17 @@ pub struct Config {
     pub mouse_reporting: bool,
     /// Which modifier turns the wheel into a font zoom over a terminal.
     ///
-    /// Defaults to the platform modifier, which is what tty7 has always done —
-    /// but on macOS that is ⌘, a key people are holding half the time for
-    /// something else entirely, so the font jumps size while they scroll
-    /// (#668). Movable, and switchable off.
+    /// Off by default. It used to be the platform modifier, but on macOS that
+    /// is ⌘, a key people are holding half the time for something else
+    /// entirely, so the font jumped size while they scrolled (#668). ⌘+ / ⌘−
+    /// still zoom; this only opts the wheel in.
     #[serde(default, deserialize_with = "de_lenient")]
     pub mouse_zoom_modifier: MouseZoomModifier,
     pub clipboard_trim_trailing_spaces: bool,
     pub copy_on_select: bool,
     /// Optional HTTP/SOCKS proxy for tty7's *own* update checks and release
-    /// downloads; when set it overrides the system proxy and the environment.
+    /// downloads, and (HTTP only) the mobile gateway's relay; when set it is
+    /// tried before the system proxy and the environment.
     /// Programs running in a pane are unaffected — they inherit their proxy
     /// from their own environment, as in any other terminal.
     ///
@@ -387,20 +437,54 @@ pub struct Config {
     #[serde(default)]
     pub env: HashMap<String, String>,
 
-    #[serde(default)]
+    /// The saved SSH hosts. They live in [`SERVERS_FILE`], not in
+    /// `config.json` (#911): people sync `config.json` between machines for its
+    /// colours and keys, and a list of servers is not something every machine
+    /// should carry. Still read from `config.json` so [`Config::load`] can
+    /// move an older file's hosts across, never written back to it.
+    #[serde(default, skip_serializing)]
     pub ssh_profiles: Vec<crate::core::ssh_profile::SshProfile>,
     #[serde(default = "default_true")]
     pub verify_host_keys: bool,
     #[serde(default)]
     pub ssh_warn_on_close: bool,
-    #[serde(default)]
+    /// How often each saved host is used, keyed by its id — which means
+    /// nothing without the hosts it counts, so it lives in [`SERVERS_FILE`]
+    /// beside them.
+    #[serde(default, skip_serializing)]
     pub ssh_profile_frecency: HashMap<uuid::Uuid, ProfileUsage>,
+    /// How often and how lately each shell was opened from the New Tab menu
+    /// or its palette command, keyed by the label the inventory shows it
+    /// under. Orders the menu's short list of shells the way
+    /// `ssh_profile_frecency` orders its hosts.
+    #[serde(default)]
+    pub shell_frecency: HashMap<String, ProfileUsage>,
 
     #[serde(default)]
     pub command_frecency: HashMap<String, ProfileUsage>,
 
     #[serde(default)]
     pub agent_commands: HashMap<String, String>,
+    /// The command line a quick launch types for an agent, keyed by its slug:
+    /// `{"claude": "claude --dangerously-skip-permissions"}`. An agent with no
+    /// entry is launched as its bare binary. A wrapper named here is detected
+    /// as that agent without an `agent_commands` entry of its own.
+    #[serde(default)]
+    pub agent_launch: HashMap<String, String>,
+    /// How often and how recently each agent (by slug) was launched or seen
+    /// running — what orders the quick-launch commands and picks the agent
+    /// "New Agent Tab" opens.
+    #[serde(default)]
+    pub agent_frecency: HashMap<String, ProfileUsage>,
+    /// Approved `.tty7/setup` scripts: repo (`worktree::setup::trust_key`) to
+    /// the sha256 of the content approved. A changed script asks again.
+    #[serde(default)]
+    pub worktree_setup_trust: HashMap<String, String>,
+    /// Past agent sessions taken out of the search's Sessions tab, as
+    /// `<agent slug>:<session id>`. Only the listing forgets them; the
+    /// agent's own history is not touched.
+    #[serde(default)]
+    pub hidden_agent_sessions: BTreeSet<String>,
     #[serde(default = "default_true")]
     pub restore_agent_sessions: bool,
     /// Give each pane its own shell history instead of one file every pane
@@ -422,6 +506,45 @@ pub struct Config {
     /// permanent data loss (#537). Cleared only by a load that parses.
     #[serde(skip)]
     pub quarantined: bool,
+    /// [`SERVERS_FILE`] is there but could not be read or parsed. The hosts
+    /// in hand are not the ones in it, so [`Config::save`] refuses to run
+    /// rather than write them over it — the same rule, for the same reason,
+    /// as [`Self::quarantined`].
+    #[serde(skip)]
+    pub servers_unreadable: bool,
+}
+
+/// Where the saved SSH hosts live, beside `config.json` (#911).
+pub const SERVERS_FILE: &str = "servers.json";
+
+/// What [`SERVERS_FILE`] holds. The keys are the ones `config.json` used to
+/// carry, so a hand-moved block pastes straight across.
+#[derive(Debug, Default, PartialEq, Deserialize)]
+#[serde(default)]
+struct ServersFile {
+    ssh_profiles: Vec<crate::core::ssh_profile::SshProfile>,
+    ssh_profile_frecency: HashMap<uuid::Uuid, ProfileUsage>,
+}
+
+#[derive(Serialize)]
+struct ServersFileRef<'a> {
+    ssh_profiles: &'a [crate::core::ssh_profile::SshProfile],
+    ssh_profile_frecency: &'a HashMap<uuid::Uuid, ProfileUsage>,
+}
+
+/// Whether a `config.json` still carries the keys that moved to
+/// [`SERVERS_FILE`] — the cue for the one-time move.
+#[derive(Deserialize)]
+struct LegacyServerKeys {
+    #[serde(default)]
+    ssh_profiles: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    ssh_profile_frecency: Option<serde::de::IgnoredAny>,
+}
+
+fn has_legacy_server_keys(text: &str) -> bool {
+    serde_json::from_str::<LegacyServerKeys>(strip_bom(text))
+        .is_ok_and(|keys| keys.ssh_profiles.is_some() || keys.ssh_profile_frecency.is_some())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -481,6 +604,28 @@ pub enum CursorStyle {
     Block,
     Bar,
     Underline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptCursorStyle {
+    #[default]
+    Follow,
+    Block,
+    Bar,
+    Underline,
+}
+
+impl PromptCursorStyle {
+    /// The shape this names, or `None` when the prompt follows `cursor_style`.
+    pub fn shape(self) -> Option<CursorStyle> {
+        match self {
+            Self::Follow => None,
+            Self::Block => Some(CursorStyle::Block),
+            Self::Bar => Some(CursorStyle::Bar),
+            Self::Underline => Some(CursorStyle::Underline),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -547,11 +692,13 @@ pub enum NotifyMode {
 }
 
 impl NotifyMode {
-    pub fn allows(self, window_active: bool) -> bool {
+    /// Whether a notification goes out, given whether the reader is already
+    /// watching what it is about.
+    pub fn allows(self, watched: bool) -> bool {
         match self {
-            Self::Never => false,
-            Self::Unfocused => !window_active,
-            Self::Always => true,
+            NotifyMode::Never => false,
+            NotifyMode::Unfocused => !watched,
+            NotifyMode::Always => true,
         }
     }
 }
@@ -574,21 +721,42 @@ pub enum UpdateChannel {
 
 /// The modifier that makes the mouse wheel resize the font.
 ///
-/// `Platform` keeps the historical binding — ⌘ on macOS, Ctrl elsewhere — and
-/// is stored rather than the resolved key so one config file can be shared
-/// between machines that disagree about which key that is.
+/// `Platform` is ⌘ on macOS and Ctrl elsewhere, stored rather than the
+/// resolved key so one config file can be shared between machines that
+/// disagree about which key that is. `None`, the default, leaves the wheel to
+/// scrolling.
 ///
 /// Shift is deliberately not offered: shift+wheel is the escape hatch that
 /// scrolls the scrollback out from under a mouse-reporting program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MouseZoomModifier {
-    #[default]
     Platform,
     Ctrl,
     Alt,
     /// The wheel never zooms; every scroll goes to the buffer.
+    #[default]
     None,
+}
+
+/// When closing a tab or a pane asks first (#1021).
+///
+/// `WhenBusy` is the question tty7 has always asked, and the default: only
+/// when something would be cut off — a program still running in the
+/// foreground, an agent mid-turn. `Always` also asks about an idle shell, for
+/// people who would rather confirm every close than ever lose one; `Never`
+/// stops asking about busy panes.
+///
+/// The warning before dropping a live SSH connection is not governed by this.
+/// It is an opt-in of its own, per host or for all of them, so it is still
+/// honoured under `Never`: turning this down is not turning that off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfirmClose {
+    Never,
+    #[default]
+    WhenBusy,
+    Always,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -683,6 +851,7 @@ impl Default for Config {
             window_blur: None,
             window_backdrop: WindowBackdrop::default(),
             dim_inactive_panes: true,
+            auto_hide_titlebar_buttons: false,
             keybindings: HashMap::new(),
             keybinding_preset: default_preset(),
             prefix: default_prefix(),
@@ -706,27 +875,34 @@ impl Default for Config {
             document_layout: DocumentLayout::default(),
             document_ratio: default_document_ratio(),
             scm_graph_expanded: false,
+            scm_changes_tree: false,
             editor_soft_wrap: false,
             editor_markdown_preview: false,
             sidebar_grouping: SidebarGrouping::Repo,
             sidebar_collapsed_groups: Vec::new(),
             sidebar_git_display: SidebarGitDisplay::Full,
             sidebar_diff_preview: true,
+            editor_lsp: true,
+            editor_git_gutter: true,
+            sidebar_auto_grouping: true,
             notify_on_command_finish: NotifyMode::Unfocused,
             notify_on_agent_event: NotifyMode::Unfocused,
             check_for_updates: true,
+            mobile_access: false,
             update_channel: UpdateChannel::default(),
             auto_download_updates: true,
             install_cli_on_path: true,
             gui_language: default_gui_language(),
             notify_threshold_secs: default_notify_threshold_secs(),
             restore_session: true,
+            confirm_close: ConfirmClose::WhenBusy,
             show_tray_icon: true,
             bell: BellMode::Visual,
             prompt_editor: true,
             tab_completion: true,
             history_search: true,
             cursor_style: CursorStyle::Block,
+            prompt_cursor_style: PromptCursorStyle::Follow,
             macos_option_as_alt: false,
             mouse_hide_while_typing: true,
             focus_follows_mouse: false,
@@ -747,11 +923,17 @@ impl Default for Config {
             verify_host_keys: true,
             ssh_warn_on_close: false,
             ssh_profile_frecency: HashMap::new(),
+            shell_frecency: HashMap::new(),
             command_frecency: HashMap::new(),
             agent_commands: HashMap::new(),
+            agent_launch: HashMap::new(),
+            agent_frecency: HashMap::new(),
+            worktree_setup_trust: HashMap::new(),
+            hidden_agent_sessions: BTreeSet::new(),
             restore_agent_sessions: true,
             per_pane_history: false,
             quarantined: false,
+            servers_unreadable: false,
         }
     }
 }
@@ -789,6 +971,16 @@ impl LoadOutcome {
 }
 
 impl Config {
+    /// Both config generations can disable automatic groups. The legacy mode
+    /// also retains directory fallback; pinned groups are always kept.
+    pub fn effective_sidebar_grouping(&self) -> SidebarGrouping {
+        if self.sidebar_auto_grouping {
+            self.sidebar_grouping
+        } else {
+            SidebarGrouping::None
+        }
+    }
+
     pub fn load() -> Self {
         Self::load_with_outcome().0
     }
@@ -798,13 +990,42 @@ impl Config {
     /// app onto the result needs the outcome to keep a broken file from
     /// evicting the settings the app is running on.
     pub fn load_with_outcome() -> (Self, LoadOutcome) {
-        let Some(path) = Self::path() else {
-            return (Config::default(), LoadOutcome::Absent);
-        };
-        let text = match std::fs::read_to_string(&path) {
+        match Self::path() {
+            Some(path) => Self::load_from(&path),
+            None => (Config::default(), LoadOutcome::Absent),
+        }
+    }
+
+    /// [`Config::load_with_outcome`] for the `config.json` at `path`, with the
+    /// saved hosts read from the [`SERVERS_FILE`] beside it.
+    ///
+    /// A `config.json` from before the split still holds the hosts itself.
+    /// When there is no [`SERVERS_FILE`] yet they are moved into one, once:
+    /// the new file is written first and `config.json` rewritten without them
+    /// only after that has landed, so a failure anywhere leaves them where
+    /// they were. When both files are there the new one wins and the copy in
+    /// `config.json` is not read — it is what an older tty7 wrote after the
+    /// move, or a synced file brought in, and it falls out of `config.json`
+    /// at its next save.
+    pub(crate) fn load_from(path: &Path) -> (Self, LoadOutcome) {
+        let (mut cfg, outcome, text) = Self::load_config_file(path);
+        let servers = path.with_file_name(SERVERS_FILE);
+        let found = cfg.load_servers(&servers);
+        if !found
+            && let Some(text) = text
+            && has_legacy_server_keys(&text)
+        {
+            cfg.move_servers_out(&text, path, &servers);
+        }
+        (cfg, outcome)
+    }
+
+    /// `config.json` alone, with the text it parsed from.
+    fn load_config_file(path: &Path) -> (Self, LoadOutcome, Option<String>) {
+        let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return (Config::default(), LoadOutcome::Absent);
+                return (Config::default(), LoadOutcome::Absent, None);
             }
             Err(e) => {
                 // Unreadable is not unparseable, but the rule is the same:
@@ -817,13 +1038,13 @@ impl Config {
                 );
                 let mut cfg = Config::default();
                 cfg.quarantined = true;
-                return (cfg, LoadOutcome::Unreadable);
+                return (cfg, LoadOutcome::Unreadable, None);
             }
         };
         match serde_json::from_str::<Config>(strip_bom(&text)) {
             Ok(mut cfg) => {
                 cfg.sanitize();
-                (cfg, LoadOutcome::Parsed)
+                (cfg, LoadOutcome::Parsed, Some(text))
             }
             Err(e) => {
                 // The next `save` overwrites this file wholesale, so handing
@@ -835,11 +1056,80 @@ impl Config {
                     "failed to parse config at {}: {e}; keeping it aside and using defaults",
                     path.display()
                 );
-                quarantine(&path);
+                quarantine(path);
                 let mut cfg = Config::default();
                 cfg.quarantined = true;
-                (cfg, LoadOutcome::Quarantined)
+                (cfg, LoadOutcome::Quarantined, None)
             }
+        }
+    }
+
+    /// Takes the hosts from the [`SERVERS_FILE`] at `path`, if there is one.
+    /// Returns whether there was — a file that is there but broken counts, so
+    /// that nothing is moved over the top of it.
+    fn load_servers(&mut self, path: &Path) -> bool {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(e) => {
+                log::warn!(
+                    "failed to read {}: {e}; saved SSH hosts unavailable, writes suppressed",
+                    path.display()
+                );
+                self.servers_unreadable = true;
+                return true;
+            }
+        };
+        match serde_json::from_str::<ServersFile>(strip_bom(&text)) {
+            Ok(servers) => {
+                self.ssh_profiles = servers.ssh_profiles;
+                self.ssh_profile_frecency = servers.ssh_profile_frecency;
+            }
+            Err(e) => {
+                log::warn!(
+                    "failed to parse {}: {e}; keeping it aside, writes suppressed",
+                    path.display()
+                );
+                quarantine(path);
+                self.servers_unreadable = true;
+            }
+        }
+        true
+    }
+
+    /// The one-time move of the hosts out of `config.json` (#911). New file
+    /// first: until it has landed, `config.json` is the only copy.
+    ///
+    /// `config.json` is then rewritten from its own `text` with just those
+    /// two keys taken out, not from `self` the way a save writes it. Nobody
+    /// asked for this write, so it should change nothing else: a hand-kept
+    /// file stays the handful of keys it was rather than growing every
+    /// default, and a key this build does not know — one a newer tty7 on a
+    /// synced machine wrote — survives.
+    fn move_servers_out(&self, text: &str, config: &Path, servers: &Path) {
+        if let Err(e) = self.write_servers(servers) {
+            log::warn!(
+                "could not move SSH hosts to {}: {e}; leaving them in config.json",
+                servers.display()
+            );
+            return;
+        }
+        let rewrite = || -> std::io::Result<()> {
+            let mut value: serde_json::Value =
+                serde_json::from_str(strip_bom(text)).map_err(std::io::Error::other)?;
+            if let Some(object) = value.as_object_mut() {
+                object.remove("ssh_profiles");
+                object.remove("ssh_profile_frecency");
+            }
+            let text = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
+            write_atomic(config, text.as_bytes())
+        };
+        match rewrite() {
+            Ok(()) => log::info!("moved SSH hosts from config.json to {}", servers.display()),
+            Err(e) => log::warn!(
+                "moved SSH hosts to {}, but could not rewrite config.json: {e}",
+                servers.display()
+            ),
         }
     }
 
@@ -930,18 +1220,62 @@ impl Config {
 
     /// Persist without hiding a failure from an interactive settings editor.
     pub fn try_save(&self) -> std::io::Result<()> {
+        let path = Self::path()
+            .ok_or_else(|| std::io::Error::other("configuration directory is unavailable"))?;
+        self.try_save_to(&path)
+    }
+
+    /// [`Config::try_save`] for the `config.json` at `path`, and the
+    /// [`SERVERS_FILE`] beside it.
+    pub(crate) fn try_save_to(&self, path: &Path) -> std::io::Result<()> {
         if self.quarantined {
             return Err(std::io::Error::other(
                 "the existing configuration could not be read; repair it before saving",
             ));
         }
-        let path = Self::path()
-            .ok_or_else(|| std::io::Error::other("configuration directory is unavailable"))?;
+        if self.servers_unreadable {
+            return Err(std::io::Error::other(format!(
+                "{SERVERS_FILE} could not be read; repair it before saving"
+            )));
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Hosts first, for the same reason the move out of `config.json`
+        // writes them first: a `config.json` that lands without them while
+        // their own file failed to would have dropped them.
+        self.write_servers(&path.with_file_name(SERVERS_FILE))?;
+        self.write_config(path)
+    }
+
+    fn write_config(&self, path: &Path) -> std::io::Result<()> {
         let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        write_atomic(&path, text.as_bytes())
+        write_atomic(path, text.as_bytes())
+    }
+
+    /// Writes the hosts to their own file — unless it already says exactly
+    /// this, which is nearly every save: a dragged divider has nothing to do
+    /// with the hosts, and rewriting the file anyway would wake the watcher a
+    /// second time. No hosts and no file stays no file.
+    fn write_servers(&self, path: &Path) -> std::io::Result<()> {
+        let on_disk = match std::fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str::<ServersFile>(strip_bom(&text)).ok(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(ServersFile::default()),
+            Err(_) => None,
+        };
+        if on_disk.as_ref().is_some_and(|held| {
+            held.ssh_profiles == self.ssh_profiles
+                && held.ssh_profile_frecency == self.ssh_profile_frecency
+        }) {
+            return Ok(());
+        }
+        let text = serde_json::to_string_pretty(&ServersFileRef {
+            ssh_profiles: &self.ssh_profiles,
+            ssh_profile_frecency: &self.ssh_profile_frecency,
+        })
+        .map_err(std::io::Error::other)?;
+        // Host names, users and key paths: nobody else's business.
+        write_atomic_private(path, text.as_bytes())
     }
 
     fn path() -> Option<PathBuf> {
@@ -1226,15 +1560,44 @@ pub fn extra_env() -> HashMap<String, String> {
     Config::load().env
 }
 
-pub fn agent_commands_cached() -> &'static HashMap<String, String> {
-    static CACHE: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| {
-        Config::load()
-            .agent_commands
-            .into_iter()
-            .map(|(k, v)| (k.to_ascii_lowercase(), v))
-            .collect()
-    })
+/// Every wrapper name the daemon should read as an agent: `agent_commands`,
+/// plus the programs `agent_launch` entries run (see
+/// [`crate::core::cli_agent::launch_aliases`]). An explicit `agent_commands`
+/// entry wins over an implied one.
+///
+/// Read again whenever `config.json` changes rather than once per process: the
+/// daemon outlives any number of edits, and a launch override added while it
+/// runs has to be recognised by the very next launch that uses it.
+pub fn agent_detection_aliases() -> std::sync::Arc<HashMap<String, String>> {
+    type Stamp = Option<(std::time::SystemTime, u64)>;
+    static CACHE: std::sync::Mutex<Option<(Stamp, std::sync::Arc<HashMap<String, String>>)>> =
+        std::sync::Mutex::new(None);
+    let stamp: Stamp = Config::path()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .and_then(|m| Some((m.modified().ok()?, m.len())));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((seen, aliases)) = cache.as_ref()
+        && *seen == stamp
+    {
+        return aliases.clone();
+    }
+    let cfg = Config::load();
+    let aliases = std::sync::Arc::new(detection_aliases(&cfg.agent_commands, &cfg.agent_launch));
+    *cache = Some((stamp, aliases.clone()));
+    aliases
+}
+
+/// [`agent_detection_aliases`] over the two maps it reads, for a caller that
+/// already holds them.
+pub fn detection_aliases(
+    commands: &HashMap<String, String>,
+    launch: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut aliases = crate::core::cli_agent::launch_aliases(launch);
+    for (name, slug) in commands {
+        aliases.insert(name.to_ascii_lowercase(), slug.clone());
+    }
+    aliases
 }
 
 fn default_preset() -> String {
@@ -1269,13 +1632,18 @@ pub enum RightPanelTab {
     /// The source control panel. Renamed from `Changes` in place rather than
     /// added alongside it: `rename` works in both directions, so a config
     /// written by this version still says `"changes"` and an older build reads
-    /// it back unchanged. A fourth variant could not do that — the old build
-    /// would fall through `de_lenient` to `Info` and kick anyone who rolled
-    /// back off the panel they were sitting on. 260px has no room for a fourth
-    /// tab tile either.
+    /// it back unchanged.
     #[serde(rename = "changes", alias = "scm", alias = "git")]
     Scm,
     Files,
+    /// Project-wide content search. Added as a tab of its own, which costs a
+    /// rolled-back build one thing: it does not know `"search"`, falls through
+    /// `de_lenient` to `Info`, and opens there. Nothing else is lost.
+    Search,
+    /// The bound GitHub repository's issues and pull requests. Same rollback
+    /// cost as `Search`.
+    #[serde(rename = "github")]
+    GitHub,
 }
 
 /// What opens when a file link in the grid is clicked.
@@ -1302,8 +1670,10 @@ pub enum DiffViewMode {
     Unified,
 }
 
+/// The detail panel's resting width: the v4 design's 280px column, which is
+/// what its insets (12px lists, 20px text) and the tab row were drawn against.
 fn default_right_panel_width() -> f32 {
-    260.
+    280.
 }
 
 /// Where the code / diff surface is drawn.
@@ -1419,9 +1789,64 @@ where
     }))
 }
 
+/// `shell`, read the way Settings writes it: no program means the login
+/// shell. A hand-edited `"shell": { "args": ["-l"] }` — or any other shape
+/// that does not name a program — used to fail the whole file, and every other
+/// setting went with it into quarantine.
+fn de_shell<'de, D>(deserializer: D) -> Result<Option<ShellConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match ShellConfig::deserialize(&value) {
+        Ok(shell) if !shell.program.trim().is_empty() => Ok(Some(shell)),
+        Ok(_) => Ok(None),
+        Err(e) => {
+            log::warn!("ignoring invalid shell {value}: {e}; using the login shell");
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notify_mode_holds_back_only_what_is_watched_under_unfocused() {
+        for watched in [false, true] {
+            assert!(!NotifyMode::Never.allows(watched));
+            assert!(NotifyMode::Always.allows(watched));
+            assert_eq!(NotifyMode::Unfocused.allows(watched), !watched);
+        }
+    }
+
+    #[test]
+    fn a_shell_without_a_program_is_the_login_shell_not_a_broken_file() {
+        for shell in [
+            r#"{"args": ["-l"]}"#,
+            r#"{"program": "", "args": []}"#,
+            r#"{"program": 5}"#,
+            "null",
+        ] {
+            let text = format!(r#"{{"font_size": 17.0, "shell": {shell}}}"#);
+            let cfg: Config = serde_json::from_str(&text).expect("the file still parses");
+            assert_eq!(cfg.shell, None, "{shell}");
+            assert_eq!(cfg.font_size, 17.0, "the rest of the file is kept");
+        }
+        let cfg: Config =
+            serde_json::from_str(r#"{"shell": {"program": "fish", "args": ["-l"]}}"#).unwrap();
+        assert_eq!(
+            cfg.shell,
+            Some(ShellConfig {
+                program: "fish".into(),
+                args: vec!["-l".into()]
+            })
+        );
+    }
 
     #[test]
     fn profile_usage_score_ranks_frequency_and_recency() {
@@ -1448,6 +1873,36 @@ mod tests {
         assert!(recent.score(now) > stale.score(now));
     }
 
+    /// A config from before the setting keeps asking exactly what it asked
+    /// before, and a value this build does not know falls back to that too
+    /// rather than failing the file.
+    #[test]
+    fn confirm_close_defaults_to_asking_when_busy() {
+        assert_eq!(Config::default().confirm_close, ConfirmClose::WhenBusy);
+        let cfg: Config = serde_json::from_str(r#"{"restore_session": false}"#).unwrap();
+        assert_eq!(cfg.confirm_close, ConfirmClose::WhenBusy);
+        let cfg: Config = serde_json::from_str(r#"{"confirm_close": "sometimes"}"#).unwrap();
+        assert_eq!(cfg.confirm_close, ConfirmClose::WhenBusy);
+    }
+
+    #[test]
+    fn confirm_close_round_trips_under_its_written_names() {
+        for (mode, name) in [
+            (ConfirmClose::Never, "never"),
+            (ConfirmClose::WhenBusy, "when-busy"),
+            (ConfirmClose::Always, "always"),
+        ] {
+            let cfg = Config {
+                confirm_close: mode,
+                ..Config::default()
+            };
+            let json = serde_json::to_value(&cfg).unwrap();
+            assert_eq!(json["confirm_close"], name);
+            let back: Config = serde_json::from_value(json).unwrap();
+            assert_eq!(back.confirm_close, mode);
+        }
+    }
+
     #[test]
     fn ssh_warn_on_close_and_frecency_round_trip() {
         let mut cfg = Config::default();
@@ -1461,8 +1916,12 @@ mod tests {
                 last_used: 42,
             },
         );
-        let json = serde_json::to_string(&cfg).unwrap();
-        let back: Config = serde_json::from_str(&json).unwrap();
+        // The count travels in the servers file now (#911), so the round
+        // trip is through disk rather than through `config.json`'s serde.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        cfg.try_save_to(&config).unwrap();
+        let (back, _) = Config::load_from(&config);
         assert!(back.ssh_warn_on_close);
         assert_eq!(back.ssh_profile_frecency.get(&id).unwrap().count, 4);
     }
@@ -1551,7 +2010,6 @@ mod tests {
         let off: Config = serde_json::from_str(r#"{"sidebar_diff_preview": false}"#).unwrap();
         assert!(!off.sidebar_diff_preview);
         let json = serde_json::to_string(&off).unwrap();
-        assert!(json.contains("\"sidebar_diff_preview\":false"), "persisted");
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(!back.sidebar_diff_preview);
     }
@@ -1633,6 +2091,29 @@ mod tests {
     }
 
     #[test]
+    fn old_and_new_group_switches_share_one_effective_mode() {
+        for (json, expected) in [
+            (r#"{}"#, SidebarGrouping::Repo),
+            (r#"{"sidebar_grouping":"none"}"#, SidebarGrouping::None),
+            (r#"{"sidebar_auto_grouping":false}"#, SidebarGrouping::None),
+            (
+                r#"{"sidebar_grouping":"repo-or-directory"}"#,
+                SidebarGrouping::RepoOrDirectory,
+            ),
+            (
+                r#"{"sidebar_grouping":"repo-or-directory","sidebar_auto_grouping":false}"#,
+                SidebarGrouping::None,
+            ),
+        ] {
+            let cfg: Config = serde_json::from_str(json).unwrap();
+            assert_eq!(cfg.effective_sidebar_grouping(), expected);
+            let restored: Config =
+                serde_json::from_value(serde_json::to_value(cfg).unwrap()).unwrap();
+            assert_eq!(restored.effective_sidebar_grouping(), expected);
+        }
+    }
+
+    #[test]
     fn dim_inactive_panes_defaults_on_and_round_trips() {
         assert!(Config::default().dim_inactive_panes);
 
@@ -1644,6 +2125,21 @@ mod tests {
         let json = serde_json::to_string(&off).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
         assert!(!back.dim_inactive_panes);
+    }
+
+    #[test]
+    fn auto_hide_titlebar_buttons_defaults_off_and_round_trips() {
+        assert!(!Config::default().auto_hide_titlebar_buttons);
+
+        // A file from before the key existed keeps its buttons on screen.
+        let old: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        assert!(!old.auto_hide_titlebar_buttons);
+
+        let on: Config = serde_json::from_str(r#"{"auto_hide_titlebar_buttons": true}"#).unwrap();
+        assert!(on.auto_hide_titlebar_buttons);
+        let json = serde_json::to_string(&on).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(back.auto_hide_titlebar_buttons, "persisted");
     }
 
     #[test]
@@ -2175,8 +2671,7 @@ mod tests {
 
     /// #668: a config written on a Mac travels to a Linux box, where the
     /// platform modifier is a different key — so the *choice* is stored, not
-    /// the key it resolves to. An unknown value must not silently disable
-    /// zooming either.
+    /// the key it resolves to. Unset, or unknown, the wheel does not zoom.
     #[test]
     fn the_zoom_modifier_round_trips_and_falls_back() {
         let cfg: Config = serde_json::from_str(r#"{"mouse_zoom_modifier": "none"}"#).unwrap();
@@ -2185,11 +2680,14 @@ mod tests {
         let cfg: Config = serde_json::from_str(r#"{"mouse_zoom_modifier": "alt"}"#).unwrap();
         assert_eq!(cfg.mouse_zoom_modifier, MouseZoomModifier::Alt);
 
-        let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        let cfg: Config = serde_json::from_str(r#"{"mouse_zoom_modifier": "platform"}"#).unwrap();
         assert_eq!(cfg.mouse_zoom_modifier, MouseZoomModifier::Platform);
 
+        let cfg: Config = serde_json::from_str(r#"{"font_size": 15.0}"#).unwrap();
+        assert_eq!(cfg.mouse_zoom_modifier, MouseZoomModifier::None);
+
         let cfg: Config = serde_json::from_str(r#"{"mouse_zoom_modifier": "meta"}"#).unwrap();
-        assert_eq!(cfg.mouse_zoom_modifier, MouseZoomModifier::Platform);
+        assert_eq!(cfg.mouse_zoom_modifier, MouseZoomModifier::None);
 
         assert_eq!(
             serde_json::to_string(&MouseZoomModifier::None).unwrap(),
@@ -2241,6 +2739,9 @@ mod tests {
 
         let cfg: Config = serde_json::from_str(r#"{"gui_language": "ja-JP"}"#).unwrap();
         assert_eq!(cfg.gui_language, "ja-JP");
+
+        let cfg: Config = serde_json::from_str(r#"{"gui_language": "ru-RU"}"#).unwrap();
+        assert_eq!(cfg.gui_language, "ru-RU");
 
         let mut cfg: Config = serde_json::from_str(r#"{"gui_language": "ko"}"#).unwrap();
         cfg.sanitize();
@@ -2684,5 +3185,273 @@ mod tests {
         std::fs::write(exe_dir.path().join(PORTABLE_MARKER), "portable-v1").unwrap();
         std::fs::write(exe_dir.path().join(PORTABLE_DATA_DIR), "").unwrap();
         assert_eq!(portable_data_dir(exe_dir.path()), None);
+    }
+
+    #[test]
+    fn launch_overrides_teach_the_daemon_their_wrappers_as_the_file_changes() {
+        let _guard = lock_config_file();
+        pin_config_dir();
+        let mut cfg = Config::default();
+        cfg.agent_launch
+            .insert("claude".to_string(), "cc --fast".to_string());
+        cfg.save();
+        let aliases = agent_detection_aliases();
+        assert_eq!(aliases.get("cc").map(String::as_str), Some("claude"));
+
+        // An edit made while the daemon runs is picked up on the next read,
+        // and an explicit `agent_commands` entry outranks an implied one.
+        cfg.agent_launch
+            .insert("codex".to_string(), "/opt/bin/cx".to_string());
+        cfg.agent_commands
+            .insert("CC".to_string(), "gemini".to_string());
+        cfg.save();
+        let aliases = agent_detection_aliases();
+        assert_eq!(aliases.get("cc").map(String::as_str), Some("gemini"));
+        assert_eq!(aliases.get("cx").map(String::as_str), Some("codex"));
+
+        let back: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.agent_launch, cfg.agent_launch);
+        Config::default().save();
+    }
+
+    fn host(name: &str, address: &str) -> crate::core::ssh_profile::SshProfile {
+        let mut profile = crate::core::ssh_profile::SshProfile::new(name);
+        profile.host = address.to_string();
+        profile.user = "deploy".to_string();
+        profile
+    }
+
+    /// A `config.json` from before #911, holding hosts, a usage count, a key
+    /// this build has never heard of, and the handful of settings the user
+    /// actually wrote.
+    fn legacy_config(profile: &crate::core::ssh_profile::SshProfile) -> String {
+        let usage = serde_json::json!({ profile.id.to_string(): { "count": 3, "last_used": 5 } });
+        serde_json::to_string_pretty(&serde_json::json!({
+            "font_size": 18.0,
+            "a_key_from_a_newer_build": { "x": 1 },
+            "ssh_profiles": [profile],
+            "ssh_profile_frecency": usage,
+            "keybindings": { "SplitRight": "cmd-d" },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_hosts_move_out_of_config_json_once_and_nothing_else_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        let servers = dir.path().join(SERVERS_FILE);
+        let profile = host("prod-web", "10.0.0.5");
+        std::fs::write(&config, legacy_config(&profile)).unwrap();
+
+        let (cfg, outcome) = Config::load_from(&config);
+        assert_eq!(outcome, LoadOutcome::Parsed);
+        assert_eq!(cfg.ssh_profiles, vec![profile.clone()]);
+        assert_eq!(cfg.ssh_profile_frecency[&profile.id].count, 3);
+        assert_eq!(cfg.font_size, 18.0);
+
+        let moved: ServersFile =
+            serde_json::from_str(&std::fs::read_to_string(&servers).unwrap()).unwrap();
+        assert_eq!(moved.ssh_profiles, vec![profile.clone()]);
+        assert_eq!(moved.ssh_profile_frecency[&profile.id].count, 3);
+
+        let left: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        let left = left.as_object().unwrap();
+        assert!(!left.contains_key("ssh_profiles"));
+        assert!(!left.contains_key("ssh_profile_frecency"));
+        // The rest of the file is exactly what it was: nothing the user did
+        // not write appears, and nothing this build cannot read disappears.
+        assert_eq!(left["font_size"], serde_json::json!(18.0));
+        assert_eq!(
+            left["a_key_from_a_newer_build"],
+            serde_json::json!({ "x": 1 })
+        );
+        assert_eq!(
+            left["keybindings"],
+            serde_json::json!({ "SplitRight": "cmd-d" })
+        );
+        assert_eq!(left.len(), 3, "the move must not expand the file: {left:?}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&servers).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // Once is once: a second load reads the new file and writes nothing.
+        let config_after = std::fs::read(&config).unwrap();
+        let servers_after = std::fs::read(&servers).unwrap();
+        let (again, _) = Config::load_from(&config);
+        assert_eq!(again.ssh_profiles, vec![profile]);
+        assert_eq!(std::fs::read(&config).unwrap(), config_after);
+        assert_eq!(std::fs::read(&servers).unwrap(), servers_after);
+    }
+
+    #[test]
+    fn with_both_files_present_the_servers_file_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        let servers = dir.path().join(SERVERS_FILE);
+        let current = host("current", "10.0.0.1");
+        let stale = host("stale", "10.0.0.2");
+        let cfg = Config {
+            ssh_profiles: vec![current.clone()],
+            ..Config::default()
+        };
+        cfg.try_save_to(&config).unwrap();
+        // An older tty7, or a synced file, puts hosts back in config.json.
+        std::fs::write(&config, legacy_config(&stale)).unwrap();
+        let servers_before = std::fs::read(&servers).unwrap();
+
+        let (loaded, _) = Config::load_from(&config);
+        assert_eq!(loaded.ssh_profiles, vec![current.clone()]);
+        assert!(loaded.ssh_profile_frecency.is_empty());
+        assert_eq!(std::fs::read(&servers).unwrap(), servers_before);
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            legacy_config(&stale),
+            "loading is not the moment to rewrite config.json"
+        );
+
+        // The stale copy falls out at the next ordinary save.
+        loaded.try_save_to(&config).unwrap();
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(!text.contains("ssh_profiles"), "{text}");
+        assert_eq!(Config::load_from(&config).0.ssh_profiles, vec![current]);
+    }
+
+    #[test]
+    fn a_config_json_without_hosts_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{\"font_size\": 18}").unwrap();
+
+        let (cfg, _) = Config::load_from(&config);
+        assert!(cfg.ssh_profiles.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "{\"font_size\": 18}"
+        );
+        assert!(!dir.path().join(SERVERS_FILE).exists());
+    }
+
+    #[test]
+    fn an_empty_hosts_key_is_dropped_without_making_a_servers_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{\"font_size\": 18, \"ssh_profiles\": []}").unwrap();
+
+        Config::load_from(&config);
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(!text.contains("ssh_profiles"), "{text}");
+        assert!(text.contains("font_size"), "{text}");
+        assert!(!dir.path().join(SERVERS_FILE).exists());
+    }
+
+    #[test]
+    fn saving_writes_the_hosts_to_their_own_file_and_nowhere_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        let servers = dir.path().join(SERVERS_FILE);
+
+        // No hosts, no file.
+        Config::default().try_save_to(&config).unwrap();
+        assert!(!servers.exists());
+
+        let profile = host("prod-web", "10.0.0.5");
+        let mut cfg = Config {
+            ssh_profiles: vec![profile.clone()],
+            ..Config::default()
+        };
+        cfg.ssh_profile_frecency.insert(
+            profile.id,
+            ProfileUsage {
+                count: 2,
+                last_used: 9,
+            },
+        );
+        cfg.try_save_to(&config).unwrap();
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(!text.contains("ssh_profile"), "{text}");
+        assert!(!text.contains("10.0.0.5"), "{text}");
+
+        let (loaded, _) = Config::load_from(&config);
+        assert_eq!(loaded.ssh_profiles, vec![profile]);
+        assert_eq!(loaded.ssh_profile_frecency, cfg.ssh_profile_frecency);
+
+        // Deleting the last host empties the file rather than leaving it be.
+        let mut emptied = loaded.clone();
+        emptied.ssh_profiles.clear();
+        emptied.ssh_profile_frecency.clear();
+        emptied.try_save_to(&config).unwrap();
+        assert!(Config::load_from(&config).0.ssh_profiles.is_empty());
+    }
+
+    #[test]
+    fn a_broken_servers_file_is_kept_aside_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        let servers = dir.path().join(SERVERS_FILE);
+        let profile = host("prod-web", "10.0.0.5");
+        std::fs::write(&config, legacy_config(&profile)).unwrap();
+        std::fs::write(&servers, "{ nope").unwrap();
+
+        let (cfg, outcome) = Config::load_from(&config);
+        assert_eq!(outcome, LoadOutcome::Parsed, "config.json itself is fine");
+        assert!(cfg.servers_unreadable);
+        assert_eq!(
+            std::fs::read_to_string(servers.with_extension("json.corrupt")).unwrap(),
+            "{ nope"
+        );
+        // Nothing moved on top of it, and nothing saves over either file.
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            legacy_config(&profile)
+        );
+        assert!(cfg.try_save_to(&config).is_err());
+        assert_eq!(std::fs::read_to_string(&servers).unwrap(), "{ nope");
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            legacy_config(&profile)
+        );
+    }
+
+    #[test]
+    fn the_hosts_never_serialize_into_config_json_but_an_old_file_still_reads() {
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"ssh_profiles":[{"name":"a","host":"h"}],"verify_host_keys":false}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.ssh_profiles.len(), 1);
+        assert!(!cfg.verify_host_keys);
+        cfg.ssh_profile_frecency
+            .insert(cfg.ssh_profiles[0].id, ProfileUsage::default());
+        let value = serde_json::to_value(&cfg).unwrap();
+        assert!(value.get("ssh_profiles").is_none());
+        assert!(value.get("ssh_profile_frecency").is_none());
+        // The SSH preferences are settings like any other and stay put.
+        assert_eq!(value["verify_host_keys"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn prompt_cursor_style_defaults_to_following_cursor_style() {
+        assert_eq!(
+            Config::default().prompt_cursor_style,
+            PromptCursorStyle::Follow
+        );
+        assert_eq!(PromptCursorStyle::Follow.shape(), None);
+
+        let cfg: Config =
+            serde_json::from_str(r#"{"cursor_style": "block", "prompt_cursor_style": "bar"}"#)
+                .unwrap();
+        assert_eq!(cfg.cursor_style, CursorStyle::Block);
+        assert_eq!(cfg.prompt_cursor_style.shape(), Some(CursorStyle::Bar));
+
+        // A value this build does not know falls back rather than failing the
+        // whole config.
+        let cfg: Config = serde_json::from_str(r#"{"prompt_cursor_style": "beam"}"#).unwrap();
+        assert_eq!(cfg.prompt_cursor_style, PromptCursorStyle::Follow);
     }
 }

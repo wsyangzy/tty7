@@ -6,7 +6,7 @@ use alacritty_terminal::term::TermMode;
 use gpui::{
     App, ClipboardEntry, ClipboardItem, Context, EntityId, ExternalPaths, FocusHandle, Focusable,
     Font, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent, Pixels, ScrollDelta,
-    ScrollWheelEvent, WeakEntity, Window, actions, div, prelude::*, px,
+    ScrollWheelEvent, Task, WeakEntity, Window, actions, div, prelude::*, px,
 };
 use gpui_component::kbd::Kbd;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
@@ -27,16 +27,16 @@ use super::typeahead::{RawInput, Typeahead};
 use crate::core::actions::{
     CloseActiveTab, CopyLinkPathUnderPointer, DecreaseFontSize, ForkAgentSessionDown,
     ForkAgentSessionLeft, ForkAgentSessionRight, ForkAgentSessionUp, IncreaseFontSize, NewTab,
-    OpenLinkUnderPointer, RevealLinkUnderPointer, SendBackTab, SendTab, SplitDown, SplitRight,
-    ToggleMaximizePane,
+    OpenLinkUnderPointer, OpenLinkWithDefaultApp, RevealLinkUnderPointer, SaveAgentLaunchArgs,
+    SendBackTab, SendTab, SplitDown, SplitRight, ToggleMaximizePane,
 };
 use crate::core::config::{BellMode, Config, LinkFileOpen, MouseZoomModifier};
 use crate::core::shell_quote::quote_for_shell;
 use crate::daemon::protocol::{RemoteContext, ShellSpec};
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 
-const GRID_PAD_X: f32 = 8.;
-const GRID_PAD_Y: f32 = 4.;
+pub(super) const GRID_PAD_X: f32 = 8.;
+pub(super) const GRID_PAD_Y: f32 = 4.;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InputCaretPaint {
@@ -124,7 +124,8 @@ actions!(
         FindPrevious,
         ClearScrollback,
         InsertNewline,
-        InsertNewlineFallback
+        InsertNewlineFallback,
+        ToggleComposer
     ]
 );
 
@@ -139,6 +140,12 @@ impl gpui::EventEmitter<AuthPromptReady> for TerminalView {}
 pub struct AgentSessionChanged;
 
 impl gpui::EventEmitter<AgentSessionChanged> for TerminalView {}
+
+/// A coding agent started running in this pane: its foreground went from no
+/// agent to this one. What quick launch counts as the agent being used.
+pub struct AgentDetected(pub crate::core::cli_agent::CLIAgent);
+
+impl gpui::EventEmitter<AgentDetected> for TerminalView {}
 
 /// A file link the user clicked, on its way to whoever can show it. The
 /// terminal resolves the path — it is the only thing that knows the pane's
@@ -263,23 +270,6 @@ fn cwd_is_on_host(pane_runs_remotely: bool, host_is_local: bool) -> bool {
     }
 }
 
-/// The cwd a native SSH pane's remote shell reported, for the few readers that
-/// only need a name for it and not a host to act on it.
-///
-/// Such a pane belongs to this machine's daemon, so [`cwd_is_on_host`] rightly
-/// turns its paths away from every `Host` call — there is no host to hand them
-/// to. But the shell on the far end states them itself (OSC 7), unlike a shell
-/// that ssh'd onward from a local prompt, whose directory is only ever a guess.
-/// Only an absolute POSIX path counts: that is what a remote sshd's shell
-/// reports, and anything else is not a directory worth naming.
-fn native_ssh_cwd(
-    remote: Option<&RemoteContext>,
-    cwd: Option<std::path::PathBuf>,
-) -> Option<std::path::PathBuf> {
-    remote.filter(|r| r.kind == crate::daemon::protocol::RemoteKind::NativeSsh)?;
-    cwd.filter(|c| c.to_string_lossy().starts_with('/'))
-}
-
 /// Which path dialect a pane's output is written in.
 ///
 /// A pane running on this machine spells paths the way this OS does, and that
@@ -331,6 +321,9 @@ pub struct TerminalView {
     pub line_height_mul: f32,
     pub cell_width: Pixels,
     pub(super) line_height: Pixels,
+    /// What the grid's height leaves under its last whole row: rows are
+    /// drawn from the top, so this is empty space above the bottom padding.
+    pub(super) grid_slack: Pixels,
     /// The grid the last frame painted, and the snapshot that went with it.
     /// A frame that cannot have the terminal lock repaints this rather than
     /// waiting on the pane's reader — see [`TerminalElement::build_grid`].
@@ -404,7 +397,7 @@ pub struct TerminalView {
     /// mouse-down, latched so the menu builder — which gpui-component runs on a
     /// deferred callback, one turn after the click — can still see the
     /// modifiers the user actually held.
-    context_menu_allowed: bool,
+    pub(super) context_menu_allowed: bool,
     /// The file link the most recent right mouse-down landed on, latched for
     /// the same reason [`context_menu_allowed`](Self::context_menu_allowed)
     /// is: by the time the menu is built the pointer is only a memory.
@@ -422,6 +415,10 @@ pub struct TerminalView {
     pub search: Option<SearchState>,
     pub cursor_visible: bool,
     pub(super) search_focused: bool,
+    /// The message box docked under an agent, once it has been asked for —
+    /// see [`super::composer`].
+    pub(super) composer: Option<super::composer::Composer>,
+    pub(super) composer_focused: bool,
     pub(super) search_case_sensitive: bool,
     pub(super) search_regex: bool,
     pub(super) search_regex_error: bool,
@@ -443,6 +440,15 @@ pub struct TerminalView {
     running_since: Option<std::time::Instant>,
     running_title: String,
     running_agent: Option<crate::core::cli_agent::CLIAgent>,
+    /// The foreground agent as of the last poll, so a new one is reported
+    /// once ([`AgentDetected`]) rather than on every frame it keeps running.
+    seen_agent: Option<crate::core::cli_agent::CLIAgent>,
+    /// Whether an agent appearing here is news. A pane this view spawned is
+    /// armed from the start; one it reattached to — an app restart, a
+    /// workspace switched back to — may already be running an agent that was
+    /// counted when it started, so it arms only once its shell is seen back
+    /// at the prompt with no agent in front.
+    agent_detection_armed: bool,
     last_agent_status: Option<crate::core::cli_agent::AgentStatus>,
     last_agent_message: Option<String>,
     agent_bell_pending: bool,
@@ -451,6 +457,10 @@ pub struct TerminalView {
     agent_attention_unread: bool,
     last_agent_session: (Option<String>, Option<Vec<String>>),
     agent_turn_started: Option<std::time::Instant>,
+    /// The "finished" notification for a turn that just reached `Done`,
+    /// waiting out [`AGENT_DONE_SETTLE`]. Dropped — and so never sent — when
+    /// the status moves on first.
+    pending_finish_notice: Option<Task<()>>,
     agent_was_rich: bool,
     agent_result_unread: bool,
     keep_unread_on_focus: bool,
@@ -472,7 +482,6 @@ pub struct TerminalView {
     history_counts: std::collections::HashMap<String, u32>,
     history_cwds: std::collections::HashMap<String, std::collections::HashSet<String>>,
     history_meta: std::collections::HashMap<String, super::history::EntryMeta>,
-    history_ranked: Vec<String>,
     history_frecency: Vec<f64>,
     history_scope: super::history::Scope,
     /// What each scope this pane has already loaded held when it was left, so
@@ -526,8 +535,10 @@ pub struct TerminalView {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct HoveredLink {
-    pub start: Point,
-    pub end: Point,
+    /// The cells to underline, one run per row. A link in a table cell
+    /// shares its rows with other cells, so its extent is not always one
+    /// stretch of the grid from a start to an end.
+    pub runs: Vec<(Point, Point)>,
     /// Whether the modifier that would open this link is down.
     ///
     /// A link underlines as soon as the pointer reaches it, so the user can
@@ -542,8 +553,9 @@ pub(super) struct HoveredLink {
 /// What sits under a cell, once the grid has been read.
 #[derive(Clone)]
 enum GridLink {
-    /// An OSC 8 hyperlink the emitter declared, with the extent it declared.
-    Hyperlink(String, Point, Point),
+    /// An OSC 8 hyperlink the emitter declared, with the extent it declared,
+    /// one run per row.
+    Hyperlink(String, Vec<(Point, Point)>),
     /// The logical line the cell belongs to, the grid point of every character
     /// in it, and which of those the cell is. When that line bridged a bare
     /// path across a TUI margin, the line as the terminal wrapped it follows:
@@ -558,7 +570,8 @@ enum GridLink {
 
 /// The outcome of asking what a cell links to.
 enum LinkAt {
-    Found(LinkTarget, Point, Point),
+    /// A link, and the cells it covers as one run per row.
+    Found(LinkTarget, Vec<(Point, Point)>),
     /// A token that parses as a path, that nothing has answered for.
     /// `pending` separates the two reasons: the path is not there, or the host
     /// that would know has not replied yet.
@@ -724,6 +737,13 @@ const INTEGRATION_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 
 const OPPORTUNISTIC_GIT_GAP: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// How long a pane whose repository is still unanswered waits before asking
+/// again. Only a probe that failed leaves it that way, and whatever broke it
+/// (a remote link mid-reconnect, a `git` that would not start) is gone in
+/// seconds, not milliseconds — nor worth a request every poll tick while it
+/// lasts.
+const GIT_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How long a title the program set has to stand before the tab adopts it.
 ///
 /// Long enough that a command which is over almost as soon as it started never
@@ -731,12 +751,19 @@ const OPPORTUNISTIC_GIT_GAP: std::time::Duration = std::time::Duration::from_mil
 /// wait for it is still what the reader is doing.
 const TITLE_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// How long a turn has to stay finished before it is announced. Long enough
+/// for a queued message or a `Stop` hook to start the next turn, short enough
+/// that the notification still reads as the moment the agent stopped.
+const AGENT_DONE_SETTLE: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// What a pane does with a title the program just set — see
 /// `TerminalView::set_title_when_settled`.
 #[derive(Debug, PartialEq, Eq)]
 enum TitleSettle {
     /// The tab already reads this, so whatever was waiting to replace it never
-    /// has to happen. This is the case a short command lands in.
+    /// has to happen. This is the case a short command lands in, and the one an
+    /// agent's spinner lands in: a frame that only changes the status mark in
+    /// front of the title reads the same on the tab, so it asks for no repaint.
     Revert,
     /// Hold it: a wait is already running and adopts the newest title when it
     /// elapses. Restarting the wait instead would let a program that rewrites
@@ -748,7 +775,7 @@ enum TitleSettle {
 }
 
 fn settle_title(showing: &str, waiting: bool, incoming: &str) -> TitleSettle {
-    if incoming == showing {
+    if tty7_core::core::tab_view::same_title_ignoring_status_mark(incoming, showing) {
         return TitleSettle::Revert;
     }
     match waiting {
@@ -763,6 +790,9 @@ const MAX_HISTORY_BYTES: u64 = 4 << 20;
 enum GitRefresh {
     Edge,
     Opportunistic,
+    /// Nothing happened; the cache just has no answer for this pane's cwd
+    /// yet, because the last probe failed. Throttled by [`GIT_RETRY_GAP`].
+    Retry,
 }
 
 fn known_pty_shim(fg: &str) -> Option<&'static str> {
@@ -1030,19 +1060,27 @@ impl TerminalView {
         notify_allowed: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.accept_agent_notice(source, kind, body) && notify_allowed {
+            self.notify_pane(lead, body, cx);
+        }
+    }
+
+    fn accept_agent_notice(
+        &mut self,
+        source: AgentNoticeSource,
+        kind: AgentNoticeKind,
+        body: &str,
+    ) -> bool {
         let session = self.terminal.agent_session();
         // Record suppressed events as consumed, too: changing focus or settings
         // must not replay the same alert through its second notification source.
-        if self.agent_notice_history.accept(
+        self.agent_notice_history.accept(
             source,
             kind,
             session.as_ref(),
             body,
             std::time::Instant::now(),
-        ) && notify_allowed
-        {
-            self.notify_pane(lead, body, cx);
-        }
+        )
     }
 
     /// Notify about this pane, with a title describing where it lives and a
@@ -1052,6 +1090,50 @@ impl TerminalView {
     fn notify_pane(&self, lead: Option<&str>, body: &str, cx: &mut Context<Self>) {
         let title = self.notification_title(lead, cx);
         super::remote::notify_desktop_for_pane(Some(&title), body, Some(cx.entity_id()));
+    }
+
+    /// Desktop notifications the program wrote (OSC 9, 99, 777), such as
+    /// Claude Code's with its Notifications setting on `ghostty`, `kitty` or
+    /// `iterm2`. The agent's Waiting mark on the tab is the daemon's doing.
+    ///
+    /// Correlate with hooks and BEL before applying the per-pane rate budget,
+    /// so duplicate sources cannot consume the budget or replay after focus
+    /// changes. The independent Agent notification setting covers OSC too.
+    fn show_program_notes(
+        &mut self,
+        notify_allowed: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let notes = self.terminal.take_osc_notes();
+        let watched = window.is_window_active() && self.focus_handle.is_focused(window);
+        if !notes.is_empty() && self.agent().is_some() && !watched {
+            self.agent_attention_unread = true;
+            cx.notify();
+        }
+        let notes: Vec<_> = notes
+            .into_iter()
+            .filter(|(_, body)| {
+                self.accept_agent_notice(AgentNoticeSource::Osc, AgentNoticeKind::Explicit, body)
+                    && notify_allowed
+            })
+            .collect();
+        // Asked on every poll, so the rest are said once a flood stops too,
+        // and while notes are held back, so a stale count never surfaces
+        // minutes later.
+        let (notes, dropped) = self
+            .terminal
+            .pace_osc_notes(notes, std::time::Instant::now());
+        if !notify_allowed {
+            return;
+        }
+        let agent = self.terminal.foreground_agent().map(|a| a.display_name());
+        if dropped {
+            self.notify_pane(agent, t(L10nKey::ProgramNotesDropped), cx);
+        }
+        for (title, body) in notes {
+            self.notify_pane(title.as_deref().or(agent), &body, cx);
+        }
     }
 
     fn notification_title(&self, lead: Option<&str>, cx: &App) -> String {
@@ -1097,15 +1179,7 @@ fn ring_system_bell() -> bool {
 }
 
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    if bracketed {
-        let text = text.replace("\r\n", "\n");
-        let mut bytes = b"\x1b[200~".to_vec();
-        bytes.extend(text.bytes().filter(|&b| b != 0x1b));
-        bytes.extend_from_slice(b"\x1b[201~");
-        bytes
-    } else {
-        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
-    }
+    tty7_core::core::paste::paste_bytes(text.as_bytes(), bracketed)
 }
 
 /// A line the shell can be handed byte for byte, as if it had been typed at its
@@ -1138,7 +1212,7 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 /// — shows no penalty this harness can resolve. Halving the bound would halve
 /// the worst case; the number is a judgement about how much latency a long
 /// typed line may pay, not something the curve picks out.
-fn types_cleanly(line: &str) -> bool {
+pub(super) fn types_cleanly(line: &str) -> bool {
     line.len() <= 512 && !line.chars().any(char::is_control)
 }
 
@@ -1189,21 +1263,30 @@ fn trim_trailing_spaces(text: &str) -> String {
         .join("\n")
 }
 
-fn clipboard_paste_text(item: &ClipboardItem, shell: Option<&str>) -> Option<String> {
-    let escaped: Vec<String> = item
-        .entries()
+/// The local files the clipboard carries — a Finder or Explorer Copy on a file
+/// puts its path there, not its bytes.
+fn clipboard_paths(item: &ClipboardItem) -> Vec<std::path::PathBuf> {
+    item.entries()
         .iter()
         .filter_map(|e| match e {
             ClipboardEntry::ExternalPaths(paths) => Some(paths.paths()),
             _ => None,
         })
         .flatten()
-        .map(|p| quote_for_shell(&p.to_string_lossy(), shell))
-        .collect();
-    if !escaped.is_empty() {
-        return Some(escaped.join(" "));
-    }
-    item.text()
+        .cloned()
+        .collect()
+}
+
+/// Paths as one line of shell words, trailing space included so whatever is
+/// typed next starts a word of its own.
+pub(super) fn pasted_paths_text(paths: &[String], shell: Option<&str>) -> String {
+    let words: Vec<String> = paths.iter().map(|p| quote_for_shell(p, shell)).collect();
+    format!("{} ", words.join(" "))
+}
+
+/// Whether the clipboard carries files rather than (only) text.
+pub(super) fn clipboard_has_paths(item: &ClipboardItem) -> bool {
+    !clipboard_paths(item).is_empty()
 }
 
 fn write_clipboard_image(img: &gpui::Image) -> Option<std::path::PathBuf> {
@@ -1373,29 +1456,177 @@ fn files_cwd(
     }
 }
 
-/// The staged image's path as the pane's own filesystem spells it.
+/// A local path — a staged image, a copied or dropped file — as the pane's own
+/// filesystem spells it.
 ///
 /// A WSL pane shares this machine's disk but not its path syntax: an agent in
 /// there reads `/mnt/c/…` and cannot open `C:\…` at all, which is why the
 /// upload route skips WSL — there is nothing to copy, only a name to rewrite.
 /// A path with no mapping falls back to the Windows one, which at least tells
 /// the user where the file is.
-fn staged_path_for_pane(local: &str, shares_localhost: bool) -> String {
+fn local_path_for_pane(local: &str, shares_localhost: bool) -> String {
     if shares_localhost {
         return wsl_path(local).unwrap_or_else(|| local.to_string());
     }
     local.to_string()
 }
 
-/// Staging images under the SSH user's own home keeps them out of the
+/// Staging pastes under the SSH user's own home keeps them out of the
 /// world-writable `/tmp`, where any local account could pre-create the
-/// directory, read what lands in it, or swap a pasted screenshot for one of
-/// its own before the pane's agent opens it.
+/// directory, read what lands in it, or swap a pasted file for one of its own
+/// before the pane's agent opens it.
 const REMOTE_CLIPBOARD_PATH: [&str; 3] = [".cache", "tty7", "clipboard"];
 
 /// Owner-only, and *only* owner: a staging directory anyone else can enter is
-/// one anyone else can read the pasted screenshots out of.
+/// one anyone else can read the pasted files out of.
 const REMOTE_CLIPBOARD_MODE: u32 = 0o700;
+
+/// How long a paste stays staged on the remote. Long enough to outlive any
+/// conversation that still refers to it; a week of pasted spreadsheets is
+/// what would otherwise pile up in the user's home forever.
+const REMOTE_CLIPBOARD_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// A fresh name for one paste's own directory under the staging directory.
+///
+/// Each paste gets a directory so every file keeps its real name — which is
+/// what the agent reads, and `report.xlsx` says far more than a hash — without
+/// two pastes of the same name overwriting each other.
+fn paste_dir_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    format!("paste-{nanos:x}{n:x}")
+}
+
+/// Whether a staging entry has outlived [`REMOTE_CLIPBOARD_TTL_SECS`]. An
+/// entry with no mtime (`0`) is left alone: its age is unknown, not great.
+fn staged_entry_expired(mtime: u64, now: u64) -> bool {
+    mtime != 0 && now.saturating_sub(mtime) > REMOTE_CLIPBOARD_TTL_SECS
+}
+
+/// Remove the staging directory's expired entries. Best effort: a failure
+/// here costs disk space, never a paste, so nothing is reported.
+fn prune_remote_clipboard_dir(route: &crate::ui::sftp::SftpRoute, dir: &str) {
+    let Ok(entries) = route.list(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    for entry in entries {
+        if entry.name == "." || entry.name == ".." || !staged_entry_expired(entry.mtime, now) {
+            continue;
+        }
+        remove_remote_tree(
+            route,
+            &crate::daemon::ssh::sftp::remote_join(dir, &entry.name),
+            entry.kind,
+            0,
+        );
+    }
+}
+
+/// Delete a remote file or directory tree. A symlink is removed as a link and
+/// never followed — the tree is ours, where it points is not.
+fn remove_remote_tree(
+    route: &crate::ui::sftp::SftpRoute,
+    path: &str,
+    kind: crate::daemon::protocol::SftpEntryKind,
+    depth: usize,
+) {
+    use crate::daemon::protocol::{SftpEntryKind, SftpOp};
+    // A pasted folder is as deep as it was on disk; this bounds a pathological
+    // one rather than any real one.
+    const MAX_DEPTH: usize = 64;
+    if kind != SftpEntryKind::Dir {
+        route.op(SftpOp::RemoveFile {
+            path: path.to_string(),
+        });
+        return;
+    }
+    if depth < MAX_DEPTH
+        && let Ok(children) = route.list(path)
+    {
+        for child in children {
+            if child.name == "." || child.name == ".." {
+                continue;
+            }
+            let child_path = crate::daemon::ssh::sftp::remote_join(path, &child.name);
+            remove_remote_tree(route, &child_path, child.kind, depth + 1);
+        }
+    }
+    route.op(SftpOp::RemoveDir {
+        path: path.to_string(),
+    });
+}
+
+/// One local path handed to the remote: where it went and the transfer
+/// carrying it, or why it never left.
+struct PasteUpload {
+    local: std::path::PathBuf,
+    started: Result<StartedUpload, String>,
+}
+
+struct StartedUpload {
+    remote: String,
+    job: u64,
+    is_dir: bool,
+}
+
+/// Start uploading `sources` into a new directory of their own under the
+/// staging directory `dir`. Blocking, like everything that talks to the
+/// daemon, so this runs off the UI thread. `Err` means the paste's directory
+/// could not be made and nothing was started; a source that could not be
+/// started on its own is reported in its own entry.
+fn start_paste_uploads(
+    route: &crate::ui::sftp::SftpRoute,
+    pane_id: u64,
+    dir: &str,
+    sources: &[std::path::PathBuf],
+) -> Result<Vec<PasteUpload>, String> {
+    use crate::daemon::protocol::{SftpOp, SftpOpResult, SftpTransferKind, SftpTransferSpec};
+    let paste_dir = crate::daemon::ssh::sftp::remote_join(dir, &paste_dir_name());
+    if let SftpOpResult::Error(e) = route.op(SftpOp::Mkdir {
+        path: paste_dir.clone(),
+    }) {
+        return Err(e);
+    }
+    Ok(sources
+        .iter()
+        .map(|local| {
+            let started = (|| {
+                let name = local
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .filter(|n| crate::daemon::ssh::sftp::safe_local_name(n))
+                    .ok_or_else(|| format!("{} has no file name", local.display()))?;
+                let is_dir = std::fs::metadata(local)
+                    .map_err(|e| format!("{}: {e}", local.display()))?
+                    .is_dir();
+                let remote = crate::daemon::ssh::sftp::remote_join(&paste_dir, &name);
+                let job = route.transfer_start(SftpTransferSpec {
+                    pane_id,
+                    kind: SftpTransferKind::Upload,
+                    local: local.clone(),
+                    remote: remote.clone(),
+                    recursive: is_dir,
+                })?;
+                Ok(StartedUpload {
+                    remote,
+                    job,
+                    is_dir,
+                })
+            })();
+            PasteUpload {
+                local: local.clone(),
+                started,
+            }
+        })
+        .collect())
+}
 
 /// Whether a prepared staging directory may be uploaded into.
 ///
@@ -1576,8 +1807,24 @@ impl TerminalView {
                     log::warn!("attach to pane {id} went unanswered ({e:#}); spawning fresh");
                     None
                 }
-                Err(e) => {
+                Err(e) if crate::terminal::attach_refused(&e) => {
                     log::info!("pane {id} is gone on its machine ({e:#}); spawning fresh");
+                    None
+                }
+                // The daemon never got to say either way: the link to its
+                // machine would not open, or broke before it answered. The pane
+                // is most likely still running over there, so a fresh shell in
+                // its place would orphan it — its scrollback, its agent session,
+                // whatever it was doing — and put a stranger in its tab. Fail,
+                // and let a retry reach the pane itself.
+                Err(e) if !route.is_local() => {
+                    log::info!("pane {id} could not be reached to reattach ({e:#})");
+                    return Err(e.context(format!(
+                        "could not reach pane {id}, which may still be running"
+                    )));
+                }
+                Err(e) => {
+                    log::info!("pane {id} is gone ({e:#}); spawning fresh");
                     None
                 }
             },
@@ -1643,18 +1890,18 @@ impl TerminalView {
         self.owner_workspace
     }
 
+    /// Dials `spec` through the local daemon. `remote_start_dir` is a
+    /// directory on the far host — see [`ClientMsg::SpawnNativeSsh`]'s `cwd`
+    /// — and never a local one.
+    ///
+    /// [`ClientMsg::SpawnNativeSsh`]: crate::daemon::protocol::ClientMsg::SpawnNativeSsh
     pub fn spawn_native_ssh_terminal(
         spec: Box<crate::daemon::protocol::NativeSshSpec>,
-        working_directory: Option<std::path::PathBuf>,
+        remote_start_dir: Option<std::path::PathBuf>,
     ) -> anyhow::Result<NativeSshParts> {
         let persist = Box::new(spec.without_secrets());
-        let (terminal, pane_id) = RemoteTerminal::spawn_native_ssh(
-            TermSize::new(80, 24),
-            8,
-            17,
-            working_directory,
-            spec,
-        )?;
+        let (terminal, pane_id) =
+            RemoteTerminal::spawn_native_ssh(TermSize::new(80, 24), 8, 17, remote_start_dir, spec)?;
         Ok(NativeSshParts {
             terminal,
             pane_id,
@@ -1699,6 +1946,7 @@ impl TerminalView {
             .map(crate::core::config::gpui_font_features);
         let report_mouse = config.mouse_reporting;
         let prompt_editor = config.prompt_editor;
+        let agent_detection_armed = !terminal.reattached();
         let mut font = gpui::font(font_family);
         font.fallbacks = Some(gpui::FontFallbacks::from_fonts(fallbacks.clone()));
         if let Some(features) = &font_features {
@@ -1827,6 +2075,8 @@ impl TerminalView {
         })
         .detach();
 
+        super::color_scheme::watch(cx);
+
         let displayed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let entity_id = cx.entity().entity_id();
         cx.default_global::<DisplayedRegistry>()
@@ -1849,12 +2099,6 @@ impl TerminalView {
         window.focus(&focus_handle, cx);
 
         let history = super::history::load(&super::history::Scope::Local);
-        let history_ranked = super::history::rank_by_frecency(
-            &history.entries,
-            &history.counts,
-            &history.cwds,
-            None,
-        );
         let history_frecency =
             super::history::frecency_scores(&history.entries, &history.counts, &history.cwds, None);
 
@@ -1880,6 +2124,7 @@ impl TerminalView {
             line_height_mul,
             cell_width: px(8.),
             line_height: px(17.),
+            grid_slack: px(0.),
             grid_buf: Vec::new(),
             grid_snap: None,
             frame_alt_screen: false,
@@ -1922,6 +2167,8 @@ impl TerminalView {
             cursor_visible: true,
             dim: 1.,
             search_focused: false,
+            composer: None,
+            composer_focused: false,
             search_case_sensitive: false,
             search_regex: false,
             search_regex_error: false,
@@ -1935,6 +2182,8 @@ impl TerminalView {
             running_since: None,
             running_title: String::new(),
             running_agent: None,
+            seen_agent: None,
+            agent_detection_armed,
             last_agent_status: None,
             last_agent_message: None,
             agent_bell_pending: false,
@@ -1942,6 +2191,7 @@ impl TerminalView {
             agent_attention_unread: false,
             last_agent_session: (None, None),
             agent_turn_started: None,
+            pending_finish_notice: None,
             agent_was_rich: false,
             agent_result_unread: false,
             keep_unread_on_focus: false,
@@ -1956,7 +2206,6 @@ impl TerminalView {
             history_counts: history.counts,
             history_cwds: history.cwds,
             history_meta: history.meta,
-            history_ranked,
             history_frecency,
             history_scope: super::history::Scope::Local,
             history_cache: Vec::new(),
@@ -2045,6 +2294,16 @@ impl TerminalView {
     /// way.
     pub(crate) fn stated_title(&self) -> Option<&str> {
         stated_title(&self.title)
+    }
+
+    /// `name` with the suffix that says how this pane ended.
+    fn ended_title(&self, name: &str) -> String {
+        let key = if self.workspace().is_some() && !self.terminal.child_exited() {
+            L10nKey::PaneTitleDisconnected
+        } else {
+            L10nKey::PaneTitleProcessExited
+        };
+        t_fmt(key, &[("title", name)])
     }
 
     /// Sets how opaque the pane wants this terminal painted; the pane leaf
@@ -2143,7 +2402,13 @@ impl TerminalView {
     }
 
     fn accepts_input(&self, cx: &gpui::App) -> bool {
-        let Some(ws) = self.workspace().map(|w| w.workspace) else {
+        // A local pane has no `PaneWorkspace`, but the window that owns it can
+        // still have been taken over by a remote client.
+        let Some(ws) = self
+            .workspace()
+            .map(|w| w.workspace)
+            .or(self.owner_workspace)
+        else {
             return true;
         };
         crate::ui::remote_workspace::workspace_accepts_input(cx, ws)
@@ -2176,6 +2441,7 @@ impl TerminalView {
         self.last_reported_focus = None;
         self.agent_bell_pending = false;
         self.agent_notice_history = AgentNoticeHistory::default();
+        self.pending_finish_notice = None;
         self.relink_abandoned = false;
         self.relink_inflight = false;
         self.title = self.default_title.clone();
@@ -2187,6 +2453,7 @@ impl TerminalView {
         self.terminal.detach_link();
         self.agent_bell_pending = false;
         self.agent_notice_history = AgentNoticeHistory::default();
+        self.pending_finish_notice = None;
         cx.notify();
     }
 
@@ -2299,10 +2566,23 @@ impl TerminalView {
         self.git_status_cwd.as_deref()
     }
 
-    /// See [`native_ssh_cwd`]. `None` for every pane that is not a native SSH
-    /// one — those either have a `git_status_cwd` or have no cwd to name.
-    pub fn native_ssh_cwd(&self) -> Option<std::path::PathBuf> {
-        native_ssh_cwd(self.remote_context().as_ref(), self.cwd())
+    /// This pane sits somewhere the repo cache cannot place yet — neither a
+    /// repository nor "not one" — and a retry is due. Only a failed probe
+    /// leaves a cwd that way; without this it would wait for the cwd to change
+    /// or a command to finish before anyone asked again.
+    ///
+    /// Read-only on purpose: this runs on every poll tick, and the cache is a
+    /// global whose every mutable touch redraws the window — while a probe is
+    /// in flight or throttled, the answer has to be "no" at no cost.
+    fn git_retry_due(&self, cx: &App) -> bool {
+        let Some(cwd) = self.git_status_cwd.as_deref() else {
+            return false;
+        };
+        let Some(cache) = cx.try_global::<crate::terminal::git_status::GitStatusCache>() else {
+            return false;
+        };
+        cache.known_repo_for(self.host_id, cwd).is_none()
+            && cache.probe_due(self.host_id, cwd, GIT_RETRY_GAP)
     }
 
     /// Plant the cwd the git-status poll would have found. For tests that
@@ -2404,7 +2684,7 @@ impl TerminalView {
     /// answers from the platform — PowerShell on Windows, POSIX elsewhere.
     /// The one pane that guess is wrong for is a cmd.exe pane that has not
     /// reported in yet.
-    fn shell_program(&self) -> Option<String> {
+    pub(super) fn shell_program(&self) -> Option<String> {
         self.shell_spec.as_ref().map(|s| s.program.clone())
     }
 
@@ -2572,17 +2852,7 @@ impl TerminalView {
                 self.pending_title = None;
                 // The pane keeps answering to its own name (an SSH pane's
                 // host, #438) — only the state suffix is localized (#602).
-                self.title = if self.workspace().is_some() && !self.terminal.child_exited() {
-                    t_fmt(
-                        L10nKey::PaneTitleDisconnected,
-                        &[("title", &self.default_title)],
-                    )
-                } else {
-                    t_fmt(
-                        L10nKey::PaneTitleProcessExited,
-                        &[("title", &self.default_title)],
-                    )
-                };
+                self.title = self.ended_title(&self.default_title);
                 if self.terminal.child_exited() {
                     cx.emit(ChildExited);
                 }
@@ -2675,6 +2945,17 @@ impl TerminalView {
         };
         let ks = reshaped.as_ref().unwrap_or(&ev.keystroke);
         let m = &ks.modifiers;
+
+        if self.composer_focused {
+            if ks.key == "escape" {
+                self.composer_escape(window, cx);
+                cx.stop_propagation();
+            } else if ks.key == "c" && m.control && !m.platform && !m.alt && !m.shift {
+                self.composer_interrupt(window, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
 
         if self.search.is_some() && self.search_focused {
             if ks.key == "escape" {
@@ -3391,7 +3672,7 @@ impl TerminalView {
         self.scroll_frac = 0.;
     }
 
-    fn send_to_pty(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+    pub(super) fn send_to_pty(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if self.terminal.exited || !self.accepts_input(cx) {
             return;
         }
@@ -3424,6 +3705,11 @@ impl TerminalView {
 
     pub fn paste(&mut self, text: String, cx: &mut Context<Self>) {
         if !self.accepts_input(cx) {
+            return;
+        }
+        // The agent's input is under the box, so a paste meant for it goes
+        // into the box — out of sight under it, it would be sent unseen.
+        if self.composer_takes_typing(&text, cx) {
             return;
         }
         // Same reason as `commit_text`: what is pasted lands on the prompt, so
@@ -3668,7 +3954,12 @@ impl TerminalView {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
-        if let Some(text) = clipboard_paste_text(&item, self.shell_program().as_deref()) {
+        let paths = clipboard_paths(&item);
+        if !paths.is_empty() {
+            self.paste_local_paths(paths, cx);
+            return;
+        }
+        if let Some(text) = item.text() {
             self.paste(text, cx);
             return;
         }
@@ -3683,21 +3974,75 @@ impl TerminalView {
         }
     }
 
-    fn drop_files(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
-        let shell = self.shell_program();
-        let text = paths
-            .paths()
-            .iter()
-            .map(|p| quote_for_shell(&p.to_string_lossy(), shell.as_deref()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        if text.is_empty() {
+    pub(super) fn drop_files(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        self.paste_local_paths(paths.paths().to_vec(), cx);
+    }
+
+    /// A row dragged out of a remote Files tree names a file on that remote,
+    /// not here: there is nothing to upload, and the path is pasted as the
+    /// tree spells it.
+    pub(super) fn drop_remote_path(
+        &mut self,
+        drag: &crate::ui::file_tree::RemotePathDrag,
+        cx: &mut Context<Self>,
+    ) {
+        self.paste_paths(vec![drag.path.to_string_lossy().into_owned()], cx);
+    }
+
+    /// Paste paths already spelled the way the pane's host reads them: into
+    /// the composer as attachments when it has the keyboard, and as shell
+    /// words onto the line otherwise. Every route that turns files into
+    /// something to paste — a drop, a copied file, a screenshot, an upload to
+    /// a remote pane — ends here.
+    fn paste_paths(&mut self, spelled: Vec<String>, cx: &mut Context<Self>) {
+        let Some(spelled) = self.composer_takes_paths(spelled, cx) else {
+            return;
+        };
+        let text = pasted_paths_text(&spelled, self.shell_program().as_deref());
+        self.paste(text, cx);
+    }
+
+    /// Paste files that live on this machine so the pane's program can open
+    /// them: uploaded first when the pane runs on an SSH host, renamed for a
+    /// WSL pane, and pasted as they are everywhere else.
+    pub(super) fn paste_local_paths(
+        &mut self,
+        paths: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
             return;
         }
-        self.paste(format!("{text} "), cx);
+        // Every step of an upload is a blocking daemon round trip, which a
+        // keystroke handler must not make, so a remote pane pastes from a
+        // background task and this returns without touching the line.
+        if self.upload_for_remote(paths.clone(), cx) {
+            return;
+        }
+        // The upload declined: a local pane, a WSL pane, which needs a rewrite
+        // rather than a transfer, or a workspace with no SSH spec to
+        // piggyback on.
+        let shares_localhost = self
+            .workspace
+            .as_ref()
+            .is_some_and(|w| w.shares_localhost());
+        let spelled: Vec<String> = paths
+            .iter()
+            .map(|p| local_path_for_pane(&p.to_string_lossy(), shares_localhost))
+            .collect();
+        self.paste_paths(spelled, cx);
     }
 
     fn paste_clipboard_image(&mut self, img: &gpui::Image, cx: &mut Context<Self>) {
+        // A screenshot pasted into the composer is one of its attachments,
+        // shown as a chip like a copied file. Forwarded as SYN it would land
+        // in the agent's own input, hidden under the box.
+        if self.composer_takes_files()
+            && let Some(path) = write_clipboard_image(img)
+        {
+            self.paste_local_paths(vec![path], cx);
+            return;
+        }
         if self.paste_clipboard_image_as_path(img, cx) {
             return;
         }
@@ -3718,66 +4063,52 @@ impl TerminalView {
         let Some(path) = write_clipboard_image(img) else {
             return false;
         };
-        // SSH panes can't see the local temp file, so the image is uploaded and
-        // the *remote* path pasted instead. Every step of that needs a blocking
-        // daemon round trip, which a keystroke handler must not do, so the
-        // remote pane pastes from a background task and this returns without
-        // touching the line.
-        if self.upload_image_for_remote(&path, cx) {
-            return true;
-        }
-        // The upload declined: a WSL pane, which needs a rewrite rather than a
-        // transfer, or a workspace with no SSH spec to piggyback on. A macOS
-        // pane only reaches this line when it is remote — a local one returned
-        // above — so pasting the path is right on every platform, and staying
-        // silent here would be the very no-op this route exists to avoid.
-        let shares_localhost = self
-            .workspace
-            .as_ref()
-            .is_some_and(|w| w.shares_localhost());
-        let path = staged_path_for_pane(&path.to_string_lossy(), shares_localhost);
-        let text = quote_for_shell(&path, self.shell_program().as_deref());
-        self.paste(format!("{text} "), cx);
+        // A macOS pane only gets here when it is remote — a local one returned
+        // above — so pasting a path is right on every platform, and staying
+        // silent would be the very no-op this route exists to avoid.
+        self.paste_local_paths(vec![path], cx);
         true
     }
 
-    /// Upload a locally staged clipboard image to the pane's remote host and
-    /// paste the remote path, all off the UI thread. Answers whether this pane
-    /// took the paste over; `false` means a local, WSL, or spec-less pane the
-    /// caller should paste the local path for.
+    /// Upload local files to the pane's remote host and paste their remote
+    /// paths, all off the UI thread. Answers whether this pane took the paste
+    /// over; `false` means a local, WSL, or spec-less pane the caller should
+    /// paste the local paths for.
     ///
-    /// The upload itself still outlives the paste — it has to, or Ctrl+V would
-    /// stall on the wire — so the job is watched to completion and a failure
-    /// at any point warns the user that the path they were handed is dangling.
-    fn upload_image_for_remote(&mut self, local: &std::path::Path, cx: &mut Context<Self>) -> bool {
-        use crate::daemon::protocol::{SftpTransferKind, SftpTransferSpec};
+    /// The paste lands as soon as the transfers start — Ctrl+V must not stall
+    /// on the wire — and each file appears at its path only once it is whole,
+    /// since the upload writes a temporary name and renames it into place. The
+    /// transfers are watched to the end, and a failure warns the user that the
+    /// path they were handed is dangling.
+    fn upload_for_remote(
+        &mut self,
+        sources: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(spec) = remote_paste_spec(self.workspace.as_ref(), self.ssh_spec.as_deref())
         else {
             return false;
         };
         let host = format!("{}@{}", spec.user, spec.host);
-        // The only caller stages through `write_clipboard_image`, so this
-        // holds; a name that could not stand alone as a remote path component
-        // would be a bug worth failing on rather than joining blindly.
-        let name = local
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .filter(|n| crate::daemon::ssh::sftp::safe_local_name(n));
-        let Some(name) = name else {
-            log::warn!("refusing to upload a clipboard image named {local:?}");
-            return false;
-        };
         let route = crate::ui::sftp::SftpRoute::new(self.pane_id, self.workspace.clone());
         let cached = self.remote_clipboard_dir.clone();
-        let local = local.to_path_buf();
         let pane_id = self.pane_id;
         cx.spawn(async move |this, cx| {
             let prepared = match cached {
                 Some(dir) => Ok(dir),
                 None => {
                     let route = route.clone();
-                    cx.background_spawn(async move { prepare_remote_clipboard_dir(&route) })
-                        .await
+                    cx.background_spawn(async move {
+                        let prepared = prepare_remote_clipboard_dir(&route);
+                        // Only on the pane's first paste, which is the only
+                        // time the directory is prepared: one listing, cheap
+                        // next to the upload that follows it.
+                        if let Ok(dir) = &prepared {
+                            prune_remote_clipboard_dir(&route, dir);
+                        }
+                        prepared
+                    })
+                    .await
                 }
             };
             let dir = match this.update(cx, |view, _| {
@@ -3787,65 +4118,76 @@ impl TerminalView {
                 Ok(Some(dir)) => dir,
                 Ok(None) => {
                     let reason = prepared.unwrap_or_else(|e| e);
-                    Self::paste_local_image_path(&this, cx, &local, &host, &reason);
+                    Self::paste_local_fallback(&this, cx, &sources, &host, &reason);
                     return;
                 }
                 Err(_) => return,
             };
-            let remote = crate::daemon::ssh::sftp::remote_join(&dir, &name);
             let started = {
-                let (route, remote, local) = (route.clone(), remote.clone(), local.clone());
-                cx.background_spawn(async move {
-                    route.transfer_start(SftpTransferSpec {
-                        pane_id,
-                        kind: SftpTransferKind::Upload,
-                        local,
-                        remote,
-                        recursive: false,
-                    })
-                })
+                let (route, sources) = (route.clone(), sources.clone());
+                cx.background_spawn(
+                    async move { start_paste_uploads(&route, pane_id, &dir, &sources) },
+                )
                 .await
             };
-            let job = match started {
-                Ok(job) => job,
+            let uploads = match started {
+                Ok(uploads) => uploads,
                 Err(reason) => {
-                    Self::paste_local_image_path(&this, cx, &local, &host, &reason);
+                    Self::paste_local_fallback(&this, cx, &sources, &host, &reason);
                     return;
                 }
             };
-            if this
-                .update(cx, |view, cx| {
-                    let text = quote_for_shell(&remote, view.shell_program().as_deref());
-                    view.paste(format!("{text} "), cx)
+            // A source that never left is pasted by its local path, so the
+            // line still says which file was meant.
+            let spelled: Vec<String> = uploads
+                .iter()
+                .map(|u| match &u.started {
+                    Ok(s) => s.remote.clone(),
+                    Err(_) => u.local.to_string_lossy().into_owned(),
                 })
-                .is_err()
-            {
+                .collect();
+            let pasted = this.update_in(cx, |view, window, cx| {
+                view.paste_paths(spelled, cx);
+                for u in &uploads {
+                    if let Err(reason) = &u.started {
+                        view.warn_paste_upload_failed(&u.local, &host, reason, window, cx);
+                    }
+                }
+            });
+            if pasted.is_err() {
                 return;
             }
-            if let Err(reason) = Self::watch_upload(route, job, &remote, cx).await {
-                let _ = this.update_in(cx, |view, window, cx| {
-                    view.warn_image_upload_failed(&host, &reason, window, cx);
-                });
+            for u in uploads {
+                let Ok(started) = u.started else { continue };
+                if let Err(reason) = Self::watch_upload(route.clone(), &started, cx).await {
+                    let _ = this.update_in(cx, |view, window, cx| {
+                        view.warn_paste_upload_failed(&u.local, &host, &reason, window, cx);
+                    });
+                }
             }
         })
         .detach();
         true
     }
 
-    /// Fall back to the local path when the remote staging directory cannot be
-    /// prepared — the paste is never dropped — and say why it is local.
-    fn paste_local_image_path(
+    /// Fall back to the local paths when nothing could be staged on the remote
+    /// — the paste is never dropped — and say why they are local.
+    fn paste_local_fallback(
         this: &gpui::WeakEntity<Self>,
         cx: &mut gpui::AsyncApp,
-        local: &std::path::Path,
+        sources: &[std::path::PathBuf],
         host: &str,
         reason: &str,
     ) {
-        let local = local.to_string_lossy().into_owned();
+        let spelled: Vec<String> = sources
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         let _ = this.update_in(cx, |view, window, cx| {
-            let text = quote_for_shell(&local, view.shell_program().as_deref());
-            view.paste(format!("{text} "), cx);
-            view.warn_image_upload_failed(host, reason, window, cx);
+            view.paste_paths(spelled, cx);
+            if let Some(first) = sources.first() {
+                view.warn_paste_upload_failed(first, host, reason, window, cx);
+            }
         });
     }
 
@@ -3855,16 +4197,18 @@ impl TerminalView {
     /// watching would otherwise fail in silence.
     async fn watch_upload(
         route: crate::ui::sftp::SftpRoute,
-        job: u64,
-        remote: &str,
+        upload: &StartedUpload,
         cx: &mut gpui::AsyncApp,
     ) -> Result<(), String> {
         use crate::daemon::protocol::{SftpJobState, SftpOp};
-        // Long enough for a screenshot over a slow link, bounded so a wedged
-        // job cannot poll forever.
         const POLL: std::time::Duration = std::time::Duration::from_millis(500);
-        const POLLS: usize = 600;
-        for _ in 0..POLLS {
+        // A pasted file can be any size, so there is no deadline on the whole
+        // transfer — only on one that has stopped moving, which is wedged
+        // rather than slow.
+        const STALLED_POLLS: usize = 600;
+        let mut last_done = 0;
+        let mut still = 0;
+        while still < STALLED_POLLS {
             cx.background_executor().timer(POLL).await;
             let listed = {
                 let route = route.clone();
@@ -3873,22 +4217,37 @@ impl TerminalView {
             };
             // A poll that failed says nothing about the job — keep asking
             // until it answers or the budget above runs out.
-            let Ok(listed) = listed else { continue };
-            let Some(progress) = listed.into_iter().find(|j| j.job_id == job) else {
+            let Ok(listed) = listed else {
+                still += 1;
+                continue;
+            };
+            let Some(progress) = listed.into_iter().find(|j| j.job_id == upload.job) else {
                 // Pruned after the retention window, or the daemon restarted:
                 // there is nothing left to report either way.
                 return Ok(());
             };
             match progress.state {
-                SftpJobState::Running => continue,
+                SftpJobState::Running => {
+                    still = if progress.bytes_done == last_done {
+                        still + 1
+                    } else {
+                        0
+                    };
+                    last_done = progress.bytes_done;
+                }
                 SftpJobState::Done => {
                     // The staging directory is already owner-only, so this is
-                    // belt and braces against a wider umask on the remote.
-                    let (route, path) = (route.clone(), remote.to_string());
-                    cx.background_spawn(
-                        async move { route.op(SftpOp::Chmod { path, mode: 0o600 }) },
-                    )
-                    .await;
+                    // belt and braces against a wider umask on the remote. A
+                    // folder is left as it was: its contents are behind the
+                    // same owner-only directory, and its own layout is the
+                    // user's.
+                    if !upload.is_dir {
+                        let (route, path) = (route.clone(), upload.remote.clone());
+                        cx.background_spawn(async move {
+                            route.op(SftpOp::Chmod { path, mode: 0o600 })
+                        })
+                        .await;
+                    }
                     return Ok(());
                 }
                 SftpJobState::Cancelled => return Ok(()),
@@ -3900,26 +4259,33 @@ impl TerminalView {
         Ok(())
     }
 
-    /// One notification per failed paste — the pane's line already has a path
+    /// One notification per failed file — the pane's line already has a path
     /// in it, and the user is the only one who can tell whether it matters.
-    fn warn_image_upload_failed(
+    fn warn_paste_upload_failed(
         &self,
+        local: &std::path::Path,
         host: &str,
         reason: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        log::warn!("clipboard image upload to {host} failed: {reason}");
+        log::warn!(
+            "pasted upload of {} to {host} failed: {reason}",
+            local.display()
+        );
+        let name = local
+            .file_name()
+            .map_or_else(|| local.to_string_lossy(), |n| n.to_string_lossy());
         window.push_notification(
             crate::ui::i18n::t_fmt(
-                crate::ui::i18n::L10nKey::SftpImagePasteUploadFailed,
-                &[("host", host), ("error", reason)],
+                crate::ui::i18n::L10nKey::SftpPasteUploadFailed,
+                &[("name", &name), ("host", host), ("error", reason)],
             ),
             cx,
         );
     }
 
-    /// Same shape as `warn_image_upload_failed`: one toast per failed open, so
+    /// Same shape as `warn_paste_upload_failed`: one toast per failed open, so
     /// a broken `link_file_command` surfaces as a config problem instead of a
     /// "dead link" (#542). Spawn is all that is reported — a spawned opener
     /// that exits non-zero is nobody's to see.
@@ -3934,9 +4300,12 @@ impl TerminalView {
         let path = path.display().to_string();
         let reason = reason.to_string();
         window.push_notification(
-            crate::ui::i18n::t_fmt(
-                crate::ui::i18n::L10nKey::LinkFileOpenFailed,
-                &[("path", path.as_str()), ("error", reason.as_str())],
+            crate::ui::host_ops::failure(
+                crate::ui::i18n::t_fmt(
+                    crate::ui::i18n::L10nKey::LinkFileOpenFailed,
+                    &[("path", path.as_str()), ("error", reason.as_str())],
+                ),
+                &reason,
             ),
             cx,
         );
@@ -4041,7 +4410,8 @@ impl TerminalView {
             self.terminal.agent_session().as_ref(),
         );
         if self.terminal.exited {
-            self.terminal.take_terminal_notifications();
+            self.terminal.take_osc_notes();
+            self.pending_finish_notice = None;
             self.agent_bell_pending = false;
             self.agent_notice_history = AgentNoticeHistory::default();
             if std::mem::take(&mut self.agent_attention_unread) {
@@ -4115,25 +4485,13 @@ impl TerminalView {
             _ => {}
         }
 
+        self.poll_agent_detection(at_prompt, cx);
         let turn_finished = self.poll_agent_status(agent_notify_allowed, window, cx);
         // Drain one bounded batch. OSC has no trustworthy process identity, so
         // shell programs and agents follow the same explicit-notification mode.
         // Status goes first to prefer an actionable hook message over a generic
         // OSC alert when both describe the same permission request.
-        for (title, body) in self.terminal.take_terminal_notifications() {
-            if self.agent().is_some() {
-                self.agent_attention_unread |= !pane_focused;
-                cx.notify();
-            }
-            self.notify_agent_event(
-                AgentNoticeSource::Osc,
-                AgentNoticeKind::Explicit,
-                title.as_deref(),
-                &body,
-                agent_notify_allowed,
-                cx,
-            );
-        }
+        self.show_program_notes(agent_notify_allowed, window, cx);
 
         let session = self.terminal.agent_session();
         let tool_activity = match session.as_ref().map(|s| s.activity) {
@@ -4159,6 +4517,8 @@ impl TerminalView {
             self.refresh_git_status(cwd_now, GitRefresh::Edge, cx);
         } else if tool_activity {
             self.refresh_git_status(cwd_now, GitRefresh::Opportunistic, cx);
+        } else if self.git_retry_due(cx) {
+            self.refresh_git_status(cwd_now, GitRefresh::Retry, cx);
         }
 
         // A tool can work in a different repository. Resolve the project's
@@ -4271,7 +4631,6 @@ impl TerminalView {
                 self.history_ready = false;
             }
         }
-        self.history_ranked.clear();
         self.history_frecency.clear();
         self.history_nav = None;
         self.reverse_search = None;
@@ -4378,6 +4737,7 @@ impl TerminalView {
             GitRefresh::Opportunistic => {
                 cache.begin_probe_throttled(id, &cwd, OPPORTUNISTIC_GIT_GAP)
             }
+            GitRefresh::Retry => cache.begin_probe_throttled(id, &cwd, GIT_RETRY_GAP),
         });
         if !claimed {
             return;
@@ -4387,10 +4747,13 @@ impl TerminalView {
         crate::ui::host_ops::HostOps::run_detached(
             host,
             cx,
-            move |h| crate::terminal::git_status::probe(h, &probe_cwd),
+            move |h| crate::terminal::git_status::probe_repo(h, &probe_cwd),
             move |cx, result| {
-                let rerun = cx.update_global::<GitStatusCache, _>(|cache, _| {
-                    cache.finish_probe(id, &cwd, result)
+                use crate::terminal::git_status::RepoProbe;
+                let rerun = cx.update_global::<GitStatusCache, _>(|cache, _| match result {
+                    RepoProbe::Repo(snap) => cache.finish_probe(id, &cwd, Some(snap)),
+                    RepoProbe::NotARepo => cache.finish_probe(id, &cwd, None),
+                    RepoProbe::Failed => cache.fail_probe(id, &cwd),
                 });
                 if rerun {
                     let _ = pane.update(cx, |view, cx| {
@@ -4403,6 +4766,24 @@ impl TerminalView {
                 }
             },
         );
+    }
+
+    /// Report an agent that has just started in this pane ([`AgentDetected`]),
+    /// once per start, and never one that was already running when this view
+    /// reattached to the pane.
+    fn poll_agent_detection(&mut self, at_prompt: bool, cx: &mut Context<Self>) {
+        let agent = self.terminal.foreground_agent();
+        if agent != self.seen_agent {
+            self.seen_agent = agent;
+            if let Some(agent) = agent
+                && self.agent_detection_armed
+            {
+                cx.emit(AgentDetected(agent));
+            }
+        }
+        if agent.is_none() && at_prompt {
+            self.agent_detection_armed = true;
+        }
     }
 
     fn poll_agent_status(
@@ -4519,6 +4900,10 @@ impl TerminalView {
         }
         let prev = std::mem::replace(&mut self.last_agent_status, status);
         let first_sight = !std::mem::replace(&mut self.agent_status_seen, true);
+        self.pending_finish_notice = None;
+        // tty7's own conclusion, not the agent's: the user interrupted the
+        // turn, or it went silent. Neither is a result to announce.
+        let inferred = session.as_ref().is_some_and(|s| s.inferred);
 
         // A view built over a pane that already holds a finished turn sees
         // `Done` arrive from nothing, the same as a turn finishing now. If the
@@ -4555,7 +4940,7 @@ impl TerminalView {
                 // built, before its leaf was attached, never gets the blur that
                 // would clear `self.focused` — trusting the cached flag there
                 // drops the badge on the one pane the reader is not looking at.
-                self.agent_result_unread = !pane_focused;
+                self.agent_result_unread = !inferred && !pane_focused;
                 self.keep_unread_on_focus = false;
             }
             Some(AgentStatus::Done) => {}
@@ -4573,6 +4958,7 @@ impl TerminalView {
             }
             Some(AgentStatus::Done)
                 if rich
+                    && !inferred
                     && matches!(
                         prev,
                         Some(AgentStatus::Working) | Some(AgentStatus::Waiting)
@@ -4585,14 +4971,37 @@ impl TerminalView {
                     }
                     None => t(L10nKey::NotifyTurnFinished).to_string(),
                 };
-                self.notify_agent_event(
+                // Reserve the event now so OSC/BEL in this poll correlate with
+                // it, but wait for a stable Done before showing it. Reserving
+                // after the delay would outlive the correlation window.
+                if self.accept_agent_notice(
                     AgentNoticeSource::Status,
                     AgentNoticeKind::Finished,
-                    Some(agent_name),
                     &body,
-                    notify_allowed,
-                    cx,
-                );
+                ) && notify_allowed
+                {
+                    let agent_name = agent_name.to_string();
+                    let session_id = self.last_agent_session.clone();
+                    self.pending_finish_notice = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(AGENT_DONE_SETTLE).await;
+                        this.update_in(cx, |view, window, cx| {
+                            view.pending_finish_notice = None;
+                            let watched =
+                                window.is_window_active() && view.focus_handle.is_focused(window);
+                            let still_done = view.terminal.agent_session().is_some_and(|s| {
+                                s.status == AgentStatus::Done && !s.inferred && s.turns == turns
+                            });
+                            if !view.terminal.exited
+                                && still_done
+                                && view.last_agent_session == session_id
+                                && cx.global::<Config>().notify_on_agent_event.allows(watched)
+                            {
+                                view.notify_pane(Some(&agent_name), &body, cx);
+                            }
+                        })
+                        .ok();
+                    }));
+                }
             }
             _ => {}
         }
@@ -5073,9 +5482,11 @@ impl TerminalView {
                     exit: None,
                 },
             );
-            if self.history.last().map(String::as_str) != Some(line.as_str()) {
-                self.history.push(line.clone());
-            }
+            // One entry per command, at its latest run: the same global
+            // dedup `normalize` applies on load, so ↑ does not step onto a
+            // command twice and a restart does not reorder anything.
+            self.history.retain(|h| *h != line);
+            self.history.push(line.clone());
             self.flush_pending_history();
             self.pending_history = Some(PendingHistory {
                 line: line.clone(),
@@ -5085,7 +5496,10 @@ impl TerminalView {
             });
             self.rerank_history(cwd.as_deref());
         }
+        // The dedup above can shift entries down, so nothing may keep an
+        // index into `history` across a submit.
         self.history_nav = None;
+        self.last_word_nav = None;
         self.history_stash.clear();
         self.history_prefix.clear();
         self.close_completion();
@@ -5195,12 +5609,6 @@ impl TerminalView {
 
     fn rerank_history(&mut self, cwd: Option<&std::path::Path>) {
         let cwd_str = cwd.and_then(|p| p.to_str());
-        self.history_ranked = super::history::rank_by_frecency(
-            &self.history,
-            &self.history_counts,
-            &self.history_cwds,
-            cwd_str,
-        );
         self.history_frecency = super::history::frecency_scores(
             &self.history,
             &self.history_counts,
@@ -5225,15 +5633,42 @@ impl TerminalView {
         super::history::append(&self.history_scope, &p.line, p.cwd.as_deref(), p.ts, exit);
     }
 
+    /// The inline suggestion: the most recent entry that extends the line,
+    /// preferring one run in the current directory and falling back to the
+    /// most recent anywhere. Commands that last exited non-zero are never
+    /// offered. Pure recency, not frecency, so the ghost names what ↑ would
+    /// recall rather than an older command that merely ran more often; Ctrl+R
+    /// is where frecency ranks.
     fn ghost_suggestion(&self) -> Option<String> {
         if self.cmd.is_empty() || self.cmd.cursor() != self.cmd.len() {
             return None;
         }
         let line = self.cmd.text();
-        self.history_ranked
-            .iter()
-            .find(|h| h.len() > line.len() && h.starts_with(&line))
-            .cloned()
+        let cwd = self.ranked_cwd.as_deref().and_then(|p| p.to_str());
+        let mut elsewhere = None;
+        for h in self.history.iter().rev() {
+            if h.len() <= line.len() || !h.starts_with(&line) {
+                continue;
+            }
+            if self
+                .history_meta
+                .get(h)
+                .and_then(|m| m.exit)
+                .is_some_and(|code| code != 0)
+            {
+                continue;
+            }
+            let here = cwd.is_some_and(|dir| {
+                self.history_cwds
+                    .get(h)
+                    .is_some_and(|dirs| dirs.contains(dir))
+            });
+            if here || cwd.is_none() {
+                return Some(h.clone());
+            }
+            elsewhere.get_or_insert(h);
+        }
+        elsewhere.cloned()
     }
 
     fn note_integration_gap(&mut self, cx: &mut Context<Self>) {
@@ -5794,6 +6229,9 @@ impl TerminalView {
 
     pub fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.terminal.exited || text.is_empty() || !self.accepts_input(cx) {
+            return;
+        }
+        if self.composer_takes_typing(text, cx) {
             return;
         }
         // Typing goes to the prompt, so the view has to be looking at it.
@@ -6695,6 +7133,22 @@ impl TerminalView {
         self.resolve_menu_link(FileLinkAction::Open, window, cx);
     }
 
+    /// "Open with Default App": the file link under the menu, handed to the
+    /// OS association whatever `link_file_open` says "Open" does.
+    fn open_menu_link_with_default_app(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The menu only offers this for a local pane; a key binding could
+        // still fire it on a remote one, where the path means nothing here.
+        if !self.host_id.is_local() {
+            return;
+        }
+        let Some(path) = self.menu_link_path().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        if let Err(e) = open_file_path(&path) {
+            self.warn_file_open_failed(&path, &e, window, cx);
+        }
+    }
+
     fn reveal_menu_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.resolve_menu_link(FileLinkAction::Reveal, window, cx);
     }
@@ -7042,7 +7496,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> Option<HoveredLink> {
         match self.resolve_link_at(col, row, true, include_loopback, cx) {
-            LinkAt::Found(_, start, end) => Some(HoveredLink { start, end, armed }),
+            LinkAt::Found(_, runs) => Some(HoveredLink { runs, armed }),
             LinkAt::Unresolved { .. } | LinkAt::None => None,
         }
     }
@@ -7080,8 +7534,8 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> LinkAt {
         let (text, points, click_idx, wrapped) = match snapshot {
-            GridLink::Hyperlink(uri, start, end) => {
-                return LinkAt::Found(LinkTarget::Url(uri), start, end);
+            GridLink::Hyperlink(uri, runs) => {
+                return LinkAt::Found(LinkTarget::Url(uri), runs);
             }
             GridLink::Text(text, points, click_idx, wrapped) => (text, points, click_idx, wrapped),
         };
@@ -7134,7 +7588,11 @@ impl TerminalView {
             })?
         });
         match link {
-            Some(link) => LinkAt::Found(link.target, points[link.start], points[link.end]),
+            Some(link) => {
+                let term = self.terminal.term.lock();
+                let runs = super::smart_select::row_runs(&term, &points[link.start..=link.end]);
+                LinkAt::Found(link.target, runs)
+            }
             // Nothing answered. Hand back what the token *said* so a click can
             // say so out loud instead of looking broken.
             None => match files
@@ -7160,7 +7618,8 @@ impl TerminalView {
         if let Some(hl) = term.grid()[line][Column(col)].hyperlink() {
             let uri = hl.uri().to_string();
             if let Some((start, end)) = super::smart_select::hyperlink_run(&term, click) {
-                return Some(GridLink::Hyperlink(uri, start, end));
+                let runs = super::smart_select::grid_runs(start, end, term.columns());
+                return Some(GridLink::Hyperlink(uri, runs));
             }
         }
 
@@ -7427,7 +7886,11 @@ impl TerminalView {
             }
         }
 
-        let cursor_style = cx.global::<Config>().cursor_style;
+        // This caret only exists at a prompt, so the prompt's own shape wins.
+        let cursor_style = {
+            let cfg = cx.global::<Config>();
+            cfg.prompt_cursor_style.shape().unwrap_or(cfg.cursor_style)
+        };
         let cursor_paint = input_caret_paint(focused, self.cursor_visible, cursor_style);
         let cursor_on = cursor_paint.is_some();
         let block_cursor = cursor_paint == Some(InputCaretPaint::Block);
@@ -7995,6 +8458,7 @@ impl Render for TerminalView {
         self.sync_frame_facts();
         self.sync_typeahead_owner();
         self.sync_scrollbar();
+        self.sync_composer(window, cx);
         if self.shell_owns_prompt() {
             if let Some((_net, bytes)) = self.hold.release() {
                 self.terminal.write(bytes);
@@ -8024,6 +8488,11 @@ impl Render for TerminalView {
             .input_active()
             .then(|| self.render_reverse_search_menu(cx))
             .flatten();
+        let (composer_docked, composer_over) = match self.render_composer(window, cx) {
+            Some((el, true)) => (Some(el), None),
+            Some((el, false)) => (None, Some(el)),
+            None => (None, None),
+        };
         let integration_notice = self.render_integration_notice(cx);
         let remote_completion_notice = self.render_remote_completion_notice(cx);
 
@@ -8042,6 +8511,10 @@ impl Render for TerminalView {
             .key_context(self.key_context())
             .size_full()
             .relative()
+            // A column so the composer docks under the grid and takes its rows
+            // from it: the grid's laid-out height is what sizes the pty.
+            .flex()
+            .flex_col()
             .overflow_hidden()
             .px(px(GRID_PAD_X))
             .py(px(GRID_PAD_Y))
@@ -8076,6 +8549,15 @@ impl Render for TerminalView {
                 window.focus(&this.focus_handle, cx);
                 this.drop_files(paths, cx);
             }))
+            .drag_over::<crate::ui::file_tree::RemotePathDrag>(|s, _, _, cx| {
+                s.bg(cx.theme().drag_border.opacity(0.12))
+            })
+            .on_drop(cx.listener(
+                |this, drag: &crate::ui::file_tree::RemotePathDrag, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                    this.drop_remote_path(drag, cx);
+                },
+            ))
             .on_action(cx.listener(|this, _: &CopyText, _w, cx| {
                 this.copy_contextual(false, cx);
             }))
@@ -8114,6 +8596,9 @@ impl Render for TerminalView {
             .on_action(cx.listener(|this, _: &OpenLinkUnderPointer, window, cx| {
                 this.open_menu_link(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &OpenLinkWithDefaultApp, window, cx| {
+                this.open_menu_link_with_default_app(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &RevealLinkUnderPointer, window, cx| {
                 this.reveal_menu_link(window, cx);
             }))
@@ -8128,6 +8613,9 @@ impl Render for TerminalView {
             .on_action(cx.listener(|this, _: &InsertNewlineFallback, _w, cx| {
                 this.insert_newline_fallback_action(cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleComposer, window, cx| {
+                this.toggle_composer(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &SendTab, _w, cx| {
                 this.tab_pressed(true, cx);
             }))
@@ -8135,6 +8623,7 @@ impl Render for TerminalView {
                 this.tab_pressed(false, cx);
             }))
             .child(TerminalElement::new(entity))
+            .children(composer_docked)
             .child(self.render_scrollbar())
             .children(search_bar)
             .children(input_bar)
@@ -8142,6 +8631,7 @@ impl Render for TerminalView {
             .children(reverse_search_menu)
             .children(integration_notice)
             .children(remote_completion_notice)
+            .children(composer_over)
             .context_menu(move |menu, window, cx| {
                 // Suppressing the popup means handing back an item-less menu:
                 // gpui-component's `ContextMenu` element skips rendering the
@@ -8163,10 +8653,18 @@ impl Render for TerminalView {
                             false => L10nKey::AppMenuRevealInFolder,
                         };
                         let label = link_menu_label(path);
+                        let default_app =
+                            offers_default_app_open(local, cx.global::<Config>().file_open_mode());
                         menu.min_w(px(220.))
                             .action_context(menu_focus.clone())
                             .label(label)
                             .menu(t(L10nKey::AppMenuOpenLink), Box::new(OpenLinkUnderPointer))
+                            .when(default_app, |menu| {
+                                menu.menu(
+                                    t(L10nKey::AppMenuOpenLinkWithDefaultApp),
+                                    Box::new(OpenLinkWithDefaultApp),
+                                )
+                            })
                             // A file on another machine has no folder here to
                             // show it in, and naming this one's would show
                             // whatever it happens to keep at that path.
@@ -8206,10 +8704,9 @@ impl Render for TerminalView {
                     )
                     .separator()
                     .menu(t(L10nKey::AppMenuFind), Box::new(FindInTerminal))
-                    .menu(
-                        t(L10nKey::AppMenuClearScrollback),
-                        Box::new(ClearScrollback),
-                    );
+                    // Inside the terminal, what gets cleared goes without
+                    // saying; the menu bar keeps the full "Clear Scrollback".
+                    .menu(t(L10nKey::TerminalContextClear), Box::new(ClearScrollback));
 
                 // `fork_label` is tty7-core's capability probe, and core has no
                 // locale table — take the answer, not its English wording.
@@ -8217,6 +8714,12 @@ impl Render for TerminalView {
                 let fork_ready = can_fork
                     && view.remote_context().is_none()
                     && view.agent_session().is_some_and(|s| s.session_id.is_some());
+                // `None` over a pane with no agent; otherwise whether it knows
+                // the command line it was started with.
+                let launch_argv_known = view.agent().map(|_| {
+                    view.agent_session()
+                        .is_some_and(|s| s.launch_argv.is_some())
+                });
 
                 let menu = match (can_fork, fork_ready) {
                     (true, true) => {
@@ -8248,6 +8751,21 @@ impl Render for TerminalView {
                         .separator()
                         .item(PopupMenuItem::new(t(L10nKey::AppMenuForkSession)).disabled(true)),
                     (false, _) => menu,
+                };
+
+                // Only over a running agent, and only live when the pane knows
+                // the command line it was started with — there is nothing to
+                // save otherwise. Beside Fork when both are there.
+                let menu = match launch_argv_known {
+                    Some(known) => {
+                        let menu = if can_fork { menu } else { menu.separator() };
+                        menu.menu_with_disabled(
+                            t(L10nKey::AppMenuSaveAgentLaunchArgs),
+                            Box::new(SaveAgentLaunchArgs),
+                            !known,
+                        )
+                    }
+                    None => menu,
                 };
 
                 menu.separator()
@@ -8491,10 +9009,24 @@ fn select_end_copy(enabled: bool, grid: bool, editor: bool) -> SelectEndCopy {
     }
 }
 
+/// Whether a file link's menu offers "Open with Default App" beside "Open".
+///
+/// Only for a file on this machine: the OS opener is handed a local path, and
+/// a remote pane's path names nothing here — or worse, this machine's copy.
+/// And not when "Open" already goes to the OS association, where the two rows
+/// would do the same thing.
+fn offers_default_app_open(host_is_local: bool, open_mode: LinkFileOpen) -> bool {
+    host_is_local && open_mode != LinkFileOpen::System
+}
+
 /// Hands a path to whatever the OS has it associated with. Also the fallback
 /// for a directory the file tree cannot reach.
+///
+/// The path is spelled this OS's way first: Explorer takes `c:/a.png` as a
+/// request to show Documents.
 pub(crate) fn open_file_path(path: &std::path::Path) -> std::io::Result<()> {
-    let path = tty7_core::core::path_spelling::local_spelling(path);
+    let spelled = super::search::spelled_for(super::search::PathStyle::NATIVE, path);
+    let path = tty7_core::core::path_spelling::local_spelling(&spelled);
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else if cfg!(windows) {
@@ -8525,6 +9057,7 @@ fn explorer_select_argument(path: &std::path::Path) -> std::ffi::OsString {
 /// no desktop-neutral Linux equivalent exists, so there the folder is opened
 /// and the file is left for the eye to find.
 pub(crate) fn reveal_file_path(path: &std::path::Path) -> std::io::Result<()> {
+    let path = &super::search::spelled_for(super::search::PathStyle::NATIVE, path);
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut c = std::process::Command::new("open");
@@ -9156,13 +9689,12 @@ mod tests {
     }
     use super::{
         COMPLETION_MENU_MAX_W, LoopbackPlan, PortRoute, RawInput, SelectEndCopy, Typeahead,
-        WheelRoute, clipboard_paste_text, compose_notification_title, cwd_is_on_host,
-        display_width, link_path_style, loopback_plan, observe_typeahead_for_owner,
-        typeahead_boundary,
+        WheelRoute, clipboard_paths, compose_notification_title, cwd_is_on_host, display_width,
+        link_path_style, loopback_plan, observe_typeahead_for_owner, typeahead_boundary,
     };
     use super::{SCROLL_ANIM_FRAME, scroll_anim_step};
     use super::{
-        TitleSettle, files_cwd, remote_paste_spec, settle_title, staged_path_for_pane,
+        TitleSettle, files_cwd, local_path_for_pane, remote_paste_spec, settle_title,
         stages_clipboard_image, staging_cache, staging_dir_is_safe, wsl_path, wsl_share_distro,
         wsl_share_path,
     };
@@ -9203,6 +9735,39 @@ mod tests {
         assert_eq!(
             settle_title("~/dev", false, "wget 1%"),
             TitleSettle::QueueAndWait
+        );
+    }
+
+    #[test]
+    fn a_spinner_frame_that_only_changes_the_status_mark_asks_for_no_repaint() {
+        // An agent rewrites its title every few hundred milliseconds while it
+        // works, and the tab never draws the mark, so none of these may wait
+        // and repaint the whole window for the same label.
+        assert_eq!(
+            settle_title(
+                "\u{25D0} fixing the switcher",
+                false,
+                "\u{25D1} fixing the switcher"
+            ),
+            TitleSettle::Revert
+        );
+        assert_eq!(
+            settle_title(
+                "\u{25D0} fixing the switcher",
+                true,
+                "\u{2733} fixing the switcher"
+            ),
+            TitleSettle::Revert,
+            "and a frame that lands while another title waits drops it, as a revert does"
+        );
+        assert_eq!(
+            settle_title(
+                "\u{25D0} fixing the switcher",
+                false,
+                "\u{25D1} fixing the parser"
+            ),
+            TitleSettle::QueueAndWait,
+            "a different title still lands"
         );
     }
 
@@ -9594,6 +10159,7 @@ mod tests {
             }),
             label: None,
             resize_echo: false,
+            size_lease: false,
         }
     }
 
@@ -9870,7 +10436,7 @@ mod tests {
         // The staged file really is on the pane's own disk — only its name
         // differs — so this is a rewrite, not an upload.
         assert_eq!(
-            staged_path_for_pane(
+            local_path_for_pane(
                 r"C:\Users\me\AppData\Local\Temp\tty7-clipboard\paste-1.png",
                 true
             ),
@@ -9881,17 +10447,17 @@ mod tests {
         // No automount mapping: the Windows path at least says where it went.
         let unc = r"\\server\share\paste-1.png";
         assert_eq!(wsl_path(unc), None);
-        assert_eq!(staged_path_for_pane(unc, true), unc);
+        assert_eq!(local_path_for_pane(unc, true), unc);
         // Drive-relative, not absolute — `C:x` means "x under C:'s cwd".
         assert_eq!(wsl_path(r"C:paste-1.png"), None);
 
         // Every other pane keeps the path exactly as staged.
         assert_eq!(
-            staged_path_for_pane("/tmp/tty7-clipboard/paste-1.png", false),
+            local_path_for_pane("/tmp/tty7-clipboard/paste-1.png", false),
             "/tmp/tty7-clipboard/paste-1.png"
         );
         assert_eq!(
-            staged_path_for_pane(r"C:\Temp\paste-1.png", false),
+            local_path_for_pane(r"C:\Temp\paste-1.png", false),
             r"C:\Temp\paste-1.png"
         );
     }
@@ -10714,7 +11280,7 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_paste_text_quotes_and_space_joins_files() {
+    fn a_copied_file_is_pasted_by_path_quoted_and_space_joined() {
         let item = ClipboardItem {
             entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
                 vec![
@@ -10724,16 +11290,49 @@ mod tests {
                 .into(),
             ))],
         };
+        let paths = clipboard_paths(&item);
         assert_eq!(
-            clipboard_paste_text(&item, Some("zsh")).as_deref(),
-            Some("'/Users/me/My File.txt' /tmp/b.log")
+            paths,
+            [
+                PathBuf::from("/Users/me/My File.txt"),
+                PathBuf::from("/tmp/b.log")
+            ]
+        );
+        let spelled: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            super::pasted_paths_text(&spelled, Some("zsh")),
+            "'/Users/me/My File.txt' /tmp/b.log "
         );
 
+        // Text is text: nothing on the clipboard names a file.
         let text = ClipboardItem::new_string("echo hi".to_string());
-        assert_eq!(
-            clipboard_paste_text(&text, Some("zsh")).as_deref(),
-            Some("echo hi")
-        );
+        assert!(clipboard_paths(&text).is_empty());
+    }
+
+    /// Two pastes of `report.xlsx` in the same instant must not land in the
+    /// same directory, or the second overwrites the file the first pasted.
+    #[test]
+    fn every_paste_stages_into_a_directory_of_its_own() {
+        let a = super::paste_dir_name();
+        let b = super::paste_dir_name();
+        assert_ne!(a, b);
+        assert!(crate::daemon::ssh::sftp::safe_local_name(&a));
+    }
+
+    #[test]
+    fn staged_pastes_expire_after_a_week_and_never_on_an_unknown_age() {
+        let now = 1_800_000_000;
+        let week = super::REMOTE_CLIPBOARD_TTL_SECS;
+        assert!(!super::staged_entry_expired(now - 60, now));
+        assert!(!super::staged_entry_expired(now - week, now));
+        assert!(super::staged_entry_expired(now - week - 1, now));
+        // No mtime from the server says nothing about age.
+        assert!(!super::staged_entry_expired(0, now));
+        // A remote clock ahead of ours is young, not negative.
+        assert!(!super::staged_entry_expired(now + 3600, now));
     }
 
     #[test]
@@ -11195,6 +11794,30 @@ mod tests {
         assert!(highlight_runs("", &[]).is_empty());
     }
 
+    /// "Open with Default App" sits beside "Open" only where it adds
+    /// something: on a local file, and when "Open" is not already the OS
+    /// association.
+    #[test]
+    fn the_default_app_row_is_offered_only_where_it_differs_from_open() {
+        use super::{LinkFileOpen, offers_default_app_open};
+        assert!(offers_default_app_open(true, LinkFileOpen::Internal));
+        assert!(offers_default_app_open(true, LinkFileOpen::Command));
+        assert!(
+            !offers_default_app_open(true, LinkFileOpen::System),
+            "it would repeat Open"
+        );
+        for mode in [
+            LinkFileOpen::Internal,
+            LinkFileOpen::System,
+            LinkFileOpen::Command,
+        ] {
+            assert!(
+                !offers_default_app_open(false, mode),
+                "a remote file has nothing here for the OS to open ({mode:?})"
+            );
+        }
+    }
+
     #[test]
     fn only_a_matching_host_may_answer_for_a_panes_paths() {
         assert!(cwd_is_on_host(false, true));
@@ -11202,37 +11825,6 @@ mod tests {
 
         assert!(!cwd_is_on_host(true, true));
         assert!(!cwd_is_on_host(false, false));
-    }
-
-    #[test]
-    fn only_a_native_ssh_pane_names_its_remote_cwd() {
-        use super::{RemoteContext, native_ssh_cwd};
-        use std::path::PathBuf;
-        let native = RemoteContext {
-            kind: RemoteKind::NativeSsh,
-            argv: Vec::new(),
-            target: "ubuntu@box".into(),
-        };
-        let home = || Some(PathBuf::from("/home/ubuntu"));
-        assert_eq!(native_ssh_cwd(Some(&native), home()), home());
-
-        // `ssh` typed at a local prompt: the directory is a guess, not a
-        // report from the far end.
-        let typed = RemoteContext {
-            kind: RemoteKind::Ssh,
-            ..native.clone()
-        };
-        assert_eq!(native_ssh_cwd(Some(&typed), home()), None);
-        assert_eq!(native_ssh_cwd(Some(&wsl_context("Ubuntu")), home()), None);
-        // A local pane has its own path through `git_status_cwd`.
-        assert_eq!(native_ssh_cwd(None, home()), None);
-
-        assert_eq!(native_ssh_cwd(Some(&native), None), None);
-        assert_eq!(
-            native_ssh_cwd(Some(&native), Some(PathBuf::from("~"))),
-            None,
-            "only an absolute path names a directory"
-        );
     }
 
     /// Which machine's spelling a pane's paths are read in. Ungated on
@@ -11282,6 +11874,7 @@ mod tests {
             spec: None,
             label: None,
             resize_echo: false,
+            size_lease: false,
         };
 
         let remote = ws.target.host_id();
@@ -11299,6 +11892,7 @@ mod tests {
             spec: None,
             label: None,
             resize_echo: false,
+            size_lease: false,
         };
         assert_eq!(sibling.target.host_id(), remote);
     }
@@ -11556,6 +12150,8 @@ mod gpui_tests {
                 project_cwd: None,
                 activity: 0,
                 turns: 0,
+                inferred: false,
+                readout: Default::default(),
             }))
             .encode(daemon)
             .unwrap();
@@ -11613,6 +12209,8 @@ mod gpui_tests {
             project_cwd: None,
             activity: 0,
             turns: 0,
+            inferred: false,
+            readout: Default::default(),
         }))
         .encode(&mut daemon)
         .unwrap();
@@ -11681,6 +12279,8 @@ mod gpui_tests {
             project_cwd: None,
             activity: 0,
             turns,
+            inferred: false,
+            readout: Default::default(),
         };
         DaemonMsg::AgentStatus(Some(state.clone()))
             .encode(daemon)
@@ -11692,6 +12292,67 @@ mod gpui_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("the agent status never reached the pane");
+    }
+
+    /// A Done hook reserves the event before its settle timer: another source
+    /// cannot announce it twice, and new work or detaching cancels the timer.
+    #[gpui::test]
+    fn a_settling_done_correlates_osc_and_cancels_on_work_or_detach(cx: &mut TestAppContext) {
+        use crate::core::cli_agent::AgentStatus;
+
+        let (window, mut daemon) = harness(cx);
+        let pane = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        // The test exercises the pending task without sending desktop alerts.
+        cx.update(|cx| {
+            cx.global_mut::<Config>().notify_on_agent_event =
+                crate::core::config::NotifyMode::Never;
+        });
+
+        for turns in [1, 2] {
+            report_agent_turn(AgentStatus::Working, turns - 1, &pane, cx, &mut daemon);
+            window
+                .update(cx, |view, window, cx| {
+                    view.poll_agent_status(false, window, cx);
+                })
+                .unwrap();
+            report_agent_turn(AgentStatus::Done, turns, &pane, cx, &mut daemon);
+            window
+                .update(cx, |view, window, cx| {
+                    assert!(view.poll_agent_status(true, window, cx));
+                    assert!(view.pending_finish_notice.is_some());
+                    assert!(
+                        !view.accept_agent_notice(
+                            super::AgentNoticeSource::Osc,
+                            super::AgentNoticeKind::Explicit,
+                            "Turn completed",
+                        ),
+                        "OSC must share the Done hook's reservation before delivery"
+                    );
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.executor().advance_clock(super::AGENT_DONE_SETTLE / 2);
+            cx.run_until_parked();
+            assert!(cx.update(|cx| pane.read(cx).pending_finish_notice.is_some()));
+
+            if turns == 1 {
+                report_agent_turn(AgentStatus::Working, turns, &pane, cx, &mut daemon);
+            }
+            window
+                .update(cx, |view, window, cx| {
+                    if turns == 1 {
+                        view.poll_agent_status(false, window, cx);
+                    } else {
+                        view.detach_link(cx);
+                        assert!(view.agent_notice_history.recent.is_empty());
+                    }
+                    assert!(view.pending_finish_notice.is_none());
+                })
+                .unwrap();
+            cx.executor().advance_clock(super::AGENT_DONE_SETTLE * 2);
+            cx.run_until_parked();
+            assert!(cx.update(|cx| pane.read(cx).pending_finish_notice.is_none()));
+        }
     }
 
     /// Poll `pane`'s agent status inside `window` and read its badge back.
@@ -12221,6 +12882,8 @@ mod gpui_tests {
             project_cwd: Some(launched_in.clone()),
             activity: 0,
             turns: 0,
+            inferred: false,
+            readout: Default::default(),
         }))
         .encode(&mut daemon)
         .unwrap();
@@ -13288,7 +13951,7 @@ mod gpui_tests {
                     for col in start..=end {
                         assert!(view.hover_link_at(col, row, false, cx), "{head} at {col}");
                         let link = view.hovered_link.as_ref().unwrap();
-                        assert_eq!((link.start, link.end), span, "{head} at {col}");
+                        assert_eq!(link.runs, vec![span], "{head} at {col}");
                     }
                     assert!(view.open_link_at(start, row, window, cx));
                 })
@@ -13646,8 +14309,10 @@ mod gpui_tests {
                 view.hover_link_at(0, 23, true, cx);
                 assert_eq!(view.last_hover_cell, Some((0, 23)));
                 view.hovered_link = Some(HoveredLink {
-                    start: Point::new(Line(23), Column(0)),
-                    end: Point::new(Line(23), Column(3)),
+                    runs: vec![(
+                        Point::new(Line(23), Column(0)),
+                        Point::new(Line(23), Column(3)),
+                    )],
                     armed: true,
                 });
                 view.set_grid_size(80, 24, px(8.), px(17.), 1., cx);
@@ -13709,12 +14374,13 @@ mod gpui_tests {
                         "the wrapped path is a link from {where_}"
                     );
                     let link = view.hovered_link.as_ref().expect("a span");
+                    let (start, end) = (link.runs[0].0, link.runs[link.runs.len() - 1].1);
                     assert_eq!(
-                        (link.start.line, link.end.line),
+                        (start.line, end.line),
                         (Line(0), Line(1)),
                         "and the span the element paints covers both rows"
                     );
-                    assert_eq!(link.start.column, Column(4), "starting at the path itself");
+                    assert_eq!(start.column, Column(4), "starting at the path itself");
                 }
             })
             .unwrap();
@@ -13974,6 +14640,208 @@ mod gpui_tests {
                 Err(e) => panic!("client socket failed before Input: {e}"),
             }
         }
+    }
+
+    /// `next_input_until_timeout` with the executor run between reads: a reply
+    /// crosses the reader thread and the view before it is written.
+    fn pumped_input(cx: &mut TestAppContext, daemon: &mut Stream, tries: usize) -> Option<String> {
+        (0..tries)
+            .find_map(|_| {
+                cx.run_until_parked();
+                next_input_until_timeout(daemon)
+            })
+            .map(|bytes| String::from_utf8(bytes).unwrap())
+    }
+
+    #[gpui::test]
+    fn a_theme_change_reaches_only_the_panes_that_asked(cx: &mut TestAppContext) {
+        let set_background = |cx: &mut TestAppContext, bg: gpui::Hsla| {
+            cx.update(|cx| gpui_component::Theme::global_mut(cx).background = bg)
+        };
+        let (_asked_window, mut asked) = harness(cx);
+        let (_plain_window, mut plain) = harness(cx);
+        set_background(cx, gpui::white());
+
+        DaemonMsg::Output(b"\x1b[?2031h\x1b[?996n".to_vec())
+            .encode(&mut asked)
+            .unwrap();
+        assert_eq!(
+            pumped_input(cx, &mut asked, 20).as_deref(),
+            Some("\x1b[?997;2n"),
+            "996 answers the current scheme"
+        );
+
+        set_background(cx, gpui::black());
+        assert_eq!(
+            pumped_input(cx, &mut asked, 20).as_deref(),
+            Some("\x1b[?997;1n")
+        );
+        DaemonMsg::Output(b"\x1b]11;?\x07".to_vec())
+            .encode(&mut asked)
+            .unwrap();
+        assert!(
+            pumped_input(cx, &mut asked, 20)
+                .is_some_and(|reply| reply.contains("11;rgb:0000/0000/0000")),
+            "OSC 11 answers with the background the flip left"
+        );
+
+        set_background(cx, gpui::white());
+        assert_eq!(
+            pumped_input(cx, &mut asked, 20).as_deref(),
+            Some("\x1b[?997;2n")
+        );
+        assert_eq!(
+            pumped_input(cx, &mut plain, 2),
+            None,
+            "a pane that never set 2031 is not written to"
+        );
+
+        DaemonMsg::Output(b"\x1b[?2031l".to_vec())
+            .encode(&mut asked)
+            .unwrap();
+        assert_eq!(pumped_input(cx, &mut asked, 1), None);
+        set_background(cx, gpui::black());
+        assert_eq!(pumped_input(cx, &mut asked, 2), None, "2031 switched off");
+    }
+
+    #[gpui::test]
+    fn a_reattach_that_replays_2031_reports_the_scheme_once(cx: &mut TestAppContext) {
+        let (_window, mut daemon) = harness(cx);
+        cx.update(|cx| gpui_component::Theme::global_mut(cx).background = gpui::black());
+        // What a replay sends: the modes ahead of the ring, then each ring
+        // segment behind its size, then the shell's state. Nothing live
+        // follows: an idle pane still hears once.
+        let size = crate::daemon::protocol::WinSize {
+            cols: 80,
+            rows: 24,
+            cell_w: 8,
+            cell_h: 16,
+        };
+        let mut replay = Vec::new();
+        for frame in [
+            DaemonMsg::Snapshot(b"\x1b[?2031h".to_vec()),
+            DaemonMsg::Size(size),
+            DaemonMsg::Snapshot(b"\x1b[?996n".to_vec()),
+            DaemonMsg::Snapshot(b"$ ".to_vec()),
+            DaemonMsg::Prompt {
+                active: true,
+                at_prompt: false,
+                last_exit: None,
+            },
+        ] {
+            frame.encode(&mut replay).unwrap();
+        }
+        std::io::Write::write_all(&mut daemon, &replay).unwrap();
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 20).as_deref(),
+            Some("\x1b[?997;1n"),
+            "the theme may have flipped while detached"
+        );
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 2),
+            None,
+            "one report for the whole replay, and the replayed 996 is not answered"
+        );
+    }
+
+    /// A program that switched 2031 on and died without `?2031l` leaves a
+    /// replay whose last word is still `?2031h`. The shell that owns the pane
+    /// now never asked, so neither a reattach nor a theme flip may type a
+    /// report into its command line.
+    #[gpui::test]
+    fn a_dead_programs_2031_never_reaches_the_shell(cx: &mut TestAppContext) {
+        let set_background = |cx: &mut TestAppContext, bg: gpui::Hsla| {
+            cx.update(|cx| gpui_component::Theme::global_mut(cx).background = bg)
+        };
+        let dead = b"\x1b]133;C;claude\x07\x1b[?2031hclaude output\r\n";
+        let prompt = b"\x1b]133;D;137\x07\x1b]133;A\x07$ \x1b]133;B\x07";
+        let restored = crate::daemon::pane::restore_preamble(Some("this shell is new"));
+
+        for tail in [&prompt[..], &restored[..]] {
+            let (_window, mut daemon) = harness(cx);
+            set_background(cx, gpui::white());
+            let mut replay = Vec::new();
+            for frame in [
+                DaemonMsg::Snapshot(dead.to_vec()),
+                DaemonMsg::Snapshot(tail.to_vec()),
+            ] {
+                frame.encode(&mut replay).unwrap();
+            }
+            std::io::Write::write_all(&mut daemon, &replay).unwrap();
+            assert_eq!(
+                pumped_input(cx, &mut daemon, 2),
+                None,
+                "a reattach reports nothing"
+            );
+            set_background(cx, gpui::black());
+            assert_eq!(pumped_input(cx, &mut daemon, 2), None, "nor does a flip");
+        }
+
+        // A ring takes many reads. One that ends after the segment holding
+        // `?2031h` and before the one holding the prompt is not the end of
+        // the replay.
+        let (_window, mut daemon) = harness(cx);
+        set_background(cx, gpui::white());
+        let size = crate::daemon::protocol::WinSize {
+            cols: 80,
+            rows: 24,
+            cell_w: 8,
+            cell_h: 16,
+        };
+        let mut head = Vec::new();
+        DaemonMsg::Size(size).encode(&mut head).unwrap();
+        DaemonMsg::Snapshot(dead.to_vec())
+            .encode(&mut head)
+            .unwrap();
+        std::io::Write::write_all(&mut daemon, &head).unwrap();
+        assert_eq!(
+            pumped_input(cx, &mut daemon, 2),
+            None,
+            "half a replay reports nothing"
+        );
+        let mut rest = Vec::new();
+        DaemonMsg::Size(size).encode(&mut rest).unwrap();
+        DaemonMsg::Snapshot(prompt.to_vec())
+            .encode(&mut rest)
+            .unwrap();
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: Some(137),
+        }
+        .encode(&mut rest)
+        .unwrap();
+        std::io::Write::write_all(&mut daemon, &rest).unwrap();
+        assert_eq!(pumped_input(cx, &mut daemon, 2), None, "nor does the rest");
+
+        // Live, the same: the program's exit and the next prompt end it.
+        let (_window, mut live) = harness(cx);
+        set_background(cx, gpui::white());
+        DaemonMsg::Output(dead.to_vec()).encode(&mut live).unwrap();
+        assert_eq!(pumped_input(cx, &mut live, 1), None);
+        set_background(cx, gpui::black());
+        assert_eq!(
+            pumped_input(cx, &mut live, 20).as_deref(),
+            Some("\x1b[?997;1n")
+        );
+        DaemonMsg::Output(prompt.to_vec())
+            .encode(&mut live)
+            .unwrap();
+        assert_eq!(pumped_input(cx, &mut live, 1), None);
+        set_background(cx, gpui::white());
+        assert_eq!(
+            pumped_input(cx, &mut live, 2),
+            None,
+            "a shell at its prompt hears nothing"
+        );
+        DaemonMsg::Output(b"\x1b[?996n".to_vec())
+            .encode(&mut live)
+            .unwrap();
+        assert_eq!(
+            pumped_input(cx, &mut live, 20).as_deref(),
+            Some("\x1b[?997;2n"),
+            "a live 996 is still answered"
+        );
     }
 
     #[gpui::test]
@@ -15734,6 +16602,7 @@ mod gpui_tests {
     #[gpui::test]
     fn the_zoom_modifier_takes_the_wheel_off_the_scrollback(cx: &mut TestAppContext) {
         let (window, _daemon) = harness(cx);
+        cx.update(|cx| cx.global_mut::<Config>().mouse_zoom_modifier = MouseZoomModifier::Platform);
         window
             .update(cx, |view, w, cx| {
                 scroll_into_history(view, 10);
@@ -15825,6 +16694,7 @@ mod gpui_tests {
     #[gpui::test]
     fn a_zoom_gesture_keeps_zooming_after_the_modifier_is_released(cx: &mut TestAppContext) {
         let (window, _daemon) = harness(cx);
+        cx.update(|cx| cx.global_mut::<Config>().mouse_zoom_modifier = MouseZoomModifier::Platform);
         window
             .update(cx, |view, w, cx| {
                 scroll_into_history(view, 10);
@@ -15844,6 +16714,7 @@ mod gpui_tests {
     #[gpui::test]
     fn a_new_gesture_is_not_bound_by_what_the_last_one_answered(cx: &mut TestAppContext) {
         let (window, _daemon) = harness(cx);
+        cx.update(|cx| cx.global_mut::<Config>().mouse_zoom_modifier = MouseZoomModifier::Platform);
         window
             .update(cx, |view, w, cx| {
                 scroll_into_history(view, 10);
@@ -16171,7 +17042,7 @@ mod gpui_tests {
         window
             .update(cx, |view, _, cx| {
                 assert!(view.input_active(), "the local editor owns a fresh prompt");
-                view.history_ranked = vec!["git log --oneline".to_string()];
+                view.history = vec!["git log --oneline".to_string()];
                 view.cmd.set("git l");
 
                 view.handle_editor_key(&key("ctrl-e"), cx);
@@ -16195,7 +17066,7 @@ mod gpui_tests {
         let (window, _daemon) = harness(cx);
         window
             .update(cx, |view, _, cx| {
-                view.history_ranked = vec!["git log --oneline".to_string()];
+                view.history = vec!["git log --oneline".to_string()];
                 view.cmd.set_with_cursor("git l", 2);
 
                 view.handle_editor_key(&key("ctrl-e"), cx);
@@ -16491,6 +17362,7 @@ mod gpui_tests {
             )),
             label: None,
             resize_echo: false,
+            size_lease: false,
         }));
         id
     }
@@ -16744,6 +17616,7 @@ mod gpui_tests {
                     spec: None,
                     label: Some("hummingbot".into()),
                     resize_echo: false,
+                    size_lease: false,
                 }));
                 assert_eq!(view.title, "hummingbot", "an untitled tab shows the name");
                 view.handle_event(AlacEvent::Exit, cx);
@@ -17051,6 +17924,270 @@ mod gpui_tests {
                     assert_eq!(
                         (still.line.0, still.column.0),
                         (after.line.0, after.column.0)
+                    );
+                });
+            })
+            .unwrap();
+    }
+
+    /// The composer end to end on a live pane: laid over the agent's input
+    /// once the input is on screen, a message leaves as one paste and then its
+    /// own Enter, the box steps aside — keyboard and all — while the agent
+    /// shows something else where its input goes, comes back when the input
+    /// does, and is gone when the agent quits.
+    #[gpui::test]
+    fn the_composer_stands_in_for_the_agents_input_and_steps_aside_for_its_prompts(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
+
+        let (window, view, mut daemon) = rooted_harness(cx);
+        let draw = |cx: &mut TestAppContext| {
+            window.update(cx, |_, window, _| window.refresh()).unwrap();
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(400));
+            cx.run_until_parked();
+        };
+        let wait_for = |cx: &mut TestAppContext, want: &dyn Fn(&TerminalView) -> bool| {
+            for _ in 0..200 {
+                if cx.update(|cx| want(view.read(cx))) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("the pane never got there");
+        };
+        let screen_has = |v: &TerminalView, needle: char| {
+            let term = v.terminal.term.lock();
+            let grid = term.grid();
+            (0..grid.screen_lines() as i32)
+                .any(|l| (0..grid.columns()).any(|c| grid[Line(l)][Column(c)].c == needle))
+        };
+        // Let the window lay the grid out first: the agent draws for the size
+        // it is given, as Claude Code does after every resize.
+        draw(cx);
+        let (cols, lines) = cx.update(|cx| {
+            let term = view.read(cx).terminal.term.lock();
+            (term.columns(), term.screen_lines())
+        });
+        let rule = "─".repeat(cols);
+        // Claude Code's input, as it draws it: the prompt between two rules
+        // at the bottom of the screen, its status row under them.
+        let input = format!(
+            "\x1b[2J\x1b[H⏺ Ready.\x1b[{};1H{rule}\x1b[{};1H❯ \x1b[{};1H{rule}\x1b[{};1H  ? for shortcuts",
+            lines - 3,
+            lines - 2,
+            lines - 1,
+            lines,
+        );
+
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| v.toggle_composer(window, cx));
+            })
+            .unwrap();
+        assert!(
+            cx.update(|cx| view.read(cx).composer.is_none()),
+            "a shell has nobody to compose for"
+        );
+
+        DaemonMsg::Agent(Some(CLIAgent::Claude))
+            .encode(&mut daemon)
+            .unwrap();
+        DaemonMsg::Output(format!("\x1b[?2004h{input}").into_bytes())
+            .encode(&mut daemon)
+            .unwrap();
+        wait_for(cx, &|v| {
+            v.agent() == Some(CLIAgent::Claude)
+                && screen_has(v, '❯')
+                && v.terminal
+                    .term
+                    .lock()
+                    .mode()
+                    .contains(TermMode::BRACKETED_PASTE)
+        });
+        let rows = cx.update(|cx| view.read(cx).terminal.size().rows);
+
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| v.toggle_composer(window, cx));
+            })
+            .unwrap();
+        draw(cx);
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| {
+                    assert!(
+                        v.composer_shown(),
+                        "the input is on screen, so the box is over it"
+                    );
+                    let input = v.composer.as_ref().unwrap().input.clone();
+                    assert!(
+                        input.read(cx).focus_handle(cx).is_focused(window),
+                        "opening the box puts the caret in it"
+                    );
+                    input.update(cx, |s, cx| s.set_value("one\ntwo", window, cx));
+                });
+            })
+            .unwrap();
+        assert_eq!(
+            cx.update(|cx| view.read(cx).terminal.size().rows),
+            rows,
+            "laid over the input, the box leaves the grid its rows"
+        );
+
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| v.submit_composer(window, cx));
+            })
+            .unwrap();
+        draw(cx);
+        assert_eq!(next_input(&mut daemon), b"\x1b[200~one\ntwo\x1b[201~");
+        assert_eq!(
+            next_input(&mut daemon),
+            b"\r",
+            "Enter goes as its own write"
+        );
+        assert_eq!(
+            cx.update(|cx| view
+                .read(cx)
+                .composer
+                .as_ref()
+                .unwrap()
+                .input
+                .read(cx)
+                .value()),
+            "",
+            "a sent message leaves the box"
+        );
+
+        // A click on the grid takes the keyboard out of the box, and it
+        // stays out: the box does not pull it back on the next frame.
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| window.focus(&v.focus_handle, cx));
+            })
+            .unwrap();
+        draw(cx);
+        draw(cx);
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, _| {
+                    assert!(
+                        v.focus_handle.is_focused(window),
+                        "the keyboard stays where the click put it"
+                    );
+                    assert!(!v.composer_focused);
+                });
+            })
+            .unwrap();
+
+        // A paste at the grid is for the input under the box: it goes into
+        // the box, and the keyboard with it — never unseen into the agent.
+        view.update(cx, |v, cx| v.paste("pasted\nhere".into(), cx));
+        draw(cx);
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| {
+                    let input = v.composer.as_ref().unwrap().input.clone();
+                    assert_eq!(input.read(cx).value(), "pasted\nhere");
+                    assert!(input.read(cx).focus_handle(cx).is_focused(window));
+                    input.update(cx, |s, cx| s.set_value("", window, cx));
+                });
+            })
+            .unwrap();
+
+        // A picker takes the input's place. Past the grace period the box
+        // steps aside and the keyboard goes to the TUI.
+        DaemonMsg::Output(
+            b"\x1b[2J\x1b[H Select model\r\n \xe2\x9d\xaf 1. Opus\r\n   2. Sonnet".to_vec(),
+        )
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for(cx, &|v| !screen_has(v, '─'));
+        draw(cx);
+        std::thread::sleep(super::super::composer::STEP_ASIDE_AFTER);
+        draw(cx);
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, _| {
+                    assert!(!v.composer_shown(), "the picker is not covered");
+                    assert!(
+                        v.focus_handle.is_focused(window),
+                        "the picker has the keyboard"
+                    );
+                });
+            })
+            .unwrap();
+
+        // The input comes back, and so do the box and its caret.
+        DaemonMsg::Output(input.clone().into_bytes())
+            .encode(&mut daemon)
+            .unwrap();
+        wait_for(cx, &|v| screen_has(v, '─'));
+        draw(cx);
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| {
+                    assert!(v.composer_shown());
+                    let input = v.composer.as_ref().unwrap().input.clone();
+                    assert!(input.read(cx).focus_handle(cx).is_focused(window));
+                });
+            })
+            .unwrap();
+
+        // A question the hooks report steps it aside at once, and nothing in
+        // the box is sent as the answer.
+        DaemonMsg::AgentStatus(Some(AgentSessionState {
+            status: AgentStatus::Waiting,
+            rich: true,
+            ..Default::default()
+        }))
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for(cx, &|v| {
+            v.agent_session()
+                .is_some_and(|s| s.status == AgentStatus::Waiting)
+        });
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, cx| {
+                    let input = v.composer.as_ref().unwrap().input.clone();
+                    input.update(cx, |s, cx| s.set_value("yes", window, cx));
+                    v.submit_composer(window, cx);
+                });
+            })
+            .unwrap();
+        draw(cx);
+        assert_eq!(
+            next_input_until_timeout(&mut daemon),
+            None,
+            "a question in the TUI is not answered from the box"
+        );
+        assert!(cx.update(|cx| !view.read(cx).composer_shown()));
+        assert_eq!(
+            cx.update(|cx| view
+                .read(cx)
+                .composer
+                .as_ref()
+                .unwrap()
+                .input
+                .read(cx)
+                .value()),
+            "yes",
+            "the held message stays in the box"
+        );
+
+        DaemonMsg::Agent(None).encode(&mut daemon).unwrap();
+        wait_for(cx, &|v| v.agent().is_none());
+        draw(cx);
+        window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |v, _| {
+                    assert!(!v.composer_shown(), "no agent, no box");
+                    assert!(
+                        v.focus_handle.is_focused(window),
+                        "the keyboard goes back to the terminal"
                     );
                 });
             })
@@ -18446,6 +19583,358 @@ mod gpui_tests {
                     view.selecting,
                     "with no menu over it the same press is the grid's to take"
                 );
+            })
+            .unwrap();
+    }
+
+    /// Quick launch counts an agent each time one starts. Reattaching to a pane
+    /// whose agent was already running — every agent tab after an app restart
+    /// — is not a start, and counting it bumped every agent once per launch of
+    /// the app. Once that pane's agent exits, the next one is a start again.
+    #[gpui::test]
+    fn only_an_agent_that_starts_under_this_view_counts_as_detected(cx: &mut TestAppContext) {
+        use crate::core::cli_agent::CLIAgent;
+
+        crate::core::config::pin_test_config_dir();
+        let (window, _root_daemon) = harness(cx);
+        cx.update(|cx| {
+            let cfg = cx.global_mut::<Config>();
+            cfg.notify_on_command_finish = crate::core::config::NotifyMode::Never;
+            cfg.notify_on_agent_event = crate::core::config::NotifyMode::Never;
+        });
+        let detected = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let pane = |reattached: bool, cx: &mut TestAppContext| {
+            let (pane, daemon) = window
+                .update(cx, |_, window, cx| {
+                    if reattached {
+                        super::quiet_reattached_test_pane(2, window, cx)
+                    } else {
+                        super::quiet_test_pane(3, window, cx)
+                    }
+                })
+                .unwrap();
+            let seen = detected.clone();
+            cx.update(|cx| {
+                cx.subscribe(&pane, move |_, ev: &AgentDetected, _| {
+                    seen.borrow_mut().push(ev.0)
+                })
+                .detach()
+            });
+            (pane, daemon)
+        };
+        let report = |agent: Option<CLIAgent>,
+                      at_prompt: bool,
+                      pane: &Entity<TerminalView>,
+                      daemon: &mut Stream,
+                      cx: &mut TestAppContext| {
+            DaemonMsg::Agent(agent).encode(daemon).unwrap();
+            DaemonMsg::Prompt {
+                active: true,
+                at_prompt,
+                last_exit: None,
+            }
+            .encode(daemon)
+            .unwrap();
+            for _ in 0..200 {
+                if pane.read_with(cx, |p, _| {
+                    p.terminal.foreground_agent() == agent && p.terminal.at_prompt() == at_prompt
+                }) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // Exercise the normal poll too: retaining the detection helper
+            // without calling it would silently stop updating quick launch.
+            cx.update_window(window.into(), |_, window, cx| {
+                pane.update(cx, |p, cx| p.poll_foreground(window, cx));
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+
+        let (restored, mut restored_daemon) = pane(true, cx);
+        report(
+            Some(CLIAgent::Claude),
+            false,
+            &restored,
+            &mut restored_daemon,
+            cx,
+        );
+        report(
+            Some(CLIAgent::Claude),
+            false,
+            &restored,
+            &mut restored_daemon,
+            cx,
+        );
+        assert_eq!(
+            *detected.borrow(),
+            vec![],
+            "already running when reattached"
+        );
+        report(None, true, &restored, &mut restored_daemon, cx);
+        report(
+            Some(CLIAgent::Codex),
+            false,
+            &restored,
+            &mut restored_daemon,
+            cx,
+        );
+        assert_eq!(
+            *detected.borrow(),
+            vec![CLIAgent::Codex],
+            "started after the reattach"
+        );
+
+        let (fresh, mut fresh_daemon) = pane(false, cx);
+        report(Some(CLIAgent::Claude), false, &fresh, &mut fresh_daemon, cx);
+        report(Some(CLIAgent::Claude), false, &fresh, &mut fresh_daemon, cx);
+        assert_eq!(
+            *detected.borrow(),
+            vec![CLIAgent::Codex, CLIAgent::Claude],
+            "a spawned pane counts its first agent, once"
+        );
+    }
+
+    /// #958: `prompt_cursor_style` shapes the shell's own caret at a prompt,
+    /// leaves the running program's cursor alone, and steps aside for a vi-mode
+    /// prompt, whose insert/normal shapes are the shell's to set.
+    #[gpui::test]
+    fn prompt_cursor_style_shapes_only_the_prompt(cx: &mut TestAppContext) {
+        use crate::core::config::{CursorStyle, PromptCursorStyle};
+
+        let (window, mut daemon) = harness(cx);
+        let shape = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let view = window.entity(cx).unwrap();
+                TerminalElement::new(view).prompt_cursor_shape(cx)
+            })
+        };
+        let wait_for = |cx: &mut TestAppContext, want: &dyn Fn(&TerminalView) -> bool| {
+            for _ in 0..200 {
+                cx.run_until_parked();
+                if window.update(cx, |view, _, _| want(view)).unwrap() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("the pane never reached the expected prompt state");
+        };
+        cx.update(|cx| cx.global_mut::<Config>().prompt_cursor_style = PromptCursorStyle::Bar);
+
+        assert_eq!(
+            shape(cx),
+            None,
+            "no prompt reported yet: a program owns the cursor"
+        );
+
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: true,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for(cx, &|view| view.terminal.at_prompt());
+        assert_eq!(shape(cx), Some(CursorStyle::Bar));
+
+        cx.update(|cx| cx.global_mut::<Config>().prompt_cursor_style = PromptCursorStyle::Follow);
+        assert_eq!(shape(cx), None, "follow leaves the prompt on cursor_style");
+        cx.update(|cx| cx.global_mut::<Config>().prompt_cursor_style = PromptCursorStyle::Bar);
+
+        DaemonMsg::Output(b"\x1b]133;V;1\x07\x1b]133;B\x07".to_vec())
+            .encode(&mut daemon)
+            .unwrap();
+        wait_for(cx, &|view| view.terminal.shell_vi_mode());
+        assert_eq!(
+            shape(cx),
+            None,
+            "a vi-mode prompt keeps the shell's own shapes"
+        );
+
+        DaemonMsg::Prompt {
+            active: true,
+            at_prompt: false,
+            last_exit: None,
+        }
+        .encode(&mut daemon)
+        .unwrap();
+        wait_for(cx, &|view| !view.terminal.at_prompt());
+        assert_eq!(shape(cx), None, "a running command gets cursor_style back");
+    }
+
+    /// Seeds a pane's history for the ghost tests: `(command, dirs, exit)`,
+    /// oldest first, with `cwd` as the directory the pane is in.
+    fn seed_ghost_history(
+        view: &mut TerminalView,
+        entries: &[(&str, &[&str], Option<i32>)],
+        cwd: Option<&str>,
+    ) {
+        view.history = entries.iter().map(|(cmd, _, _)| cmd.to_string()).collect();
+        view.history_cwds.clear();
+        view.history_meta.clear();
+        for (cmd, dirs, exit) in entries {
+            view.history_cwds.insert(
+                cmd.to_string(),
+                dirs.iter().map(|d| d.to_string()).collect(),
+            );
+            view.history_meta.insert(
+                cmd.to_string(),
+                crate::terminal::history::EntryMeta {
+                    ts: None,
+                    exit: *exit,
+                },
+            );
+        }
+        view.rerank_history(cwd.map(std::path::Path::new));
+    }
+
+    #[gpui::test]
+    fn ghost_suggests_the_command_just_run_over_a_frequent_one(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, _| {
+                seed_ghost_history(
+                    view,
+                    &[
+                        ("git checkout main", &["/work/proj"], Some(0)),
+                        ("git commit -m x", &["/work/proj"], Some(0)),
+                    ],
+                    Some("/work/proj"),
+                );
+                view.history_counts
+                    .insert("git checkout main".to_string(), 20);
+                view.rerank_history(Some(std::path::Path::new("/work/proj")));
+                view.cmd.set("git c");
+                assert_eq!(
+                    view.ghost_suggestion().as_deref(),
+                    Some("git commit -m x"),
+                    "recency decides the ghost, however often the older one ran"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn ghost_prefers_this_directory_then_falls_back_to_anywhere(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, _| {
+                seed_ghost_history(
+                    view,
+                    &[
+                        ("cargo build", &["/work/proj"], None),
+                        ("cargo test --all", &["/elsewhere"], None),
+                        ("npm run dev", &["/elsewhere"], None),
+                    ],
+                    Some("/work/proj"),
+                );
+                view.cmd.set("cargo ");
+                assert_eq!(
+                    view.ghost_suggestion().as_deref(),
+                    Some("cargo build"),
+                    "an older match run here beats a newer one run elsewhere"
+                );
+                view.cmd.set("npm ");
+                assert_eq!(
+                    view.ghost_suggestion().as_deref(),
+                    Some("npm run dev"),
+                    "with nothing run here, the newest match anywhere is offered"
+                );
+                view.cmd.set("python ");
+                assert_eq!(view.ghost_suggestion(), None);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn ghost_skips_commands_that_failed(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, _| {
+                seed_ghost_history(
+                    view,
+                    &[
+                        ("make test", &["/work/proj"], Some(0)),
+                        ("make tset", &["/work/proj"], Some(2)),
+                        ("make lint", &["/work/proj"], Some(1)),
+                    ],
+                    Some("/work/proj"),
+                );
+                view.cmd.set("make t");
+                assert_eq!(
+                    view.ghost_suggestion().as_deref(),
+                    Some("make test"),
+                    "the newer typo exited 2, so the older success is offered"
+                );
+                view.cmd.set("make l");
+                assert_eq!(
+                    view.ghost_suggestion(),
+                    None,
+                    "a command whose only run failed is never offered"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn ghost_names_what_up_arrow_recalls(cx: &mut TestAppContext) {
+        let (window, _daemon) = harness(cx);
+        window
+            .update(cx, |view, _, cx| {
+                seed_ghost_history(
+                    view,
+                    &[
+                        ("git status", &[], None),
+                        ("git log --oneline", &[], None),
+                        ("ls", &[], None),
+                        ("git push", &[], None),
+                        ("echo hi", &[], None),
+                    ],
+                    None,
+                );
+                view.history_counts.insert("git status".to_string(), 50);
+                view.rerank_history(None);
+                for typed in ["git", "git l", "e", "l"] {
+                    view.history_nav = None;
+                    view.cmd.set(typed);
+                    let ghost = view.ghost_suggestion();
+                    view.handle_editor_key(&key("up"), cx);
+                    assert_eq!(
+                        ghost.as_deref(),
+                        Some(view.cmd.text().as_str()),
+                        "ghost and ↑ disagree on {typed:?}"
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn submitting_a_command_again_moves_it_to_the_newest_entry(cx: &mut TestAppContext) {
+        crate::core::config::pin_test_config_dir();
+        let (window, mut daemon) = harness(cx);
+        prompt_ready(&window, cx, &mut daemon);
+
+        window
+            .update(cx, |view, _, cx| {
+                view.history = ["git status", "ls", "make"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+                view.cmd.set("git status");
+                view.submit_command(cx);
+                assert_eq!(
+                    view.history,
+                    ["ls", "make", "git status"],
+                    "one entry per command, at its latest run, as a reload leaves it"
+                );
+
+                view.cmd.set("");
+                view.handle_editor_key(&key("up"), cx);
+                assert_eq!(view.cmd.text(), "git status");
+                view.handle_editor_key(&key("up"), cx);
+                assert_eq!(view.cmd.text(), "make", "↑ never lands on a command twice");
             })
             .unwrap();
     }

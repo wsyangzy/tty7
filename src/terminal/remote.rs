@@ -14,12 +14,13 @@ use alacritty_terminal::vte::ansi::{self, CursorShape, CursorStyle};
 
 use crate::terminal::command_cursor::{CommandCursorStyle, CommandMark};
 use crate::terminal::parked_cursor::{CursorCut, ParkedCursorRepair, ParkedCursorScanner};
+use crate::terminal::prompt_reflow::{PromptBreak, PromptMark};
 
 use std::collections::VecDeque;
 
 use crate::core::cli_agent::{AgentSessionState, AgentStatus, CLIAgent};
 use crate::core::config::CursorStyle as ConfigCursorStyle;
-use crate::core::osc::{OscTokenizer, TitleEffect, TitleLifetime};
+use crate::core::osc::{Note, NoteBudget, OscTokenizer, TitleEffect, TitleLifetime};
 use crate::daemon::protocol::{
     AuthPromptKind, AuthResponse, ClientMsg, DaemonMsg, KnownHostEntry, KnownHostId,
     LoopbackForward, LoopbackForwardRequest, ManagedForward, NativeSshSpec, PaneProcs,
@@ -29,6 +30,7 @@ use crate::daemon::protocol::{
 };
 use crate::daemon::transport::{self, Stream};
 use gpui::EntityId;
+use tty7_core::core::term_modes::{COLOR_SCHEME_UPDATES, TerminalModes};
 
 use super::size::TermSize;
 
@@ -45,6 +47,7 @@ impl EventListener for EventProxy {
                 event,
                 AlacEvent::PtyWrite(_)
                     | AlacEvent::ColorRequest(..)
+                    | AlacEvent::TextAreaSizeRequest(_)
                     | AlacEvent::ClipboardStore(..)
                     | AlacEvent::ClipboardLoad(..)
                     | AlacEvent::Bell
@@ -107,13 +110,16 @@ struct ReaderSignals {
     /// which places/deletes them as `DaemonMsg::Image`/`DeleteImage` frames land.
     images: crate::terminal::images::ImageStore,
     clipboard_writes: Arc<Mutex<VecDeque<tty7_core::core::clipboard::ClipboardWrite>>>,
+    osc_notes: OscNotes,
     clipboard_write_busy: Arc<AtomicBool>,
-    agent_notifications: Arc<Mutex<VecDeque<(Option<String>, String)>>>,
+    lease: Arc<Mutex<Option<String>>>,
     /// Whether this pane's pty is one a conhost renders into, and so whether
     /// the reader puts back the cursor a repaint parked. Decided per pane from
     /// its [`PtySource`], and shared rather than copied because the reader can
     /// learn better mid-stream — see the `RemoteContext` arm.
     local_conpty: Arc<AtomicBool>,
+    /// Whether the program in the pane switched on DEC mode 2031.
+    color_scheme_updates: Arc<AtomicBool>,
 }
 
 /// What kind of pty is at the far end of a pane's link, which is what decides
@@ -168,6 +174,10 @@ pub struct PaneWorkspace {
     /// `false` whenever the answer is unknown (link down, server too old to
     /// advertise), which keeps the safe reflow-at-request behavior.
     pub resize_echo: bool,
+    /// Whether that daemon knows size leases — a phone running the pane at
+    /// its own size — so this client can ask to hear about them. Read off the
+    /// same hello, `false` when unknown, like `resize_echo`.
+    pub size_lease: bool,
 }
 
 impl PaneWorkspace {
@@ -224,6 +234,8 @@ pub enum PaneRoute {
         /// answer everywhere a route is assigned — spawn, attach, relink —
         /// and a relink builds its route fresh, so a reconnect re-answers it.
         resize_echo: bool,
+        /// As [`PaneWorkspace::size_lease`].
+        size_lease: bool,
     },
     Unroutable(String),
 }
@@ -236,6 +248,7 @@ impl PaneRoute {
                 Ok(header) => PaneRoute::Remote {
                     header: Box::new(header),
                     resize_echo: ws.resize_echo,
+                    size_lease: ws.size_lease,
                 },
                 Err(e) => PaneRoute::Unroutable(e.to_string()),
             },
@@ -575,6 +588,10 @@ pub struct RemoteTerminal {
     pub exited: bool,
     size: TermSize,
     synced_size: bool,
+    /// This link reattached to a pane that was already running rather than
+    /// spawning a fresh one, so whatever it reports first — an agent in the
+    /// foreground included — predates this client.
+    reattached: bool,
     /// The `(cell_w, cell_h)` last sent to the daemon, in device pixels. Tracked
     /// alongside `size` so a display-scale change still reaches the child even
     /// when the grid dimensions are unchanged.
@@ -614,8 +631,14 @@ pub struct RemoteTerminal {
     /// anchors are relative to, so the store lives here rather than in the daemon.
     images: crate::terminal::images::ImageStore,
     clipboard_writes: Arc<Mutex<VecDeque<tty7_core::core::clipboard::ClipboardWrite>>>,
+    osc_notes: OscNotes,
+    /// On the pane rather than its view so it survives a relink; only the
+    /// view's poll touches it.
+    note_budget: Mutex<NoteBudget>,
     clipboard_write_busy: Arc<AtomicBool>,
-    agent_notifications: Arc<Mutex<VecDeque<(Option<String>, String)>>>,
+    /// Who runs this pane at their own size — a phone, by the name it paired
+    /// under — while the daemon says so. See [`Self::take_back`].
+    lease: Arc<Mutex<Option<String>>>,
     route: PaneRoute,
     proxy: EventProxy,
     reader_thread: Option<JoinHandle<()>>,
@@ -633,6 +656,8 @@ pub struct RemoteTerminal {
     /// to it is rebuilt, and the route a relink carries cannot tell a
     /// native-SSH pane from a local shell.
     local_conpty: Arc<AtomicBool>,
+    /// Whether the program in the pane switched on DEC mode 2031.
+    color_scheme_updates: Arc<AtomicBool>,
 }
 
 /// The workspace id a spawn carries, so the pane's shell gets `$TTY7_WS` and a
@@ -789,6 +814,7 @@ impl RemoteTerminal {
             Self::from_stream_with(stream, size, Vec::new(), PtySource::for_route(route))?;
         term.route = route.clone();
         term.seed_cwd(spawned_in);
+        term.watch_leases();
         Ok((term, pane_id))
     }
 
@@ -859,6 +885,7 @@ impl RemoteTerminal {
         let mut term =
             Self::from_stream_parts(stream, size, buffered, PtySource::for_route(route), true)?;
         term.route = route.clone();
+        term.watch_leases();
         Ok(term)
     }
 
@@ -902,7 +929,8 @@ impl RemoteTerminal {
         }
         // Retired readers may still be finishing a batch. Give this link its
         // own queue so they cannot enqueue an old alert after a relink.
-        self.agent_notifications = Arc::new(Mutex::new(VecDeque::new()));
+        self.osc_notes = OscNotes::default();
+        self.note_budget = Mutex::new(NoteBudget::default());
         self.cursor_repair = Arc::new(Mutex::new(ParkedCursorRepair::default()));
         self.clipboard_write_busy.store(false, Ordering::Release);
 
@@ -958,13 +986,15 @@ impl RemoteTerminal {
                 phase: self.ssh_phase.clone(),
                 images: self.images.clone(),
                 clipboard_writes: self.clipboard_writes.clone(),
+                osc_notes: self.osc_notes.clone(),
                 clipboard_write_busy: self.clipboard_write_busy.clone(),
-                agent_notifications: self.agent_notifications.clone(),
+                lease: self.lease.clone(),
                 // Deliberately the pane's existing answer rather than one
                 // rebuilt from `route`: the pty on the far side is the same pty
                 // it was before the link dropped, and only this value still
                 // remembers what a `RemoteContext` taught the old reader.
                 local_conpty: self.local_conpty.clone(),
+                color_scheme_updates: self.color_scheme_updates.clone(),
             },
         );
         self.reader_thread = Some(reader);
@@ -974,6 +1004,12 @@ impl RemoteTerminal {
         // `LinkWriter` through its `Drop`, which is what closes the old socket.
         self.link = LinkWriter::new(stream, self.input_loss())?;
         self.route = route.clone();
+        // The new link has told us nothing yet; the daemon repeats a lease
+        // that still stands when we ask again.
+        if let Ok(mut guard) = self.lease.lock() {
+            *guard = None;
+        }
+        self.watch_leases();
         self.synced_size = false;
         self.resize(size, cell_w, cell_h);
         Ok(())
@@ -1056,11 +1092,13 @@ impl RemoteTerminal {
         let ssh_phase: Arc<Mutex<Option<SshPhase>>> = Arc::new(Mutex::new(None));
         let images = crate::terminal::images::ImageStore::new();
         let clipboard_writes = Arc::new(Mutex::new(VecDeque::new()));
+        let osc_notes = OscNotes::default();
         let clipboard_write_busy = Arc::new(AtomicBool::new(false));
-        let agent_notifications = Arc::new(Mutex::new(VecDeque::new()));
+        let lease = Arc::new(Mutex::new(None));
 
         let reader_quit = Arc::new(AtomicBool::new(false));
         let local_conpty = Arc::new(AtomicBool::new(pty == PtySource::LocalConpty));
+        let color_scheme_updates = Arc::new(AtomicBool::new(false));
         let reader_thread = Self::spawn_reader(
             term.clone(),
             proxy.clone(),
@@ -1084,9 +1122,11 @@ impl RemoteTerminal {
                 phase: ssh_phase.clone(),
                 images: images.clone(),
                 clipboard_writes: clipboard_writes.clone(),
+                osc_notes: osc_notes.clone(),
                 clipboard_write_busy: clipboard_write_busy.clone(),
-                agent_notifications: agent_notifications.clone(),
+                lease: lease.clone(),
                 local_conpty: local_conpty.clone(),
+                color_scheme_updates: color_scheme_updates.clone(),
             },
         );
 
@@ -1103,6 +1143,7 @@ impl RemoteTerminal {
             exited: false,
             size,
             synced_size: false,
+            reattached: awaiting_replay,
             synced_cell: (0, 0),
             resize_sent_at: None,
             link,
@@ -1123,13 +1164,16 @@ impl RemoteTerminal {
             agent_session,
             images,
             clipboard_writes,
+            osc_notes,
+            note_budget: Mutex::default(),
             clipboard_write_busy,
-            agent_notifications,
+            lease,
             route: PaneRoute::Local,
             proxy,
             reader_thread: Some(reader_thread),
             reader_quit,
             local_conpty,
+            color_scheme_updates,
         })
     }
 
@@ -1147,7 +1191,8 @@ impl RemoteTerminal {
     pub fn detach_link(&mut self) {
         self.link.send(ClientMsg::Detach);
         self.stop_reader();
-        self.agent_notifications = Arc::new(Mutex::new(VecDeque::new()));
+        self.osc_notes = OscNotes::default();
+        self.note_budget = Mutex::new(NoteBudget::default());
         self.poll_exited();
     }
 
@@ -1201,9 +1246,11 @@ impl RemoteTerminal {
                     phase,
                     images,
                     clipboard_writes,
+                    osc_notes,
                     clipboard_write_busy,
-                    agent_notifications,
+                    lease,
                     local_conpty,
+                    color_scheme_updates,
                 } = signals;
                 let mut awaiting_replay = awaiting_replay;
                 crate::core::threads::promote_to_user_interactive();
@@ -1229,6 +1276,14 @@ impl RemoteTerminal {
                 // against the bytes before its `D`, not the whole batch.
                 let mut command_tok = OscTokenizer::new(&[b"133"]);
                 let mut command_cursor = CommandCursorStyle::default();
+                let mut prompt_break = PromptBreak::default();
+                // A new link replays the pane from scratch, 2031 included
+                // (`term_modes` restores it ahead of the ring).
+                let mut modes = TerminalModes::new();
+                color_scheme_updates.store(false, Ordering::Relaxed);
+                // Set by a replay, sent by the first frame after it: a replay
+                // is a modes Snapshot plus one per ring segment.
+                let mut report_scheme = false;
                 let mut pending: Vec<u8> = buffered;
                 // Kitty-graphics decode runs on its own thread with newest-frame
                 // coalescing (issue #213): inflating a full-window browser frame
@@ -1325,6 +1380,9 @@ impl RemoteTerminal {
                                             ReaderCut::Command(mark) => {
                                                 command_cursor.apply(term, mark)
                                             }
+                                            ReaderCut::Prompt(mark) => {
+                                                prompt_break.apply(term, mark)
+                                            }
                                         },
                                     ) else {
                                         return;
@@ -1334,17 +1392,8 @@ impl RemoteTerminal {
                                         tr_adv_t += t0.elapsed() - waited;
                                     }
                                 }
-                                let mut notes = Vec::new();
-                                osc.feed(&out_batch, &mut notes);
-                                if let Ok(mut pending) = agent_notifications.lock() {
-                                    for note in notes {
-                                        if pending.len() == MAX_TERMINAL_NOTIFICATIONS {
-                                            pending.pop_front();
-                                        }
-                                        // Identity can arrive after output. Every OSC
-                                        // alert goes through the view's live policy.
-                                        pending.push_back(note);
-                                    }
+                                if let Ok(mut notes) = osc_notes.lock() {
+                                    osc.feed(&out_batch, &mut *notes);
                                 }
                                 mode_tok.feed(&out_batch, |payload| {
                                     if let Some(mode) = payload.strip_prefix(b"133;V;") {
@@ -1428,6 +1477,21 @@ impl RemoteTerminal {
                                 break 'main;
                             }
                         };
+                        // Once per replay (a modes Snapshot, then one per
+                        // ring segment), at the first frame past the ring —
+                        // not when what was read runs out: an 8 MiB ring
+                        // takes many reads, and a read that ends between the
+                        // segment holding a dead program's `?2031h` and the
+                        // one holding the prompt that ended it would report
+                        // into the shell. A live Output reports once folded.
+                        if !matches!(
+                            msg,
+                            DaemonMsg::Size(_) | DaemonMsg::Snapshot(_) | DaemonMsg::Output(_)
+                        ) && std::mem::take(&mut report_scheme)
+                            && modes.is_on(COLOR_SCHEME_UPDATES)
+                        {
+                            proxy.send_event(super::color_scheme::query_reply());
+                        }
                         match msg {
                             // Geometry, applied at this exact stream position.
                             // During replay each ring segment is preceded by
@@ -1473,11 +1537,14 @@ impl RemoteTerminal {
                                 let fed =
                                     feed_grid(&term, &mut processor, &bytes, cuts, &quit, |term, cut| {
                                         match cut {
-                                            ReaderCut::Parked(cut) => {
-                                                cursor_repair.lock().unwrap().apply(term, cut)
-                                            }
                                             ReaderCut::Command(mark) => {
                                                 command_cursor.apply(term, mark)
+                                            }
+                                            ReaderCut::Prompt(mark) => {
+                                                prompt_break.apply(term, mark)
+                                            }
+                                            ReaderCut::Parked(cut) => {
+                                                cursor_repair.lock().unwrap().apply(term, cut)
                                             }
                                         }
                                     });
@@ -1500,6 +1567,12 @@ impl RemoteTerminal {
                                     }
                                 });
                                 proxy.replaying.store(false, Ordering::Relaxed);
+                                // A replayed `?996n` was answered long ago,
+                                // but the theme may have flipped while the pane
+                                // was detached, so say what it is now.
+                                super::color_scheme::fold(&mut modes, &bytes, &color_scheme_updates);
+                                modes.take_color_scheme_queries();
+                                report_scheme = true;
                                 // The replay carries the pane's recent marks,
                                 // so reading it is what lets a reattached
                                 // window know whether the title it just
@@ -1521,6 +1594,15 @@ impl RemoteTerminal {
                                 // time, and that report would be discounted.
                                 awaiting_replay = false;
                                 replaying_state = false;
+                                super::color_scheme::fold(&mut modes, &bytes, &color_scheme_updates);
+                                if std::mem::take(&mut report_scheme)
+                                    && modes.is_on(COLOR_SCHEME_UPDATES)
+                                {
+                                    proxy.send_event(super::color_scheme::query_reply());
+                                }
+                                for _ in 0..modes.take_color_scheme_queries() {
+                                    proxy.send_event(super::color_scheme::query_reply());
+                                }
                                 out_batch.extend_from_slice(&bytes);
                                 tr_frames += 1;
                             }
@@ -1734,6 +1816,12 @@ impl RemoteTerminal {
                                 }
                                 proxy.send_event(AlacEvent::Wakeup);
                             }
+                            DaemonMsg::Lease(by) => {
+                                if let Ok(mut guard) = lease.lock() {
+                                    *guard = by;
+                                }
+                                proxy.send_event(AlacEvent::Wakeup);
+                            }
                             DaemonMsg::Exited { .. } => {
                                 flush_batch!();
                                 child_exited.store(true, Ordering::SeqCst);
@@ -1832,6 +1920,10 @@ impl RemoteTerminal {
         self.local_conpty.load(Ordering::Relaxed)
     }
 
+    pub(super) fn color_scheme_updates(&self) -> bool {
+        self.color_scheme_updates.load(Ordering::Relaxed)
+    }
+
     /// Queues a keystroke — or a paste, or a mouse report — for the link.
     ///
     /// Callers are gpui event handlers on the UI thread, so this returns
@@ -1867,6 +1959,41 @@ impl RemoteTerminal {
             PaneRoute::Remote { resize_echo, .. } => *resize_echo,
             PaneRoute::Unroutable(_) => false,
         }
+    }
+
+    /// Whether the daemon behind this pane knows size leases, asked the way
+    /// [`Self::resize_echoed`] asks: never over the network from here.
+    fn leases_supported(&self) -> bool {
+        match &self.route {
+            PaneRoute::Local => crate::daemon::spawn::local_daemon_supports(
+                crate::daemon::protocol::FEATURE_SIZE_LEASE,
+            ),
+            PaneRoute::Remote { size_lease, .. } => *size_lease,
+            PaneRoute::Unroutable(_) => false,
+        }
+    }
+
+    /// Asks to be told when a phone runs this pane at its own size. Only
+    /// where the daemon knows leases: an older one drops a link that sends it.
+    fn watch_leases(&self) {
+        if self.leases_supported() {
+            self.link.send(ClientMsg::Lease(
+                crate::daemon::protocol::LeaseRequest::Watch,
+            ));
+        }
+    }
+
+    /// Who runs this pane at their own size right now, if anyone.
+    pub fn leased_by(&self) -> Option<String> {
+        self.lease.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Ends a phone's lease: the pane goes back to this window's size. The
+    /// daemon confirms with the lease ending, which clears [`Self::leased_by`].
+    pub fn take_back(&self) {
+        self.link.send(ClientMsg::Lease(
+            crate::daemon::protocol::LeaseRequest::TakeBack,
+        ));
     }
 
     pub fn resize(&mut self, size: TermSize, cell_w: u16, cell_h: u16) {
@@ -1956,6 +2083,11 @@ impl RemoteTerminal {
         self.remote_context.lock().ok().and_then(|g| g.clone())
     }
 
+    /// See the field: an attach to a running pane, not a fresh spawn.
+    pub fn reattached(&self) -> bool {
+        self.reattached
+    }
+
     pub fn at_prompt(&self) -> bool {
         self.shell_state
             .lock()
@@ -1988,6 +2120,30 @@ impl RemoteTerminal {
     /// and deletes images as out-of-band frames arrive from the daemon.
     pub fn images(&self) -> crate::terminal::images::ImageStore {
         self.images.clone()
+    }
+
+    /// Desktop notifications the program wrote (OSC 9, 99, 777), oldest
+    /// first; the view decides whether each is shown.
+    pub fn take_osc_notes(&self) -> Vec<Note> {
+        self.osc_notes
+            .lock()
+            .map(|mut notes| notes.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Of `notes` about to be shown, the ones this pane's [`NoteBudget`] lets
+    /// through, and whether notes it dropped earlier are due to be said.
+    pub fn pace_osc_notes(
+        &self,
+        mut notes: Vec<Note>,
+        now: std::time::Instant,
+    ) -> (Vec<Note>, bool) {
+        let Ok(mut budget) = self.note_budget.lock() else {
+            return (notes, false);
+        };
+        let (show, dropped) = budget.admit(now, notes.len());
+        notes.truncate(show);
+        (notes, dropped)
     }
 
     pub fn pop_clipboard_write(&self) -> Option<tty7_core::core::clipboard::ClipboardWrite> {
@@ -2095,21 +2251,29 @@ impl RemoteTerminal {
         }
     }
 
+    /// `remote_start_dir` is a directory on the far host, carried as
+    /// [`ClientMsg::SpawnNativeSsh`]'s `cwd`.
     pub fn spawn_native_ssh(
         size: TermSize,
         cell_w: u16,
         cell_h: u16,
-        cwd: Option<PathBuf>,
+        remote_start_dir: Option<PathBuf>,
         spec: Box<NativeSshSpec>,
     ) -> anyhow::Result<(Self, u64)> {
-        match Self::spawn_native_ssh_once(size, cell_w, cell_h, cwd.clone(), spec.clone()) {
+        match Self::spawn_native_ssh_once(
+            size,
+            cell_w,
+            cell_h,
+            remote_start_dir.clone(),
+            spec.clone(),
+        ) {
             Err(first_err) if daemon_disconnected_before_spawn_reply(&first_err) => {
                 if let Err(restart_err) = crate::daemon::spawn::restart() {
                     return Err(anyhow::anyhow!(
                         "daemon disconnected before SpawnNativeSsh reply ({first_err}); restart failed: {restart_err}"
                     ));
                 }
-                Self::spawn_native_ssh_once(size, cell_w, cell_h, cwd, spec).map_err(|second_err| {
+                Self::spawn_native_ssh_once(size, cell_w, cell_h, remote_start_dir, spec).map_err(|second_err| {
                     anyhow::anyhow!(
                         "daemon disconnected before SpawnNativeSsh reply ({first_err}); restarted daemon but it still failed: {second_err}"
                     )
@@ -2123,7 +2287,7 @@ impl RemoteTerminal {
         size: TermSize,
         cell_w: u16,
         cell_h: u16,
-        cwd: Option<PathBuf>,
+        remote_start_dir: Option<PathBuf>,
         spec: Box<NativeSshSpec>,
     ) -> anyhow::Result<(Self, u64)> {
         let mut stream = connect()?;
@@ -2133,7 +2297,7 @@ impl RemoteTerminal {
         let auto_supplied_password = spec.password.is_some();
 
         ClientMsg::SpawnNativeSsh {
-            cwd,
+            cwd: remote_start_dir,
             size: win,
             spec,
         }
@@ -2164,13 +2328,6 @@ impl RemoteTerminal {
         term.ssh_user = Some(user);
         term.auto_supplied_password = auto_supplied_password;
         Ok((term, pane_id))
-    }
-
-    pub fn take_terminal_notifications(&self) -> Vec<(Option<String>, String)> {
-        self.agent_notifications
-            .lock()
-            .map(|mut pending| pending.drain(..).collect())
-            .unwrap_or_default()
     }
 
     pub fn take_auth_prompt(&self) -> Option<(u64, AuthPromptKind)> {
@@ -2381,6 +2538,29 @@ impl RemoteTerminal {
         query(pane_id, forward_id)
             .inspect_err(|e| log::warn!("RemoveForward failed: {e}"))
             .ok()
+    }
+
+    /// The list after switching one forward on or off, or why it was not
+    /// switched — the daemon's own refusal, which names what is in the way.
+    pub fn set_forward_enabled(
+        pane_id: u64,
+        forward_id: u64,
+        enabled: bool,
+    ) -> anyhow::Result<Vec<ManagedForward>> {
+        let mut stream = connect()?;
+        ClientMsg::SetForwardEnabled {
+            pane_id,
+            forward_id,
+            enabled,
+        }
+        .encode(&mut stream)?;
+        match DaemonMsg::read(&mut stream)? {
+            DaemonMsg::ForwardList(list) => Ok(list),
+            DaemonMsg::Error(msg) => Err(anyhow::anyhow!(msg)),
+            other => Err(anyhow::anyhow!(
+                "unexpected reply to SetForwardEnabled: {other:?}"
+            )),
+        }
     }
 
     pub fn list_forwards(pane_id: u64) -> Vec<ManagedForward> {
@@ -3179,36 +3359,48 @@ mod notification_tests {
     }
 }
 
+type OscNotes = Arc<Mutex<VecDeque<Note>>>;
+
+/// Notes queued for a view that has not polled: a burst keeps only its
+/// newest few, so it shows as a few rather than a spray.
+const MAX_OSC_NOTES: usize = 3;
+
 struct OscNotifyScanner {
     tok: OscTokenizer,
+    notes: crate::core::osc::Notifications,
 }
 
 impl Default for OscNotifyScanner {
     fn default() -> Self {
         Self {
-            tok: OscTokenizer::new(&[b"9", b"777"]),
+            tok: OscTokenizer::new(&[b"9", b"99", b"777"]),
+            notes: Default::default(),
         }
     }
 }
 
 impl OscNotifyScanner {
-    fn feed(&mut self, bytes: &[u8], out: &mut Vec<(Option<String>, String)>) {
+    fn feed(&mut self, bytes: &[u8], out: &mut VecDeque<Note>) {
+        let notes = &mut self.notes;
         self.tok.feed(bytes, |payload| {
-            if let Some(note) = parse_osc_notification(payload) {
-                if out.len() == MAX_TERMINAL_NOTIFICATIONS {
-                    out.remove(0);
+            if let Some(note) = parse_osc_notification(notes, payload) {
+                if out.len() >= MAX_OSC_NOTES {
+                    out.pop_front();
                 }
-                out.push(note);
+                out.push_back(note);
             }
         });
     }
 }
 
-fn parse_osc_notification(payload: &[u8]) -> Option<(Option<String>, String)> {
+fn parse_osc_notification(
+    notes: &mut crate::core::osc::Notifications,
+    payload: &[u8],
+) -> Option<Note> {
     if crate::core::cli_agent::parse_agent_event(payload).is_some() {
         return None;
     }
-    let (title, body) = crate::core::osc::parse_notification(payload)?;
+    let (title, body) = notes.parse(payload)?;
     if title.as_deref() == Some(crate::core::cli_agent::AGENT_EVENT_SENTINEL) {
         return None;
     }
@@ -3511,6 +3703,7 @@ mod chunking_tests {
         let mut processor: ansi::Processor = ansi::Processor::new();
         let mut command_tok = OscTokenizer::new(&[b"133"]);
         let mut command_cursor = CommandCursorStyle::default();
+        let mut prompt_break = PromptBreak::default();
         let quit = AtomicBool::new(false);
         let mut bytes = b"\x1b[5 q\x1b[2;3H\x1b]133;C\x07\x1b[2 q\x1b[?25l".to_vec();
         // Split a cursor move across the lock boundary inside a ConPTY frame.
@@ -3526,6 +3719,7 @@ mod chunking_tests {
                 match cut {
                     ReaderCut::Parked(cut) => repair.lock().unwrap().apply(term, cut),
                     ReaderCut::Command(mark) => command_cursor.apply(term, mark),
+                    ReaderCut::Prompt(mark) => prompt_break.apply(term, mark),
                 }
             })
             .is_some()
@@ -3543,6 +3737,7 @@ mod chunking_tests {
                 match cut {
                     ReaderCut::Parked(cut) => repair.lock().unwrap().apply(term, cut),
                     ReaderCut::Command(mark) => command_cursor.apply(term, mark),
+                    ReaderCut::Prompt(mark) => prompt_break.apply(term, mark),
                 }
             })
             .is_some()
@@ -3558,6 +3753,7 @@ mod chunking_tests {
 enum ReaderCut {
     Parked(CursorCut),
     Command(CommandMark),
+    Prompt(PromptMark),
 }
 
 /// Adds the batch's command marks to `cuts`, keeping them in stream order
@@ -3567,6 +3763,8 @@ fn command_cuts(tok: &mut OscTokenizer, bytes: &[u8], cuts: &mut Vec<(usize, Rea
     tok.feed_at(bytes, |off, payload| {
         if let Some(mark) = CommandMark::parse(payload) {
             cuts.push((off, ReaderCut::Command(mark)));
+        } else if let Some(mark) = PromptMark::parse(payload) {
+            cuts.push((off, ReaderCut::Prompt(mark)));
         }
     });
     if before > 0 && cuts.len() > before {
@@ -3747,7 +3945,7 @@ mod replay_tests {
 
             let mut notes = Vec::new();
             for _ in 0..200 {
-                notes.extend(term.take_terminal_notifications());
+                notes.extend(term.take_osc_notes());
                 if notes.len() == 2 {
                     break;
                 }
@@ -3762,7 +3960,7 @@ mod replay_tests {
                 "{} notifications must follow the view policy",
                 agent.display_name(),
             );
-            assert!(term.take_terminal_notifications().is_empty());
+            assert!(term.take_osc_notes().is_empty());
         }
     }
 
@@ -3775,7 +3973,7 @@ mod replay_tests {
         let mut term = RemoteTerminal::from_stream(client, TermSize::new(80, 24)).unwrap();
         // OSC precedes the first Agent frame. That frame flushes output before
         // setting identity, so these must still be queued rather than displayed.
-        let output: String = (0..MAX_TERMINAL_NOTIFICATIONS * 2)
+        let output: String = (0..MAX_OSC_NOTES * 2)
             .map(|n| format!("\x1b]9;notice {n}\x07"))
             .collect();
         DaemonMsg::Output(output.into_bytes())
@@ -3792,15 +3990,15 @@ mod replay_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(term.foreground_agent(), Some(CLIAgent::Codex));
-        let notes = term.take_terminal_notifications();
-        assert_eq!(notes.len(), MAX_TERMINAL_NOTIFICATIONS);
-        assert_eq!(notes[0].1, format!("notice {}", MAX_TERMINAL_NOTIFICATIONS));
+        let notes = term.take_osc_notes();
+        assert_eq!(notes.len(), MAX_OSC_NOTES);
+        assert_eq!(notes[0].1, format!("notice {}", MAX_OSC_NOTES));
         assert_eq!(
             notes.last().unwrap().1,
-            format!("notice {}", MAX_TERMINAL_NOTIFICATIONS * 2 - 1)
+            format!("notice {}", MAX_OSC_NOTES * 2 - 1)
         );
 
-        let retired_queue = term.agent_notifications.clone();
+        let retired_queue = term.osc_notes.clone();
         retired_queue
             .lock()
             .unwrap()
@@ -3820,7 +4018,7 @@ mod replay_tests {
             .lock()
             .unwrap()
             .push_back((None, "late old approval".into()));
-        assert!(term.take_terminal_notifications().is_empty());
+        assert!(term.take_osc_notes().is_empty());
         DaemonMsg::Snapshot(b"\x1b]9;replayed approval\x07".to_vec())
             .encode(&mut new_daemon)
             .unwrap();
@@ -3830,7 +4028,7 @@ mod replay_tests {
         new_daemon.flush().unwrap();
         let mut notes = Vec::new();
         for _ in 0..200 {
-            notes.extend(term.take_terminal_notifications());
+            notes.extend(term.take_osc_notes());
             if !notes.is_empty() {
                 break;
             }
@@ -3842,16 +4040,16 @@ mod replay_tests {
     #[test]
     fn terminal_notification_scanning_bounds_batch_and_text() {
         let mut scanner = OscNotifyScanner::default();
-        let mut notes = Vec::new();
+        let mut notes = VecDeque::new();
         let title = "界".repeat(NOTIFY_TITLE_MAX * 2);
         let body = "文".repeat(NOTIFY_BODY_MAX * 2);
-        for _ in 0..MAX_TERMINAL_NOTIFICATIONS * 2 {
+        for _ in 0..MAX_OSC_NOTES * 2 {
             scanner.feed(
                 format!("\x1b]777;notify;{title};{body}\x07").as_bytes(),
                 &mut notes,
             );
         }
-        assert_eq!(notes.len(), MAX_TERMINAL_NOTIFICATIONS);
+        assert_eq!(notes.len(), MAX_OSC_NOTES);
         for (title, body) in notes {
             assert_eq!(title.unwrap().chars().count(), NOTIFY_TITLE_MAX + 1);
             assert_eq!(body.chars().count(), NOTIFY_BODY_MAX + 1);
@@ -4293,6 +4491,7 @@ mod replay_tests {
         PaneRoute::Remote {
             header: Box::new(crate::daemon::router::RouteHeader::wsl("Ubuntu-22.04")),
             resize_echo: true,
+            size_lease: false,
         }
     }
 
@@ -4726,6 +4925,7 @@ mod route_header_tests {
             spec: None,
             label: label.map(str::to_string),
             resize_echo: false,
+            size_lease: false,
         }
     }
 
@@ -4850,6 +5050,7 @@ mod parked_cursor_tests {
             let route = PaneRoute::Remote {
                 header: Box::new(header),
                 resize_echo: false,
+                size_lease: false,
             };
             assert_eq!(PtySource::for_route(&route), PtySource::Raw);
         }
@@ -5231,6 +5432,80 @@ mod replayed_mode_tests {
         );
         assert!(mode.contains(TermMode::SGR_MOUSE), "{mode:?}");
     }
+
+    /// #1074, checked against the emulator itself rather than against our
+    /// reading of it: wherever the ring's front falls, the prelude plus what
+    /// the ring still holds has to leave the client's kitty keyboard flags
+    /// where the whole stream leaves them — and its stacks too, which only
+    /// show once the program pops or switches screens, so those are probed
+    /// after.
+    #[test]
+    fn a_replay_prelude_lands_the_kitty_keyboard_flags_where_the_stream_does() {
+        use alacritty_terminal::event::VoidListener;
+
+        fn kitty_after(chunks: &[&[u8]], probes: &[&[u8]]) -> Vec<TermMode> {
+            let config = terminal_config_from_user(&crate::core::config::Config::default());
+            let mut term = Term::new(config, &TermSize::new(40, 10), VoidListener);
+            let mut processor: ansi::Processor = ansi::Processor::new();
+            for chunk in chunks {
+                processor.advance(&mut term, chunk);
+            }
+            let mut seen = vec![*term.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL];
+            for probe in probes {
+                processor.advance(&mut term, probe);
+                seen.push(*term.mode() & TermMode::KITTY_KEYBOARD_PROTOCOL);
+            }
+            seen
+        }
+
+        let streams: [&[u8]; 5] = [
+            // An agent CLI: one push at startup, a pop and push around a
+            // subprocess later on.
+            b"\x1b[>1uhello\r\n\x1b[<u$ ls\r\n\x1b[>1uback\r\n",
+            b"\x1b[>1u\x1b[?1049h\x1b[>7uframe\x1b[=3uframe\x1b[>5u",
+            b"\x1b[>1uidle\x1b[=0;1u\x1b[=1;2utyping",
+            b"\x1b[>1u\x1b[>3u\x1b[?1049h\x1b[>7u\x1b[<u\x1b[?1049l\x1b[<u\x1b[>2u",
+            b"\x1b[>1u\x1bc\x1b[>4uafter a reset",
+        ];
+        let probes: [&[u8]; 7] = [
+            b"\x1b[<u",
+            b"\x1b[?1049h",
+            b"\x1b[<u",
+            b"\x1b[?1049l",
+            b"\x1b[<u",
+            b"\x1b[<u",
+            b"\x1b[>8u",
+        ];
+        for stream in streams {
+            let whole = {
+                let mut m = TerminalModes::new();
+                m.feed(stream);
+                m
+            };
+            let expected = kitty_after(&[stream], &probes);
+            for cut in (0..=stream.len()).filter(|&i| i == stream.len() || stream[i] == 0x1b) {
+                let (dropped, kept) = stream.split_at(cut);
+                let (mut head, mut ring) = (TerminalModes::new(), TerminalModes::new());
+                head.feed(dropped);
+                ring.feed(kept);
+                // A ring that starts inside an alternate screen it later leaves
+                // is replayed onto the primary one — the DEC restore's own
+                // limit, not the keyboard's; there is no stack to push it to.
+                let restores_alt = whole.is_on(1049) && !ring.is_on(1049);
+                if head.is_on(1049) && !restores_alt {
+                    continue;
+                }
+                let prelude = whole.replay_prelude(&head, &ring).unwrap_or_default();
+                assert_eq!(
+                    kitty_after(&[&prelude, kept], &probes),
+                    expected,
+                    "cut at {cut} of {:?}, prelude {:?}",
+                    String::from_utf8_lossy(stream),
+                    String::from_utf8_lossy(&prelude),
+                );
+            }
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -5255,6 +5530,7 @@ mod tests {
             )),
             label: None,
             resize_echo: false,
+            size_lease: false,
         }
     }
 
@@ -5284,6 +5560,7 @@ mod tests {
                 PaneRoute::for_workspace(Some(&ws)),
                 PaneRoute::Remote {
                     resize_echo: true,
+                    size_lease: false,
                     ..
                 }
             ),
@@ -5301,6 +5578,7 @@ mod tests {
             spec: None,
             label: None,
             resize_echo: false,
+            size_lease: false,
         };
         let route = PaneRoute::for_workspace(Some(&ws));
         let header = route.header().expect("WSL is routed");
@@ -5319,6 +5597,7 @@ mod tests {
             spec: None,
             label: None,
             resize_echo: false,
+            size_lease: false,
         };
         let route = PaneRoute::for_workspace(Some(&ws));
         let header = route.header().expect("a local child is routable");
@@ -5342,6 +5621,7 @@ mod tests {
             spec: None,
             label: None,
             resize_echo: false,
+            size_lease: false,
         };
         let route = PaneRoute::for_workspace(Some(&ws));
         assert!(matches!(route, PaneRoute::Unroutable(_)));
@@ -6026,12 +6306,19 @@ mod tests {
 
     #[test]
     fn snapshot_replay_suppresses_query_replies_and_side_effects() {
+        crate::core::config::pin_test_config_dir();
         let (client_side, mut daemon_side) = UnixStream::pair().unwrap();
         let term = RemoteTerminal::from_stream(client_side, TermSize::new(80, 24)).unwrap();
 
-        DaemonMsg::Snapshot(b"\x1b[6n\x1b]11;?\x07\x1b]52;c;aGk=\x07\x07replayed".to_vec())
-            .encode(&mut daemon_side)
-            .unwrap();
+        // `CSI 14t` is the one query alacritty hands out as its own event
+        // (the pixel size lives with the view) rather than as a `PtyWrite`;
+        // answered from a replay, its `CSI 4;h;w t` lands on whatever reads
+        // the pane now — a shell prompt, once the TUI that asked has quit.
+        DaemonMsg::Snapshot(
+            b"\x1b[6n\x1b]11;?\x07\x1b[14t\x1b[16t\x1b[18t\x1b]52;c;aGk=\x07\x07replayed".to_vec(),
+        )
+        .encode(&mut daemon_side)
+        .unwrap();
         daemon_side.flush().unwrap();
 
         let mut events = Vec::new();
@@ -6053,11 +6340,33 @@ mod tests {
                 e,
                 AlacEvent::PtyWrite(_)
                     | AlacEvent::ColorRequest(..)
+                    | AlacEvent::TextAreaSizeRequest(_)
                     | AlacEvent::ClipboardStore(..)
                     | AlacEvent::ClipboardLoad(..)
                     | AlacEvent::Bell
             )),
             "replayed history must not re-answer queries or replay side effects"
+        );
+
+        DaemonMsg::Output(b"\x1b[14t".to_vec())
+            .encode(&mut daemon_side)
+            .unwrap();
+        daemon_side.flush().unwrap();
+        let mut got_size_request = false;
+        for _ in 0..200 {
+            while let Ok(ev) = term.events.try_recv() {
+                if matches!(ev, AlacEvent::TextAreaSizeRequest(_)) {
+                    got_size_request = true;
+                }
+            }
+            if got_size_request {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            got_size_request,
+            "a live pixel-size query must still be answered"
         );
 
         DaemonMsg::Output(b"\x1b[6n".to_vec())
@@ -6499,6 +6808,7 @@ mod tests {
         term.route = PaneRoute::Remote {
             header: Box::new(crate::daemon::router::RouteHeader::wsl("Ubuntu-22.04")),
             resize_echo: true,
+            size_lease: false,
         };
 
         term.resize(TermSize::new(120, 30), 8, 17);
@@ -6563,6 +6873,7 @@ mod tests {
         term.route = PaneRoute::Remote {
             header: Box::new(crate::daemon::router::RouteHeader::wsl("Ubuntu-22.04")),
             resize_echo: true,
+            size_lease: false,
         };
         daemon_side
             .set_read_timeout(Some(std::time::Duration::from_millis(150)))
@@ -6734,6 +7045,7 @@ mod tests {
         term.route = PaneRoute::Remote {
             header: Box::new(crate::daemon::router::RouteHeader::wsl("Ubuntu-22.04")),
             resize_echo: false,
+            size_lease: false,
         };
 
         term.resize(TermSize::new(120, 30), 8, 17);
@@ -6954,6 +7266,8 @@ mod tests {
                 project_cwd: None,
                 activity: 0,
                 turns: 0,
+                inferred: false,
+                readout: Default::default(),
             }))
             .encode(daemon)
             .unwrap();
@@ -7016,6 +7330,8 @@ mod tests {
             project_cwd: None,
             activity: 0,
             turns: 0,
+            inferred: false,
+            readout: Default::default(),
         }))
         .encode(&mut daemon_side)
         .unwrap();
@@ -7067,6 +7383,8 @@ mod tests {
             project_cwd: None,
             activity: 0,
             turns: 0,
+            inferred: false,
+            readout: Default::default(),
         }))
         .encode(&mut daemon_side)
         .unwrap();
@@ -7450,15 +7768,52 @@ mod tests {
 
 #[cfg(test)]
 mod osc_tests {
-    use super::{OscNotifyScanner, parse_osc_notification};
+    use super::{MAX_OSC_NOTES, Note, OscNotifyScanner, VecDeque, parse_osc_notification};
 
-    fn scan(chunks: &[&[u8]]) -> Vec<(Option<String>, String)> {
+    fn scan(chunks: &[&[u8]]) -> Vec<Note> {
         let mut s = OscNotifyScanner::default();
-        let mut out = Vec::new();
+        let mut out = VecDeque::new();
         for c in chunks {
             s.feed(c, &mut out);
         }
-        out
+        out.into()
+    }
+
+    /// A burst of notifications shows only its newest few, once.
+    #[test]
+    fn a_burst_of_notes_is_handed_over_as_its_newest_few() {
+        use crate::daemon::protocol::DaemonMsg;
+        use crate::terminal::size::TermSize;
+
+        crate::core::config::pin_test_config_dir();
+        let (client, mut daemon) = crate::terminal::view::test_stream_pair();
+        let term = super::RemoteTerminal::from_stream(client, TermSize::new(80, 24)).unwrap();
+        let burst: Vec<u8> = (0..40)
+            .flat_map(|n| format!("\x1b]9;note {n}\x07").into_bytes())
+            .collect();
+        DaemonMsg::Output(burst).encode(&mut daemon).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let taken = loop {
+            let batch = term.take_osc_notes();
+            if !batch.is_empty() || std::time::Instant::now() > deadline {
+                break batch;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let bodies: Vec<_> = taken.into_iter().map(|(_, body)| body).collect();
+        assert_eq!(bodies, ["note 37", "note 38", "note 39"]);
+        assert!(term.take_osc_notes().is_empty(), "the rest were dropped");
+    }
+
+    #[test]
+    fn an_unread_queue_keeps_only_the_newest_notes() {
+        let chunks: Vec<Vec<u8>> = (0..MAX_OSC_NOTES + 2)
+            .map(|n| format!("\x1b]9;note {n}\x07").into_bytes())
+            .collect();
+        let got = scan(&chunks.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        assert_eq!(got.len(), MAX_OSC_NOTES);
+        assert_eq!(got[0], (None, "note 2".to_string()));
     }
 
     #[test]
@@ -7510,16 +7865,35 @@ mod osc_tests {
     }
 
     #[test]
+    fn claude_codes_kitty_and_ghostty_channels() {
+        assert_eq!(
+            scan(&[
+                b"\x1b]99;i=3:d=0:p=title;Claude Code\x07\x1b]99;i=3:p=body;Done\x07",
+                b"\x1b]99;i=3:d=1:a=focus;\x07",
+            ]),
+            vec![(Some("Claude Code".to_string()), "Done".to_string())]
+        );
+        assert_eq!(
+            scan(&[b"\x1b]777;notify;Claude Code;Done\x07"]),
+            vec![(Some("Claude Code".to_string()), "Done".to_string())]
+        );
+    }
+
+    #[test]
     fn conemu_osc9_subcommands_are_not_notifications() {
         assert_eq!(scan(&[b"\x1b]9;4;1;50\x07"]), vec![]);
         assert_eq!(scan(&[b"\x1b]9;9;/home/u\x07"]), vec![]);
+        assert_eq!(scan(&[b"\x1b]9;12\x07"]), vec![], "a prompt mark");
+        assert_eq!(scan(&[b"\x1b]9;11;a comment\x07"]), vec![]);
+        assert_eq!(scan(&[b"\x1b]9;42\x07"]), vec![(None, "42".to_string())]);
     }
 
     #[test]
     fn parse_rejects_empty_and_unrelated() {
-        assert_eq!(parse_osc_notification(b"9;"), None);
-        assert_eq!(parse_osc_notification(b"777;notify;"), None);
-        assert_eq!(parse_osc_notification(b"8;;https://example.com"), None);
+        let n = &mut Default::default();
+        assert_eq!(parse_osc_notification(n, b"9;"), None);
+        assert_eq!(parse_osc_notification(n, b"777;notify;"), None);
+        assert_eq!(parse_osc_notification(n, b"8;;https://example.com"), None);
     }
 
     #[test]

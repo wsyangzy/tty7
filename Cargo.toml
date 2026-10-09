@@ -31,7 +31,16 @@ required-features = ["updater"]
 # client used only to *download* a `tty7-server` onto a remote machine
 # (decision D5). The server binary is the thing being downloaded, so it can
 # never take that path; the GUI, which is the client that pushes it, can.
-tty7-core = { path = "crates/tty7-core", features = ["gssapi", "remote-install"] }
+#
+# `github` is the right panel's GitHub tab: the same HTTPS client, pointed at
+# api.github.com.
+tty7-core = { path = "crates/tty7-core", features = ["gssapi", "remote-install", "github"] }
+# The mobile gateway, run by the local daemon while mobile access is on
+# (`core::mobile`). Lives in the GUI binary only: tty7-server is the lean static
+# binary pushed to remote machines, and must not grow iroh.
+tty7-gateway = { path = "crates/tty7-gateway" }
+# Draws the pairing code in Settings → Mobile.
+qrcode = { version = "0.14", default-features = false }
 
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
@@ -73,6 +82,17 @@ tempfile = "3"
 # userinfo and man-page names back out.
 url = "2"
 percent-encoding = "2"
+# The code editor's language-server client (`ui::lsp`). The same version
+# gpui-component's LSP hooks take their types from.
+lsp-types = { version = "0.97.0", features = ["proposed"] }
+
+# The code editor's file loading and saving (`ui::editor_text`). `encoding_rs`
+# decodes legacy-encoded text (GB18030, Windows-1252) and writes it back in the
+# same encoding, and `globset` matches `.editorconfig` section globs. Both are
+# already in the tree (via gpui's HTTP stack and its `ignore` walker), so they
+# pin no new code.
+encoding_rs = "0.8.35"
+globset = "0.4.20"
 
 # SSH profile ids in the connection manager UI (`ui::ssh_connect`,
 # `ui::settings`, the command palette). The profiles themselves — and the
@@ -254,6 +274,10 @@ ksni = { version = "0.3.6", default-features = false, features = ["blocking", "a
 # into test builds and never reaches a release binary.
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# tests/edns_z_flag.rs drives iroh's resolver, so the simple-dns patch below is
+# checked by the default `cargo test` CI runs, which skips tty7-gateway.
+iroh = "1.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true
@@ -279,7 +303,7 @@ edition = "2024"
 # they must never drift apart. This is the line a release bump edits (and the
 # one nightly's `awk '/^version = /'` stamps: it is the first such line in the
 # file, since the package entries above are all `version.workspace = true`).
-version = "26.9.3"
+version = "26.9.4"
 
 [workspace.dependencies]
 # Our fork's `tty7` branch carries the local customizations tty7 relies on:
@@ -337,12 +361,20 @@ smallvec = "1"
 smol = "2"
 
 [patch.crates-io]
-# Temporary until upstream russh releases gssapi-with-mic client auth support
-# (https://github.com/Eugeny/russh/pull/737) — remove this patch and take the
-# crates.io release once it lands. Pinned to an exact rev (never a branch):
-# russh is the SSH protocol layer handling user credentials, and a moving
-# branch on a third-party fork could change what `cargo update` builds.
-russh = { git = "https://github.com/ayamir/russh", rev = "0d1d073350ed823069252075cbf3db9672d5b490" }
+# Our fork (l0ng-ai/russh, branch `tty7`): ayamir's gssapi-with-mic client auth
+# (0d1d073) plus Eugeny/russh 58886f4d + 24e2c374, which stop zlib from
+# truncating packets that inflate past 2x — without them a host with
+# `Compression yes` connects and never prints a byte (#997). GSSAPI has since
+# landed upstream (#738, in 0.62.7 / 0.63), but 0.62.7 lacks 24e2c374 and 0.63
+# changes `check_server_key`; drop this patch when moving to 0.63.2+. Pinned
+# to an exact rev (never a branch): russh is the SSH protocol layer handling
+# user credentials, and `cargo update` must not change what it builds.
+russh = { git = "https://github.com/l0ng-ai/russh", rev = "34f73e68d875b6fc2529654102ee65bafc691c59" }
+# simple-dns 0.12.0 with the EDNS OPT TTL read at RFC 6891's offsets: upstream
+# takes the extended RCODE from the low byte, where the DO/Z flags live, so a
+# resolver that sets a Z bit (Clash-style fake-IP DNS does) turns every answer
+# into RCODE 16 and iroh resolves nothing — no relay, no phone off the LAN.
+simple-dns = { path = "vendor/simple-dns" }
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
@@ -401,6 +433,23 @@ codegen-units = 1
 #    the unmeasured items at an estimate instead, which `measure_all` would
 #    settle exactly at the price of laying out the whole document on the first
 #    frame (see `ui::diff_overlay::DIFF_LINE_H`).
+#
+# 5. A text layout remembers the width it was truncated to, and a size measured
+#    under truncation no longer answers a later measure that asks for the whole
+#    text. A flex item is measured against a squeezed width first and for its
+#    content size after; answering the second from the first laid every
+#    truncating name out as just its ellipsis (see the switcher's
+#    `a_truncating_name_beside_its_number_takes_the_room_it_has`).
+#
+# 6. `enter` and `tab` map to their native key equivalents in macOS menus.
+#    Without them NSMenuItem got the literal string "enter" and took its first
+#    character, so a `secondary-enter` item (ToggleFullscreen) read as ⌘E.
+#
+# 7. A right- or center-aligned line paints into a layer that covers where its
+#    glyphs land. The layer was sized from the unaligned origin, so an opaque
+#    quad painted over the glyphs later got no higher draw order than them, and
+#    the text showed through — the Changes panel's flush-right directory drew
+#    through the hover action buttons.
 #
 # Patching by source rather than editing the `gpui`/`gpui_platform` pins above is
 # deliberate: `gpui-component` declares its own `gpui` from the upstream URL, and

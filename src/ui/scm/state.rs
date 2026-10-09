@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use gpui::Entity;
 use gpui_component::input::InputState;
@@ -96,6 +96,14 @@ pub(crate) struct ScmPanelState {
     /// opening one by hand has to outlast the next file landing in it.
     pub(crate) collapsed: HashSet<ScmGroup>,
     pub(crate) toggled: HashSet<ScmGroup>,
+    /// Directories folded shut in the tree view, per group — the same
+    /// directory can be open under Changes and shut under Staged. Keyed by
+    /// the full repo-relative path of the (possibly compacted) row.
+    pub(crate) folded_dirs: HashSet<(ScmGroup, String)>,
+    /// The filter over the changed files. Created on first render like
+    /// `commit_input`, with the subscription that turns typing into a repaint.
+    pub(crate) filter: Option<Entity<InputState>>,
+    pub(crate) filter_sub: Option<gpui::Subscription>,
     /// Working directory → the repository root containing it, or `None` when
     /// there is none, with when the answer was given. The root is what every
     /// write runs from and what every cache is keyed by, so it is resolved
@@ -165,6 +173,14 @@ impl ScmPanelState {
         }
     }
 
+    /// Fold a tree directory shut, or open it again.
+    pub(crate) fn toggle_dir(&mut self, group: ScmGroup, key: String) {
+        let entry = (group, key);
+        if !self.folded_dirs.remove(&entry) {
+            self.folded_dirs.insert(entry);
+        }
+    }
+
     pub(crate) fn set_group_collapsed(&mut self, group: ScmGroup, collapsed: bool) {
         self.toggled.insert(group);
         if collapsed {
@@ -207,7 +223,12 @@ pub(crate) struct GraphState {
     /// The filter case-folds every subject and author; re-running that over
     /// 5000 commits on every frame while the box is open is real work, and
     /// even the unfiltered identity list is 40KB of indices a frame.
-    pub(crate) filter_cache: Option<(Option<String>, usize, Arc<Vec<usize>>)>,
+    ///
+    /// The page is held as a `Weak`, not as its address: a freed page's
+    /// allocation gets reused by the next one, and a bare pointer then says
+    /// "same page" for a shorter history — indices past its end, and a panic.
+    /// While this `Weak` lives the allocation cannot be handed out again.
+    pub(crate) filter_cache: Option<(Option<String>, Weak<CommitPage>, Arc<Vec<usize>>)>,
     /// An open "name a branch at this commit" input, and the rev it starts
     /// from. The panel's own naming row cannot serve this: it always creates
     /// at HEAD, and the whole point here is the commit under the cursor.

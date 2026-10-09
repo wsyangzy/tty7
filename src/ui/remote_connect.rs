@@ -157,8 +157,8 @@ pub fn filter_hosts(hosts: &[HostChoice], query: &str) -> Vec<HostChoice> {
 }
 
 fn host_score(query: &str, host: &HostChoice) -> Option<i32> {
-    let label = crate::ui::palette::fuzzy_score(query, &host.label);
-    let detail = crate::ui::palette::fuzzy_score(query, &host.detail).map(|score| score - 3);
+    let label = crate::ui::search::fuzzy_score(query, &host.label);
+    let detail = crate::ui::search::fuzzy_score(query, &host.detail).map(|score| score - 3);
     label.into_iter().chain(detail).max()
 }
 
@@ -436,7 +436,7 @@ fn new_session_token() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-fn client_hostname() -> String {
+pub(crate) fn client_hostname() -> String {
     static NAME: OnceLock<String> = OnceLock::new();
     NAME.get_or_init(|| {
         // Windows publishes the name in the environment, so the usual case

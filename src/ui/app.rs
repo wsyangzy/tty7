@@ -4,11 +4,7 @@ use gpui::{
 };
 use gpui_component::color_picker::{ColorPickerEvent, ColorPickerState};
 use gpui_component::input::{InputEvent, InputState};
-use gpui_component::select::{SearchableVec, SelectEvent, SelectState};
-use gpui_component::slider::{SliderEvent, SliderState};
-use gpui_component::{
-    ActiveTheme as _, IndexPath, InteractiveElementExt as _, TitleBar, WindowExt as _,
-};
+use gpui_component::{ActiveTheme as _, InteractiveElementExt as _, TitleBar, WindowExt as _};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,18 +20,19 @@ use crate::core::session::{
 use crate::core::shells::ShellInventory;
 use crate::core::ssh_config;
 use crate::core::window_state::{WindowGeometry as _, WindowState};
-use crate::daemon::protocol::{RemoteContext, ShellSpec, ssh_option_takes_value};
+use crate::daemon::protocol::{RemoteContext, RemoteKind, ShellSpec, ssh_option_takes_value};
 use crate::daemon::spawn::DaemonMismatch;
 use crate::terminal::view::{ChildExited, TerminalView};
 use crate::ui::forwards::{ForwardFields, added_forward, rule_of};
 use crate::ui::host_registry::HostId;
 use crate::ui::i18n::{L10nKey, set_locale, t, t_fmt, t_plural};
-use crate::ui::palette::{
-    ChromeState, Command, CommandGroup, CommandKind, PaletteEvent, PaletteView,
-};
 use crate::ui::pane::{CloseOutcome, Dir, Pane, PaneSlot};
 use crate::ui::presets::Fill;
 use crate::ui::scm::ScmIntent;
+use crate::ui::search::{
+    Avatar, Catalog, ChromeState, CommandGroup, CommandKind, Item, SearchEvent, SearchTab,
+    SearchView,
+};
 use crate::ui::settings::{Recording, SettingsSection, SettingsState, ThemeEditor};
 use crate::ui::theme::{apply_theme, set_menus};
 
@@ -44,6 +41,39 @@ pub(crate) enum SpawnAs {
     /// A local shell; `None` is whatever the default one is.
     Shell(Option<ShellSpec>),
     Ssh(Box<crate::daemon::protocol::NativeSshSpec>),
+}
+
+/// How a pane being opened relates to the pane it was opened from — which is
+/// what decides whether it may start in that pane's directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenedFrom {
+    /// A local shell.
+    LocalShell,
+    /// The source pane's own SSH host, dialled again (⌘T, ⌘D on an SSH pane).
+    SameSshHost,
+    /// A saved host or quick connect: a connection of its own, whatever pane
+    /// happened to be in front when it was asked for.
+    FreshSshHost,
+}
+
+/// The directory a pane opened from another one starts in.
+///
+/// `source_cwd` is the source pane's last reported directory, and on a remote
+/// pane that is a path on the far host. It carries over only to a pane on the
+/// same side of the link: a local shell takes a local pane's directory, and a
+/// redial of the same host takes the far shell's. Anything else starts where a
+/// fresh pane would — a local path handed to a remote `cd` names nothing there,
+/// and a remote one handed to a local spawn names nothing here.
+fn inherited_start_dir(
+    opened: OpenedFrom,
+    source_cwd: Option<std::path::PathBuf>,
+    source_is_remote: bool,
+) -> Option<std::path::PathBuf> {
+    match opened {
+        OpenedFrom::LocalShell => source_cwd.filter(|_| !source_is_remote),
+        OpenedFrom::SameSshHost => source_cwd,
+        OpenedFrom::FreshSshHost => None,
+    }
 }
 
 /// Where a row taken out of the new-tab menu lands.
@@ -141,6 +171,13 @@ pub(crate) const LINE_HEIGHT_STEP: f32 = 0.05;
 
 const MAX_CLOSED_TABS: usize = 20;
 
+/// How long ⌘⇧T waits for this window's queued edits to reach the machine
+/// before asking it for the newest closed tab: polls of [`REOPEN_SETTLE_POLL`].
+/// A close is one round trip; two seconds covers a slow link without making a
+/// wedged one hang the keypress.
+const REOPEN_SETTLE_POLLS: u32 = 40;
+const REOPEN_SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 const RESIZE_STEP: f32 = 0.05;
 
 pub(crate) const RECORD_COMMIT_DELAY_MS: u64 = 650;
@@ -215,7 +252,7 @@ pub(crate) fn document_column_px(body: f32, ratio: f32) -> Option<f32> {
     Some((body * ratio).clamp(DOCUMENT_MIN_W, body - TERMINAL_MIN_W))
 }
 
-pub(crate) const TITLE_BAR_HEIGHT: f32 = 40.;
+pub(crate) const TITLE_BAR_HEIGHT: f32 = 48.;
 
 /// Work to run against the settings window once it has been built.
 type SettingsFollowUp = Box<dyn FnOnce(&mut Tty7App, &mut Window, &mut Context<Tty7App>)>;
@@ -239,6 +276,7 @@ pub(crate) const TILE_SIZE_XS: f32 = 18.;
 pub(crate) const TILE_GLYPH_XS: f32 = 11.;
 
 /// Line-only controls share the toolbar icon size.
+#[allow(dead_code)]
 pub(crate) const TILE_GLYPH_LINE: f32 = 16.;
 
 pub(crate) const TILE_PAD: f32 = (TILE_SIZE - TILE_GLYPH) / 2.;
@@ -317,6 +355,57 @@ fn strip_band(viewport: Size<Pixels>, pad: Edges<Pixels>) -> Bounds<Pixels> {
 }
 
 pub(crate) const WINDOW_MARK_SIZE: f32 = 20.;
+
+/// A transparent sheet that answers one question: is the pointer inside the
+/// box it covers. Lay it over a region as that region's *last* child and read
+/// the flag to reveal chrome only while the pointer is there.
+///
+/// The obvious way to write this is `group_hover` on the region itself, and it
+/// does not work. Group hover asks whether the group's *hitbox* is the one
+/// under the pointer, and gpui's hit test stops at the first `occlude()`d
+/// element it meets on the way down. Tab chips and the chrome tiles are all
+/// occluding, so the region stopped counting as hovered the instant the
+/// pointer reached the very button it was revealing, and the button vanished
+/// from under the cursor. Painted last, this sheet's own hitbox sits in front
+/// of all of them, and it blocks nothing — it is not opaque, so the rows,
+/// chips and tiles underneath keep their clicks, cursors and tooltips.
+pub(crate) fn hover_sheet(id: &'static str, flag: &Rc<Cell<bool>>) -> gpui::Stateful<gpui::Div> {
+    use gpui::{InteractiveElement as _, StatefulInteractiveElement as _};
+    let flag = flag.clone();
+    gpui::div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .on_hover(move |over, window, _cx| {
+            if flag.get() != *over {
+                flag.set(*over);
+                window.refresh();
+            }
+        })
+}
+
+/// Whether a group of title-bar tiles paints this frame: always, unless
+/// `auto_hide_titlebar_buttons` is on, and then only while the pointer is over
+/// the bar the group sits in.
+pub(crate) fn titlebar_chrome_shown(auto_hide: bool, pointer_over_bar: bool) -> bool {
+    !auto_hide || pointer_over_bar
+}
+
+/// Take the paint off a chrome tile that [`titlebar_chrome_shown`] says is
+/// resting, and nothing else.
+///
+/// Opacity, not `invisible()`. Both keep the tile's slot, so revealing it never
+/// shifts what is beside it. But gpui skips a hidden element's whole paint
+/// pass, and that is where its click handler, its accessibility actions and
+/// its tooltip are registered: a hidden tile still shows up to a screen reader,
+/// by label, from prepaint, and then does nothing when pressed from there. At
+/// zero opacity the tile is fully there and merely not drawn.
+pub(crate) fn resting_chrome<E: gpui::Styled>(tile: E, shown: bool) -> E {
+    match shown {
+        true => tile,
+        false => tile.opacity(0.),
+    }
+}
 
 pub(crate) fn title_bar_drag(
     row: gpui::Stateful<gpui::Div>,
@@ -405,7 +494,19 @@ pub struct Tab {
     pub(crate) zoomed: Option<Entity<TerminalView>>,
     pub(crate) diff_overlay: Option<crate::ui::diff_overlay::DiffOverlayState>,
     pub(crate) code: Option<Box<crate::ui::code_editor::TabCode>>,
-    pub(crate) sidebar_group: std::cell::RefCell<Option<crate::core::group_key::GroupKey>>,
+    /// The pinned sidebar group this tab was put in, by id, or `None` to
+    /// leave it to auto grouping. A `Cell` because the sidebar files a tab
+    /// that walks into a pinned folder while it is working out where to draw
+    /// it, which it does from `&self`.
+    pub(crate) group: std::cell::Cell<Option<crate::core::group_key::GroupId>>,
+    /// The auto group this tab last resolved to. Stored nowhere — an auto
+    /// group is derived — but remembered here so a tab whose repo probe is
+    /// still in flight stays where it was instead of bouncing through
+    /// Ungrouped for the frames the probe takes.
+    pub(crate) auto_group: std::cell::RefCell<Option<crate::core::group_key::AutoKey>>,
+    /// Which pinned folder this tab was last seen inside, so it joins one only
+    /// on the way *in* — see [`crate::core::group_key::EntryWatch`].
+    pub(crate) folder_watch: std::cell::Cell<crate::core::group_key::EntryWatch>,
     pub(crate) overlay_top: OverlayTop,
     /// Whether this tab's document fills the workspace or docks beside the
     /// terminal, once the tab has been told. `None` follows `document_layout`
@@ -439,6 +540,25 @@ pub struct Tab {
     /// the tab no longer holds are dropped as the next one is written, so a
     /// closed pane leaves nothing behind either.
     focus_origin: std::collections::HashMap<(gpui::EntityId, Dir), gpui::EntityId>,
+    /// Set while the tab is asleep (#762): its panes were stopped and `pane`
+    /// is `Pane::Empty`. What is kept instead is what it takes to bring them
+    /// back — see [`Asleep`].
+    pub(crate) asleep: Option<Asleep>,
+}
+
+/// A sleeping tab: nothing of it runs, and everything a wake needs is here.
+///
+/// `layout` is the tab as the restore path reads a tab — pane ids, cwds,
+/// shells, agent sessions — so waking is that restore, run on one tab: each
+/// pane's id asks the daemon for the screen it stored when the pane was
+/// stopped, and an agent with a known session is resumed the way a reboot
+/// resumes it. `view` is what the tab is called in the meantime, read off
+/// the panes as they went to sleep (or off the tree's records, after a
+/// restart), since there is no terminal left to ask.
+pub(crate) struct Asleep {
+    pub(crate) layout: SessionPane,
+    pub(crate) view: tty7_core::core::tab_view::TabView,
+    pub(crate) home: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -459,10 +579,13 @@ impl Tab {
             code: None,
             overlay_top: OverlayTop::default(),
             document_layout: None,
-            sidebar_group: std::cell::RefCell::new(None),
+            group: std::cell::Cell::new(None),
+            auto_group: std::cell::RefCell::new(None),
+            folder_watch: std::cell::Cell::new(crate::core::group_key::EntryWatch::fresh()),
             tree_id: std::cell::Cell::new(tty7_core::core::machine::TabId::new()),
             last_used: std::cell::Cell::new(0),
             focus_origin: Default::default(),
+            asleep: None,
         }
     }
 
@@ -476,15 +599,33 @@ impl Tab {
             code: None,
             overlay_top: OverlayTop::default(),
             document_layout: None,
-            sidebar_group: std::cell::RefCell::new(
-                tree.sidebar_group
-                    .as_deref()
-                    .and_then(crate::core::group_key::GroupKey::decode),
-            ),
+            group: std::cell::Cell::new(tree.group),
+            auto_group: std::cell::RefCell::new(tree.last_auto.clone()),
+            // Only ever built for a tab that was just created elsewhere — by
+            // `tty7 tab new`, or another window — so it is as new as one
+            // opened here: opened inside a pinned folder, it joins it. Every
+            // window that hears of it reaches the same answer.
+            folder_watch: std::cell::Cell::new(crate::core::group_key::EntryWatch::fresh()),
             tree_id: std::cell::Cell::new(tree.id),
             last_used: std::cell::Cell::new(0),
             focus_origin: Default::default(),
+            asleep: None,
         }
+    }
+
+    pub(crate) fn is_asleep(&self) -> bool {
+        self.asleep.is_some()
+    }
+
+    /// The layout a sleeping tab will wake into; `None` for a tab that is awake.
+    pub(crate) fn asleep_layout(&self) -> Option<&SessionPane> {
+        self.asleep.as_ref().map(|a| &a.layout)
+    }
+
+    /// The agent a sleeping tab was running when it went to sleep, so its row
+    /// still says what it is while nothing in it can.
+    pub(crate) fn asleep_agent(&self) -> Option<crate::core::cli_agent::CLIAgent> {
+        self.asleep.as_ref().and_then(|a| a.view.agent)
     }
 
     fn focus_target(&self) -> Option<crate::ui::pane::PaneSlot> {
@@ -589,6 +730,14 @@ impl Tab {
         Option<std::path::PathBuf>,
     ) {
         let name = self.name.clone();
+        if let Some(asleep) = &self.asleep {
+            let view = tty7_core::core::tab_view::TabView {
+                id: self.tree_id.get(),
+                name,
+                ..asleep.view.clone()
+            };
+            return (view, asleep.home.clone());
+        }
         let Some(leaf) = self.title_leaf(window, cx) else {
             return (
                 tty7_core::core::tab_view::TabView {
@@ -762,13 +911,9 @@ pub(crate) struct WorkspaceRename {
 }
 
 pub(crate) struct GroupRename {
-    /// The group being renamed, by the key it had when the box opened.
-    ///
-    /// A custom group *is* its name — there is no group record anywhere for
-    /// an id to point at, only the tabs that claim it. So renaming one means
-    /// rewriting every tab that says the old name, and this is what says
-    /// which those are.
-    pub(crate) key: crate::core::group_key::GroupKey,
+    /// The pinned group being renamed. By id, so a rename that lands after
+    /// another window reordered or renamed the groups still names this one.
+    pub(crate) group: crate::core::group_key::GroupId,
     pub(crate) input: Entity<InputState>,
     pub(crate) _subs: Vec<Subscription>,
 }
@@ -826,11 +971,11 @@ pub struct Tty7App {
     _git_status_watch: Subscription,
     _pane_liveness_watch: Subscription,
     _appearance_watch: Subscription,
-    palette: Option<Entity<PaletteView>>,
-    palette_sub: Option<Subscription>,
-    /// Preset that was live when the palette's theme picker started previewing.
+    pub(crate) search: Option<Entity<SearchView>>,
+    search_sub: Option<Subscription>,
+    /// Preset that was live when the search's theme picker started previewing.
     /// `Some` means the theme on screen is a preview that was never written to
-    /// disk, and closing the palette without confirming puts this one back.
+    /// disk, and closing the search without confirming puts this one back.
     theme_preview_restore: Option<String>,
     pub(crate) closed: Vec<SessionTab>,
     pub(crate) renaming: Option<Renaming>,
@@ -858,19 +1003,25 @@ pub struct Tty7App {
     pub(crate) sftp_panel: crate::ui::sftp::SftpPanelState,
     pub(crate) right_panel: crate::ui::right_panel::RightPanelState,
     pub(crate) scm: crate::ui::scm::ScmPanelState,
+    pub(crate) github: crate::ui::github::GitHubPanelState,
     pub(crate) diff_probes_inflight:
         std::collections::HashSet<(crate::ui::host_ops::HostId, std::path::PathBuf)>,
     pub(crate) diff_probes_restale:
         std::collections::HashSet<(crate::ui::host_ops::HostId, std::path::PathBuf)>,
     pub(crate) file_tree: crate::ui::file_tree::FileTreeState,
+    pub(crate) panel_search: crate::ui::panel_search::PanelSearchState,
     pub(crate) editor: crate::ui::code_editor::EditorPanelState,
     pub(crate) sidebar_width: Rc<Cell<f32>>,
     pub(crate) sidebar_dragging: Rc<Cell<bool>>,
-    /// Whether the pointer is over the sidebar and over the tab strip. The
-    /// chrome tiles in each — new tab, the panel toggles, the app menu — are
-    /// drawn only while its own flag is set, so a window nobody is pointing at
-    /// carries no buttons at all. The right panel's own title bar is the
-    /// exception: its tiles are always painted while the panel is open.
+    /// Whether the pointer is over the sidebar and over the tab strip. With
+    /// `auto_hide_titlebar_buttons` on, the chrome tiles in each — new tab and
+    /// the panel toggles — are painted only while its own flag is set, so a
+    /// window nobody is pointing at carries no buttons at all. The right
+    /// panel's own title bar is the exception: its tiles are always painted
+    /// while the panel is open. Written by [`hover_sheet`]; nobody reads them
+    /// while the setting is off.
+    pub(crate) sidebar_chrome_hover: Rc<Cell<bool>>,
+    pub(crate) strip_chrome_hover: Rc<Cell<bool>>,
     /// How much width a settings row will actually get, measured once per
     /// render. `settings_row` is called from page builders that never see the
     /// window, and the answer differs per page — the SSH page spends a host
@@ -897,6 +1048,12 @@ pub struct Tty7App {
     pub(crate) right_panel_tab: RightPanelTab,
     pub(crate) sidebar_collapsed: bool,
     pub(crate) sidebar_scroll: gpui::ScrollHandle,
+    /// The tab whose sidebar row is brought into view the next time it is
+    /// drawn. Read by the row, not by `activate`: a new tab has no row yet,
+    /// and the list's children are groups, so a tab index is no child index.
+    /// Keyed by the tab's id, not its index, so a reorder or close in between
+    /// cannot point it at another tab.
+    pub(crate) sidebar_reveal: Rc<Cell<Option<tty7_core::core::machine::TabId>>>,
     pub(crate) reorder: Rc<RefCell<Option<crate::ui::reorder::Reorder>>>,
     /// The pane the pointer is over, so only that one offers its drag handle.
     pub(crate) pane_hover: Rc<Cell<Option<gpui::EntityId>>>,
@@ -926,12 +1083,21 @@ pub struct Tty7App {
     /// the sidebar — and takes no part in the reading.
     pub(crate) strip_slots: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     pub(crate) sidebar_slots: Rc<RefCell<Vec<Bounds<Pixels>>>>,
-    /// Where each custom group's block was drawn last frame, so a tab held
-    /// over one can be told which group it is over. Only custom groups are
-    /// here: a repo group's membership is decided by cwd, so dropping a tab
+    /// Where each pinned group's block was drawn last frame, so a tab held
+    /// over one can be told which group it is over. Only pinned groups are
+    /// here: an auto group's membership is decided by cwd, so dropping a tab
     /// into one has no meaning to record.
     pub(crate) sidebar_group_slots:
-        Rc<RefCell<Vec<(crate::core::group_key::GroupKey, Bounds<Pixels>)>>>,
+        Rc<RefCell<Vec<(crate::core::group_key::GroupId, Bounds<Pixels>)>>>,
+    /// Where the divider between the pinned groups and the rest was drawn
+    /// last frame. Everything below it is auto grouping's: a tab dropped
+    /// there leaves its pinned group, and an auto group's header lifted
+    /// above it is pinned.
+    pub(crate) sidebar_divider: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// This workspace's pinned groups and folds, as the machine tree holds
+    /// them. Adopted from every pull and every `GroupsChanged`, and pushed
+    /// back as one `WorkspaceSetGroups` whenever this window edits it.
+    pub(crate) sidebar_groups: crate::core::group_key::WorkspaceGroups,
     /// Where the active tab's panes were last drawn, which is the frame of
     /// reference a drag's landing is worked out in.
     pub(crate) pane_area: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -944,7 +1110,7 @@ pub struct Tty7App {
     /// it (where focus goes back to on close). `None` while settings is shut —
     /// and always in tests, which keep drawing settings over the workspace so
     /// they can drive it through the one test window they have.
-    settings_window: Option<(gpui::AnyWindowHandle, gpui::AnyWindowHandle)>,
+    pub(crate) settings_window: Option<(gpui::AnyWindowHandle, gpui::AnyWindowHandle)>,
     pub(crate) ssh_prompt: crate::ui::ssh_prompt::SshPromptState,
     /// A close question is on screen. It carries no target: the answer acts on
     /// the tab or pane captured when the question was raised, not on whatever
@@ -989,16 +1155,45 @@ pub struct Tty7App {
 pub(crate) enum CloseTarget {
     Tab(tty7_core::core::machine::TabId),
     Pane,
+    /// Close Other Tabs, keeping this one.
+    OtherTabs(tty7_core::core::machine::TabId),
+    /// Close Tabs to the Right of this one.
+    TabsRightOf(tty7_core::core::machine::TabId),
 }
 
 /// Why closing needs a question first. Closing a tab is the highest-frequency
 /// destructive key in any terminal, and the product's headline claim is that
 /// shells outlive the app — so the one action that permanently ends one has to
 /// name what it is about to end.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CloseReason {
     LiveSsh,
     Busy(crate::terminal::view::PaneBusy),
+    /// Nothing is running; the user asked to be asked anyway
+    /// ([`ConfirmClose::Always`](crate::core::config::ConfirmClose::Always)).
+    Idle,
+    /// A bulk close of this many tabs, asked about once for all of them.
+    Tabs(usize),
+}
+
+/// Whether closing one pane needs a question, and which.
+///
+/// The SSH warning comes first and is not governed by `mode`: it is an opt-in
+/// of its own, and `Never` must not quietly switch it off.
+fn close_reason(
+    mode: crate::core::config::ConfirmClose,
+    warn_ssh: bool,
+    busy: Option<crate::terminal::view::PaneBusy>,
+) -> Option<CloseReason> {
+    use crate::core::config::ConfirmClose;
+    if warn_ssh {
+        return Some(CloseReason::LiveSsh);
+    }
+    match mode {
+        ConfirmClose::Never => None,
+        ConfirmClose::WhenBusy => busy.map(CloseReason::Busy),
+        ConfirmClose::Always => Some(busy.map_or(CloseReason::Idle, CloseReason::Busy)),
+    }
 }
 
 /// The question to put to the user before ending work that is still going on.
@@ -1021,6 +1216,17 @@ fn close_prompt(ends_the_tab: bool, reason: &CloseReason) -> (String, String) {
             };
             (title.to_string(), body)
         }
+        CloseReason::Idle => {
+            let title = match ends_the_tab {
+                true => t(L10nKey::CloseTabBusyTitle),
+                false => t(L10nKey::ClosePaneBusyTitle),
+            };
+            (title.to_string(), t(L10nKey::CloseIdleBody).to_string())
+        }
+        CloseReason::Tabs(count) => (
+            crate::ui::i18n::t_plural(L10nKey::CloseTabsTitle, *count, &[]),
+            t(L10nKey::CloseTabsBody).to_string(),
+        ),
     }
 }
 
@@ -1042,28 +1248,9 @@ impl TabAgentSession {
     }
 }
 
-/// Maps a backdrop onto the settings dropdown. The dropdown lists the
-/// presets the current Windows build supports, plus the stored value even
-/// when unsupported here (see `theme::backdrop_options`), so the label
-/// always matches what the window actually resolves to.
+/// The name the settings backdrop menu gives a material.
 #[cfg(target_os = "windows")]
-fn window_backdrop_index(backdrop: WindowBackdrop) -> usize {
-    crate::ui::theme::backdrop_options(backdrop)
-        .iter()
-        .position(|candidate| *candidate == backdrop)
-        .unwrap_or(0)
-}
-
-#[cfg(target_os = "windows")]
-fn window_backdrop_from_index(idx: usize, current: WindowBackdrop) -> WindowBackdrop {
-    crate::ui::theme::backdrop_options(current)
-        .get(idx)
-        .copied()
-        .unwrap_or(WindowBackdrop::Auto)
-}
-
-#[cfg(target_os = "windows")]
-fn window_backdrop_label_key(backdrop: WindowBackdrop) -> L10nKey {
+pub(crate) fn window_backdrop_label_key(backdrop: WindowBackdrop) -> L10nKey {
     match backdrop {
         WindowBackdrop::Auto => L10nKey::SettingsBackdropAuto,
         WindowBackdrop::Blur => L10nKey::SettingsBackdropBlur,
@@ -1072,14 +1259,6 @@ fn window_backdrop_label_key(backdrop: WindowBackdrop) -> L10nKey {
         WindowBackdrop::Acrylic => L10nKey::SettingsBackdropAcrylic,
         WindowBackdrop::Off => L10nKey::SettingsBackdropOff,
     }
-}
-
-#[cfg(target_os = "windows")]
-fn window_backdrop_labels(backdrop: WindowBackdrop) -> Vec<String> {
-    crate::ui::theme::backdrop_options(backdrop)
-        .iter()
-        .map(|backdrop| t(window_backdrop_label_key(*backdrop)).to_string())
-        .collect()
 }
 
 /// What a full-window overlay (settings, the opened file, the diff view)
@@ -1355,7 +1534,8 @@ impl Tty7App {
         let right_panel_width = cx.global::<Config>().right_panel_width;
         let document_ratio = cx.global::<Config>().document_ratio;
         let right_panel_visible = cx.global::<Config>().right_panel_visible;
-        let right_panel_tab = cx.global::<Config>().right_panel_tab;
+        let right_panel_tab =
+            crate::ui::right_panel::shown_tab(cx.global::<Config>().right_panel_tab);
         let scm_graph_expanded = cx.global::<Config>().scm_graph_expanded;
         let sidebar_collapsed = cx.global::<Config>().sidebar_collapsed;
         let config_watch = cx.observe_global_in::<Config>(window, |this, window, cx| {
@@ -1397,7 +1577,6 @@ impl Tty7App {
             apply_theme(Some(window), cx);
             let _ = this.update(cx, |this, cx| {
                 this.rebuild_theme_editor(window, cx);
-                this.sync_window_opacity_slider(window, cx);
                 cx.notify();
             });
         });
@@ -1459,6 +1638,10 @@ impl Tty7App {
                 cx.notify();
             }
         });
+        // The Files tab's one field drives both of its searches: names here,
+        // and what the files say through the content search.
+        let panel_search =
+            crate::ui::panel_search::PanelSearchState::new(file_search.clone(), window, cx);
         let mut app = Self {
             tabs,
             active,
@@ -1479,8 +1662,8 @@ impl Tty7App {
             _git_status_watch: git_status_watch,
             _pane_liveness_watch: pane_liveness_watch,
             _appearance_watch: appearance_watch,
-            palette: None,
-            palette_sub: None,
+            search: None,
+            search_sub: None,
             theme_preview_restore: None,
             closed: Vec::new(),
             renaming: None,
@@ -1517,12 +1700,16 @@ impl Tty7App {
                 },
                 ..Default::default()
             },
+            github: Default::default(),
             diff_probes_inflight: Default::default(),
             diff_probes_restale: Default::default(),
             file_tree,
+            panel_search,
             editor,
             sidebar_width: Rc::new(Cell::new(sidebar_width)),
             sidebar_dragging: Rc::new(Cell::new(false)),
+            sidebar_chrome_hover: Rc::new(Cell::new(false)),
+            strip_chrome_hover: Rc::new(Cell::new(false)),
             settings_row_width: Cell::new(f32::MAX),
             settings_viewport_w: Cell::new(f32::MAX),
             settings_hit_anchored: Cell::new(false),
@@ -1535,6 +1722,7 @@ impl Tty7App {
             right_panel_tab,
             sidebar_collapsed,
             sidebar_scroll: gpui::ScrollHandle::new(),
+            sidebar_reveal: Rc::new(Cell::new(None)),
             reorder: Rc::new(RefCell::new(None)),
             pane_hover: Rc::new(Cell::new(None)),
             pane_drag: Rc::new(RefCell::new(None)),
@@ -1543,6 +1731,8 @@ impl Tty7App {
             strip_slots: Rc::new(RefCell::new(Vec::new())),
             sidebar_slots: Rc::new(RefCell::new(Vec::new())),
             sidebar_group_slots: Rc::new(RefCell::new(Vec::new())),
+            sidebar_divider: Rc::new(Cell::new(None)),
+            sidebar_groups: Default::default(),
             pane_area: Rc::new(Cell::new(None)),
             sidebar_search,
             _sidebar_search_sub: sidebar_search_sub,
@@ -1570,6 +1760,18 @@ impl Tty7App {
             crate::ui::tray::init(cx);
         }
         app.refresh_shells(cx);
+        // Backstop for every other way a window goes away (a workspace
+        // closed from elsewhere): its language-server documents go with it.
+        let app_id = cx.entity_id();
+        cx.on_release(move |_, cx| crate::ui::lsp::LspStore::sync_window(app_id, Vec::new(), cx))
+            .detach();
+        cx.on_release(move |_, cx| {
+            if cx.has_global::<crate::terminal::git_data::ScmData>() {
+                cx.global_mut::<crate::terminal::git_data::ScmData>()
+                    .release_window(app_id.as_u64());
+            }
+        })
+        .detach();
         cx.on_app_quit(|app, cx| {
             app.save_session(cx);
             crate::core::window_state::WindowState::from_bounds(app.window_bounds).save();
@@ -1581,6 +1783,13 @@ impl Tty7App {
             this.window_bounds = window_bounds_to_remember(window);
         })
         .detach();
+
+        // With focus on nothing, or on a handle whose element is gone (a panel
+        // closed under it, a context menu that dismissed), gpui dispatches keys
+        // on the window root alone, one level above every listener on
+        // `tty7-root`, and ⌘P, ⌘T, ⌘W and the rest go dead.
+        cx.on_focus_lost(window, |this, window, cx| this.focus_active(window, cx))
+            .detach();
 
         // The home page's cursor, on the terminal's own schedule. It ticks
         // whether or not the page is up — a timer that wakes twice a second to
@@ -1617,10 +1826,28 @@ impl Tty7App {
         .detach();
 
         let weak_app = cx.weak_entity();
-        window.on_window_should_close(cx, move |_window, cx| {
-            if let Some(app) = weak_app.upgrade() {
-                app.update(cx, |app, cx| app.prepare_window_close(cx));
+        window.on_window_should_close(cx, move |window, cx| {
+            let Some(app) = weak_app.upgrade() else {
+                return true;
+            };
+            // Unsaved editor buffers hold the window open until the question
+            // about them is answered; the answer closes it.
+            let asked = app.update(cx, |app, cx| {
+                let unsaved = app.editor_unsaved();
+                app.editor_guard_unsaved(
+                    unsaved,
+                    crate::ui::code_editor::AfterUnsaved::CloseWindow,
+                    window,
+                    cx,
+                )
+            });
+            if asked {
+                return false;
             }
+            app.update(cx, |app, cx| {
+                app.prepare_window_close(cx);
+                app.lsp_window_closed(cx);
+            });
             true
         });
 
@@ -1711,9 +1938,28 @@ impl Tty7App {
         }
     }
 
-    fn close_window(&self, window: &mut Window, cx: &mut App) {
+    fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let unsaved = self.editor_unsaved();
+        if self.editor_guard_unsaved(
+            unsaved,
+            crate::ui::code_editor::AfterUnsaved::CloseWindow,
+            window,
+            cx,
+        ) {
+            return;
+        }
         self.prepare_window_close(cx);
+        self.lsp_window_closed(cx);
         window.remove_window();
+    }
+
+    /// The window close a question about unsaved files was holding up.
+    pub(crate) fn close_window_after_unsaved(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_window(window, cx);
     }
 
     pub(crate) fn teardown_workspace_forwards(&self, cx: &gpui::App) {
@@ -1819,6 +2065,9 @@ impl Tty7App {
         let claimed = WorkspaceStore::claim(cx, id);
         crate::ui::windows::WindowRegistry::rebind(cx, previous, claimed);
         crate::ui::remote_workspace::RemoteLinks::supervise(cx, claimed);
+        // Switching to a workspace is asking for it: if a remote client is
+        // driving it, this window takes it over (a no-op for a remote one).
+        crate::ui::local_link::LocalLink::open_explicitly(cx, claimed);
         // Forgotten on the way in as well as on the way out. `adopt_workspace`
         // puts the empty session up before the pull below orders the real one,
         // and it saves what it put up: a window showing nothing, syncing
@@ -1857,21 +2106,111 @@ impl Tty7App {
             cx,
         );
         if dropped > 0 {
-            window.push_notification(t_plural(L10nKey::AppTabsNotRestored, dropped, &[]), cx);
+            window.push_notification(
+                gpui_component::notification::Notification::warning(t_plural(
+                    L10nKey::AppTabsNotRestored,
+                    dropped,
+                    &[],
+                )),
+                cx,
+            );
         }
         self.tabs = tabs;
         self.active = active;
         self.maximized = None;
+        self.wake_active_if_asleep(window, cx);
         self.save_session(cx);
         crate::ui::windows::refresh_menu(cx);
         self.focus_active(window, cx);
         cx.notify();
     }
 
+    /// ⌘⇧T. Asks the machine first, where it keeps closed tabs: that list
+    /// outlives this window and the app, and holds every close the machine
+    /// took. The window's own list is what is left when the machine keeps none
+    /// — an older daemon or remote server — or has nothing more to give; it
+    /// only ever fills while the machine could not take a close.
     fn reopen_closed_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((client, machine_ws)) = crate::ui::tree_sync::closed_tabs_link(cx, self.workspace)
+        else {
+            self.reopen_closed_here(window, cx);
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            // The close being undone may still be queued for the machine.
+            // Asking before it lands would reopen the tab closed before it.
+            for _ in 0..REOPEN_SETTLE_POLLS {
+                let settled = this
+                    .update(cx, |app, cx| {
+                        crate::ui::tree_sync::tree_ops_settled(cx, app.workspace)
+                    })
+                    .unwrap_or(true);
+                if settled {
+                    break;
+                }
+                cx.background_executor().timer(REOPEN_SETTLE_POLL).await;
+            }
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    client.call(tty7_core::daemon::control::ControlRequest::TabReopen {
+                        workspace: machine_ws,
+                        tab: None,
+                    })
+                })
+                .await;
+            let _ = this.update_in(cx, |app, window, cx| {
+                use tty7_core::daemon::control::ReplyOk;
+                match answer {
+                    Ok(ReplyOk::ReopenedTab(Some(reopened))) => {
+                        let host = WorkspaceStore::host_of(cx, app.workspace);
+                        crate::ui::machine_mirror::MachineMirrors::note_reopened(
+                            cx,
+                            host,
+                            machine_ws,
+                            reopened.tab.id,
+                        );
+                        let st = crate::ui::tree_sync::session_tab_from_reopened(&reopened);
+                        if let Err(st) = app.put_back_closed_tab(st, window, cx) {
+                            // The entry is off the machine's list now; keep it
+                            // here so another ⌘⇧T can try it again.
+                            app.remember_closed_here(st);
+                        }
+                    }
+                    Ok(ReplyOk::ReopenedTab(None)) => app.reopen_closed_here(window, cx),
+                    Ok(other) => {
+                        log::warn!("the machine answered TabReopen with {other:?}");
+                        app.reopen_closed_here(window, cx);
+                    }
+                    Err(e) => {
+                        log::warn!("could not ask the machine for a closed tab ({e})");
+                        app.reopen_closed_here(window, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn reopen_closed_here(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(st) = self.closed.pop() else {
             return;
         };
+        if let Err(st) = self.put_back_closed_tab(st, window, cx) {
+            self.closed.push(st);
+        }
+    }
+
+    /// Rebuild a closed tab and open it where a new tab would go. Every pane
+    /// asks the daemon for the one it names: attached if it is somehow still
+    /// running, otherwise a fresh shell in its cwd opening on its last screen.
+    /// Hands the tab back when no pane in it would start.
+    fn put_back_closed_tab(
+        &mut self,
+        st: SessionTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), SessionTab> {
         let pane_ws = self.window_workspace(cx);
         let alive = alive_panes_on(&crate::terminal::PaneRoute::for_workspace(pane_ws.as_ref()));
         let Some(pane) = session_to_pane(
@@ -1883,9 +2222,11 @@ impl Tty7App {
             window,
             cx,
         ) else {
-            window.push_notification(t(L10nKey::AppReopenTabFailed), cx);
-            self.closed.push(st);
-            return;
+            window.push_notification(
+                gpui_component::notification::Notification::error(t(L10nKey::AppReopenTabFailed)),
+                cx,
+            );
+            return Err(st);
         };
         self.remember_active_pane(window, cx);
         self.maximized = None;
@@ -1901,16 +2242,27 @@ impl Tty7App {
                 code: None,
                 overlay_top: OverlayTop::default(),
                 document_layout: None,
-                sidebar_group: std::cell::RefCell::new(st.sidebar_group),
-                tree_id: std::cell::Cell::new(tty7_core::core::machine::TabId::new()),
+                group: std::cell::Cell::new(st.group),
+                auto_group: std::cell::RefCell::new(st.last_auto),
+                // Reopened here, so it is this window's new tab: walking into
+                // a pinned folder files it there like any other.
+                folder_watch: std::cell::Cell::new(crate::core::group_key::EntryWatch::fresh()),
+                // A tab the machine kept comes back under its own id; one from
+                // this window's list never had one the machine still knows.
+                tree_id: std::cell::Cell::new(
+                    st.tree_id
+                        .unwrap_or_else(tty7_core::core::machine::TabId::new),
+                ),
                 last_used: std::cell::Cell::new(0),
                 focus_origin: Default::default(),
+                asleep: None,
             },
         );
         self.active = insert_at;
         self.focus_active(window, cx);
         self.save_session(cx);
         cx.notify();
+        Ok(())
     }
 
     pub(crate) fn owns_leaf(&self, leaf_id: u64) -> bool {
@@ -2017,6 +2369,34 @@ impl Tty7App {
     fn quit_stop_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         cx.activate(true);
         window.activate_window();
+        // Unsaved editor buffers are asked about first, in the window that
+        // holds them. Quitting ends every window, so another window's
+        // buffers count as much as this one's: hand the quit over to it, and
+        // it asks about its own before carrying the quit on.
+        let unsaved = self.editor_unsaved();
+        if self.editor_guard_unsaved(
+            unsaved,
+            crate::ui::code_editor::AfterUnsaved::Quit,
+            window,
+            cx,
+        ) {
+            return;
+        }
+        let me = cx.entity_id();
+        let elsewhere = crate::ui::windows::WindowRegistry::open_windows(cx)
+            .into_iter()
+            .filter_map(|(ws, app)| Some((ws, app.upgrade()?)))
+            .find(|(_, app)| app.entity_id() != me && !app.read(cx).editor_unsaved().is_empty());
+        if let Some((ws, app)) = elsewhere
+            && let Some(handle) = crate::ui::windows::WindowRegistry::window_for(cx, ws)
+        {
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, cx| {
+                    app.update(cx, |app, cx| app.quit_stop_sessions(window, cx));
+                });
+            });
+            return;
+        }
         let answer = window.prompt(
             PromptLevel::Warning,
             t(crate::ui::i18n::L10nKey::QuitStopServerTitle),
@@ -2036,6 +2416,11 @@ impl Tty7App {
             let _ = cx.update(|cx| cx.quit());
         })
         .detach();
+    }
+
+    /// The quit a question about unsaved files was holding up.
+    pub(crate) fn quit_after_unsaved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.quit_stop_sessions(window, cx);
     }
 
     pub(crate) fn restart_window_daemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2417,18 +2802,65 @@ impl Tty7App {
             cfg.theme_preset = effective;
         }
         self.after_theme_change(window, cx);
-        let slot = if on {
-            if crate::ui::theme::system_dark(cx) {
-                crate::ui::settings::ThemeSlot::Dark
-            } else {
-                crate::ui::settings::ThemeSlot::Light
-            }
-        } else {
-            crate::ui::settings::ThemeSlot::Manual
-        };
-        if let Some(s) = self.active_settings_mut() {
-            s.theme_panel_slot = slot;
+    }
+
+    /// The Appearance page's three modes. System follows the OS between the
+    /// light and the dark slot; Light and Dark pin the matching slot's theme.
+    pub(crate) fn set_theme_mode(
+        &mut self,
+        mode: crate::ui::settings::ThemeMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::settings::ThemeMode;
+        if self.theme_draft_dirty() {
+            self.with_settings_edits_resolved(window, cx, move |this, window, cx| {
+                this.set_theme_mode(mode, window, cx)
+            });
+            return;
         }
+        match mode {
+            ThemeMode::System => {
+                if !cx.global::<Config>().theme_follow_system {
+                    self.set_theme_follow_system(true, window, cx);
+                }
+            }
+            ThemeMode::Light | ThemeMode::Dark => {
+                let cfg = cx.global_mut::<Config>();
+                cfg.theme_follow_system = false;
+                cfg.theme_preset = if mode == ThemeMode::Dark {
+                    cfg.theme_preset_dark.clone()
+                } else {
+                    cfg.theme_preset_light.clone()
+                };
+                self.theme_preview_restore = None;
+                self.after_theme_change(window, cx);
+            }
+        }
+    }
+
+    /// A pick from a theme slot's menu. Pinned to one mode, the pick is also
+    /// what that mode's slot remembers, so System picks it back up.
+    pub(crate) fn pick_slot_theme(
+        &mut self,
+        dark_slot: bool,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if cx.global::<Config>().theme_follow_system {
+            self.set_slot_preset(dark_slot, id, window, cx);
+            return;
+        }
+        if !self.theme_draft_dirty() {
+            let cfg = cx.global_mut::<Config>();
+            if dark_slot {
+                cfg.theme_preset_dark = id.to_string();
+            } else {
+                cfg.theme_preset_light = id.to_string();
+            }
+        }
+        self.set_preset(id, window, cx);
     }
 
     pub(crate) fn set_theme_legible_palette(
@@ -2455,57 +2887,7 @@ impl Tty7App {
             self.persist_settings_config(cx);
         }
         self.rebuild_theme_editor(window, cx);
-        self.sync_window_opacity_slider(window, cx);
         cx.notify();
-    }
-
-    /// Opens or closes the theme picker, and moves the caret with it.
-    ///
-    /// The panel leads with a search box, and it opened unfocused — so the
-    /// first thing typed at a panel whose whole job is picking one of nine
-    /// themes went nowhere. Closing hands the caret back to the settings
-    /// search rather than leaving it on a box that is no longer drawn.
-    pub(crate) fn toggle_theme_panel(
-        &mut self,
-        slot: crate::ui::settings::ThemeSlot,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let opened = match self.active_settings_mut() {
-            Some(s) if s.theme_panel_open && s.theme_panel_slot == slot => {
-                s.theme_panel_open = false;
-                false
-            }
-            Some(s) => {
-                s.theme_panel_open = true;
-                s.theme_panel_slot = slot;
-                true
-            }
-            None => return,
-        };
-        self.focus_theme_panel(opened, window, cx);
-        cx.notify();
-    }
-
-    pub(crate) fn close_theme_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_settings_mut().is_none() {
-            return;
-        }
-        if let Some(s) = self.active_settings_mut() {
-            s.theme_panel_open = false;
-        }
-        self.focus_theme_panel(false, window, cx);
-        cx.notify();
-    }
-
-    fn focus_theme_panel(&mut self, opened: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let handle = self.settings.as_ref().map(|s| match opened {
-            true => s.theme_search.read(cx).focus_handle(cx),
-            false => s.search.read(cx).focus_handle(cx),
-        });
-        if let Some(handle) = handle {
-            window.focus(&handle, cx);
-        }
     }
 
     pub(crate) fn open_themes_folder(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2530,28 +2912,6 @@ impl Tty7App {
             return;
         }
         cx.open_with_system(&dir);
-    }
-
-    pub(crate) fn fork_active_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = crate::ui::theme::effective_preset_id(cx);
-        let theme = crate::ui::presets::by_id(cx, &id);
-        match crate::ui::presets::fork_to_file(&theme) {
-            Ok(new_id) => {
-                crate::ui::presets::load_registry(cx);
-                self.set_preset(&new_id, window, cx);
-            }
-            // A button that does nothing is the worst kind of failure: there
-            // is no way to tell it from "I clicked the wrong thing".
-            Err(e) => {
-                log::warn!("failed to duplicate theme: {e}");
-                crate::ui::host_ops::HostOps::notify_err(
-                    window,
-                    cx,
-                    t(L10nKey::ThemeDuplicateFailed),
-                    &e,
-                );
-            }
-        }
     }
 
     pub(crate) fn theme_draft_dirty(&self) -> bool {
@@ -2678,18 +3038,6 @@ impl Tty7App {
         })
     }
 
-    pub(crate) fn set_window_opacity(
-        &mut self,
-        v: f32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        cx.global_mut::<Config>().window_opacity = Some(v.clamp(0.2, 1.0));
-        apply_theme(Some(window), cx);
-        self.persist_settings_config(cx);
-        cx.notify();
-    }
-
     pub(crate) fn set_window_blur(
         &mut self,
         on: bool,
@@ -2712,14 +3060,6 @@ impl Tty7App {
         cx.global_mut::<Config>().window_backdrop = backdrop;
         apply_theme(Some(window), cx);
         self.persist_settings_config(cx);
-        // A material changes the default opacity (SYSTEM_MATERIAL_OPACITY
-        // vs 1.0), so the slider must track the new effective value.
-        self.sync_window_opacity_slider(window, cx);
-        // Rebuild the rows as well as the selected index. The previous value
-        // may have been an unsupported preset retained only for cross-machine
-        // config sync, and must disappear after the user selects a supported
-        // preset on this machine.
-        self.sync_window_backdrop_select(window, cx);
         cx.notify();
     }
 
@@ -2730,46 +3070,7 @@ impl Tty7App {
         }
         apply_theme(Some(window), cx);
         self.persist_settings_config(cx);
-        self.sync_window_opacity_slider(window, cx);
-        #[cfg(target_os = "windows")]
-        self.sync_window_backdrop_select(window, cx);
         cx.notify();
-    }
-
-    pub(crate) fn sync_window_opacity_slider(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let eff = Self::effective_window_opacity(cx);
-        if let Some(slider) = self
-            .active_settings()
-            .map(|s| s.window_opacity_slider.clone())
-        {
-            slider.update(cx, |s, cx| s.set_value(eff, window, cx));
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    pub(crate) fn sync_window_backdrop_select(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(select) = self
-            .active_settings()
-            .map(|s| s.window_backdrop_select.clone())
-        {
-            let current = cx.global::<Config>().window_backdrop;
-            let rows = window_backdrop_labels(current);
-            let selected = window_backdrop_index(current);
-            select.update(cx, |state, cx| {
-                state.set_items(SearchableVec::new(rows), window, cx);
-                // Replacing the delegate clears its selection snapshot, so
-                // restore the stored value after installing the new rows.
-                state.set_selected_index(Some(IndexPath::default().row(selected)), window, cx);
-            });
-        }
     }
 
     pub(crate) fn pick_theme_image(&mut self, cx: &mut Context<Self>) {
@@ -2877,32 +3178,11 @@ impl Tty7App {
             })
             .collect();
 
-        let image_opacity_slider = theme.image.as_ref().map(|img| {
-            let slider = cx.new(|_| {
-                SliderState::new()
-                    .min(0.0)
-                    .max(1.0)
-                    .step(0.01)
-                    .default_value(img.opacity)
-            });
-            subs.push(cx.subscribe_in(
-                &slider,
-                window,
-                |this, _s, ev: &SliderEvent, window, cx| {
-                    if let SliderEvent::Change(v) = ev {
-                        this.set_theme_image_opacity(v.start(), window, cx);
-                    }
-                },
-            ));
-            slider
-        });
-
         if let Some(s) = self.settings.as_mut() {
             s.theme_editor = Some(ThemeEditor {
                 for_id: theme.id.clone(),
                 seed,
                 ansi,
-                image_opacity_slider,
                 _subs: subs,
             });
         }
@@ -2948,6 +3228,19 @@ impl Tty7App {
         self.terminal_cursor_style = cfg.cursor_style;
         self.terminal_scrollback_limit = cfg.scrollback_limit;
         self.apply_terminal_config_to_panes(&cfg, cx);
+    }
+
+    pub(crate) fn set_prompt_cursor_style(
+        &mut self,
+        style: crate::core::config::PromptCursorStyle,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_config(cx, |cfg| cfg.prompt_cursor_style = style);
+        for tab in &self.tabs {
+            for leaf in tab.pane.terminals() {
+                leaf.update(cx, |_, cx| cx.notify());
+            }
+        }
     }
 
     pub(crate) fn persist_settings_config(&mut self, cx: &mut Context<Self>) {
@@ -3060,7 +3353,7 @@ impl Tty7App {
         cx: &mut Context<Self>,
     ) {
         let fields = self.managed_forward_fields(cx);
-        let Some(rule) = fields.collect() else {
+        let Some(mut rule) = fields.collect() else {
             // Add is disabled while the fields do not make a rule and the form
             // already says what is missing, so there is nothing to do here and
             // nothing left to explain.
@@ -3068,6 +3361,10 @@ impl Tty7App {
         };
         let route = self.forward_route(pane_id, cx);
         let previous = self.loopback_panel.mf_editing.clone();
+        // Editing a switched-off rule edits it; it does not switch it on.
+        if let Some(old) = &previous {
+            rule.enabled = old.enabled;
+        }
         // A saved edit is a replace, and the rule being replaced has to come
         // out first: the ordinary edit keeps the bind port, and the far side
         // really does bind it, so adding first would collide with the very
@@ -3171,10 +3468,14 @@ impl Tty7App {
         let Some(list) = route.add(rule) else {
             return PlaceOutcome::Unreachable(t(L10nKey::ForwardRequestFailed).to_string());
         };
-        let broken = added_forward(&before, &list).and_then(|added| match &added.status {
-            ForwardStatus::Error(msg) => Some((added.id, msg.clone())),
-            ForwardStatus::Listening => None,
-        });
+        // A switched-off rule reports an error status because it binds
+        // nothing, and that is what it was asked to do.
+        let broken = added_forward(&before, &list)
+            .filter(|added| added.enabled)
+            .and_then(|added| match &added.status {
+                ForwardStatus::Error(msg) => Some((added.id, msg.clone())),
+                ForwardStatus::Listening => None,
+            });
         self.loopback_panel.managed = list;
         let Some((id, msg)) = broken else {
             return PlaceOutcome::Placed;
@@ -3260,6 +3561,87 @@ impl Tty7App {
             self.loopback_panel.managed = list;
         }
         cx.notify();
+    }
+
+    /// Switch one forward on or off, and carry the choice into the saved host
+    /// the rule came from, if it came from one — so the next connection opens
+    /// the same set of rules instead of the ones that were saved before.
+    pub(crate) fn set_managed_forward_enabled(
+        &mut self,
+        pane_id: u64,
+        forward_id: u64,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let route = self.forward_route(pane_id, cx);
+        let forward = self
+            .loopback_panel
+            .managed
+            .iter()
+            .find(|m| m.id == forward_id)
+            .cloned();
+        match route.set_enabled(forward_id, enabled) {
+            Ok(list) => {
+                self.loopback_panel.managed = list;
+                if let Some(forward) = forward {
+                    self.remember_forward_enabled(pane_id, &forward, enabled, cx);
+                }
+            }
+            Err(e) => {
+                window.push_notification(
+                    crate::ui::host_ops::failure(
+                        t_fmt(L10nKey::ForwardSwitchFailed, &[("error", &e.to_string())]),
+                        &e,
+                    ),
+                    cx,
+                );
+                // The refusal changed nothing, but the panel may be behind
+                // whatever did change — ask rather than guess.
+                self.loopback_panel.managed = route.list();
+            }
+        }
+        cx.notify();
+    }
+
+    fn remember_forward_enabled(
+        &mut self,
+        pane_id: u64,
+        forward: &crate::daemon::protocol::ManagedForward,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let profile_id = self
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.pane.terminals())
+            .find_map(|leaf| {
+                let view = leaf.read(cx);
+                (view.pane_id == pane_id).then(|| view.ssh_spec()?.profile_id.clone())?
+            })
+            .and_then(|id| uuid::Uuid::parse_str(&id).ok());
+        let Some(profile_id) = profile_id else {
+            return;
+        };
+        let saved = cx
+            .global::<Config>()
+            .ssh_profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .and_then(|p| crate::ui::forwards::saved_rule_index(&p.forwards, forward, enabled));
+        let Some(idx) = saved else {
+            return;
+        };
+        self.update_config(cx, |cfg| {
+            if let Some(rule) = cfg
+                .ssh_profiles
+                .iter_mut()
+                .find(|p| p.id == profile_id)
+                .and_then(|p| p.forwards.get_mut(idx))
+            {
+                rule.enabled = enabled;
+            }
+        });
     }
 
     pub(crate) fn show_ssh_forwards(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3388,7 +3770,7 @@ impl Tty7App {
                     verify,
                     &crate::ui::ssh_connect::config_alias_resolver,
                 );
-                self.open_native_ssh_tab(Box::new(spec), window, cx);
+                self.open_native_ssh_tab(Box::new(spec), None, window, cx);
             }
             Err(reason) => self.push_ssh_connect_error(reason, cx),
         }
@@ -3428,6 +3810,10 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.dim_inactive_panes = on);
     }
 
+    pub(crate) fn set_auto_hide_titlebar_buttons(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.update_config(cx, |cfg| cfg.auto_hide_titlebar_buttons = on);
+    }
+
     pub(crate) fn set_cursor_blink(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.cursor_blink = on);
         if !on {
@@ -3456,6 +3842,14 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.new_tab_position = pos);
     }
 
+    pub(crate) fn set_confirm_close(
+        &mut self,
+        mode: crate::core::config::ConfirmClose,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_config(cx, |cfg| cfg.confirm_close = mode);
+    }
+
     pub(crate) fn set_tab_bar_position(&mut self, pos: TabBarPosition, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.tab_bar_position = pos);
     }
@@ -3465,7 +3859,10 @@ impl Tty7App {
         grouping: crate::core::config::SidebarGrouping,
         cx: &mut Context<Self>,
     ) {
-        self.update_config(cx, |cfg| cfg.sidebar_grouping = grouping);
+        self.update_config(cx, |cfg| {
+            cfg.sidebar_grouping = grouping;
+            cfg.sidebar_auto_grouping = grouping != crate::core::config::SidebarGrouping::None;
+        });
     }
 
     pub(crate) fn set_sidebar_git_display(
@@ -3662,7 +4059,13 @@ impl Tty7App {
 
     pub(crate) fn focus_active(&self, window: &mut Window, cx: &mut App) {
         self.sync_window_title(window, cx);
-        if let Some(settings) = self.settings.as_ref() {
+        // Only where the page is drawn: with settings in a window of its own,
+        // its handle focused in the workspace window is focus on nothing
+        // there, and every shortcut in the workspace goes dead.
+        let settings_here = self
+            .settings_window
+            .is_none_or(|(settings, _)| settings == window.window_handle());
+        if let Some(settings) = self.settings.as_ref().filter(|_| settings_here) {
             window.focus(&settings.focus_handle, cx);
             return;
         }
@@ -3774,7 +4177,28 @@ impl Tty7App {
         let parts = match parts {
             Ok(parts) => parts,
             Err(reason) => {
-                pending.update(cx, |p, cx| p.fail(reason, cx));
+                let retry = pending.update(cx, |p, cx| {
+                    p.fail(reason, cx);
+                    p.next_auto_retry()
+                });
+                if let Some(delay) = retry {
+                    let pending = pending.clone();
+                    cx.spawn_in(window, async move |this, cx| {
+                        cx.background_executor().timer(delay).await;
+                        let _ = this.update_in(cx, |app, window, cx| {
+                            let still_there = app.tabs.iter().any(|tab| {
+                                tab.pane.leaves().iter().any(|l| l.entity_id() == slot_id)
+                            });
+                            // Try Again got there first, or the tab is gone.
+                            if !still_there || !pending.read(cx).is_failed() {
+                                return;
+                            }
+                            pending.update(cx, |p, cx| p.retrying(cx));
+                            start_pane_spawn(pending.clone(), window, cx);
+                        });
+                    })
+                    .detach();
+                }
                 return;
             }
         };
@@ -3792,18 +4216,21 @@ impl Tty7App {
             return;
         }
         let was_focused = pending.read(cx).focus_handle.contains_focused(window, cx);
-        let resume = (!parts.restored)
+        let restored = parts.restored;
+        let view = build_terminal_view(parts, font_size, window, cx);
+        let resume = (!restored)
             .then(|| {
                 let spawn = &pending.read(cx).spawn;
                 agent_resume_command(
                     &spawn.agent,
                     spawn.agent_session_id.as_deref(),
                     spawn.agent_launch_argv.as_deref(),
+                    view.read(cx),
                     cx,
                 )
+                .or_else(|| spawn.run_on_land.clone())
             })
             .flatten();
-        let view = build_terminal_view(parts, font_size, window, cx);
         if let Some(cmd) = resume {
             view.read(cx).run_command_line(&cmd);
         }
@@ -3829,8 +4256,53 @@ impl Tty7App {
         }
     }
 
+    /// ⌘T. From an SSH pane it dials the same host again, the way ⌘D does:
+    /// a local shell opened from one would land in a directory the pane never
+    /// showed, and in Ungrouped rather than under the host the user was on.
+    /// The new session starts in the far directory the pane was in, as a
+    /// local ⌘T starts in the local one.
     pub(crate) fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_tab_with_shell(None, window, cx);
+        let source = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.pane.focused_or_first(window, cx))
+            .map(|view| {
+                let view = view.read(cx);
+                let remote = view
+                    .remote_context()
+                    .filter(|r| matches!(r.kind, RemoteKind::Ssh | RemoteKind::NativeSsh));
+                (view.ssh_spec(), remote, view.cwd())
+            });
+        match source {
+            Some((Some(spec), remote, cwd)) => {
+                let start_dir = inherited_start_dir(OpenedFrom::SameSshHost, cwd, true);
+                let place = self.spawn_group(None, cx).on_host(remote.map(|r| r.target));
+                let spec = crate::ui::ssh_connect::resolve_persisted_ssh_spec(spec, cx);
+                let before = self.tabs.len();
+                self.open_native_ssh_tab(spec, start_dir, window, cx);
+                if self.tabs.len() > before
+                    && let Some(tab) = self.tabs.get(self.active)
+                {
+                    place.seat(tab);
+                    self.save_session(cx);
+                }
+            }
+            // A shell that ssh'd onward from a local prompt: the far side is
+            // only reachable by typing the same command again, from the
+            // directory it was typed in.
+            Some((None, Some(remote), cwd)) if remote.kind == RemoteKind::Ssh => {
+                let line = crate::terminal::git_data::shell_quote(&remote.argv);
+                let place = self.spawn_group(None, cx).on_host(Some(remote.target));
+                if let Some(slot) = self.new_tab_slot(cwd, None, window, cx) {
+                    if let Some(tab) = self.tabs.get(self.active) {
+                        place.seat(tab);
+                        self.save_session(cx);
+                    }
+                    crate::ui::agent_launch::run_when_ready(&slot, line, cx);
+                }
+            }
+            _ => self.new_tab_with_shell(None, window, cx),
+        }
     }
 
     pub(crate) fn new_tab_at(
@@ -3915,8 +4387,21 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.new_tab_slot(cwd, shell, window, cx);
+    }
+
+    /// [`Self::new_tab_with_cwd`], answering with the pane it opened — `None`
+    /// when nothing opened, so a caller about to type into the new pane has
+    /// nothing to type into rather than whatever was focused before.
+    pub(crate) fn new_tab_slot(
+        &mut self,
+        cwd: Option<std::path::PathBuf>,
+        shell: Option<ShellSpec>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<PaneSlot> {
         if !self.guard_local_spawn(window, cx) {
-            return;
+            return None;
         }
         let group = self.spawn_group(cwd.as_deref(), cx);
         let tab = match new_terminal(
@@ -3936,9 +4421,9 @@ impl Tty7App {
                 // A retry from the home screen fails the same way; keep the
                 // reason on screen rather than only in a toast that leaves.
                 self.startup_error = Some(gpui::SharedString::from(text.clone()));
-                window.push_notification(text, cx);
+                window.push_notification(crate::ui::host_ops::failure(text, &e), cx);
                 cx.notify();
-                return;
+                return None;
             }
         };
         // Something opened, so whatever the last failure was is stale.
@@ -3946,36 +4431,38 @@ impl Tty7App {
         self.remember_active_pane(window, cx);
         self.maximized = None;
         let insert_at = self.new_tab_insert_at(cx);
-        let new_tab = Tab::new(Pane::leaf(tab));
-        if let Some(group) = group {
-            *new_tab.sidebar_group.borrow_mut() = group;
-        }
+        let new_tab = Tab::new(Pane::leaf(tab.clone()));
+        group.seat(&new_tab);
         self.tabs.insert(insert_at, new_tab);
         self.active = insert_at;
         self.focus_active(window, cx);
         self.save_session(cx);
         cx.notify();
+        Some(tab)
     }
 
+    /// A tab dialling `spec`, whose shell starts in `remote_start_dir` on the
+    /// far host. A connection opened from a saved host or quick connect
+    /// passes `None`: the pane in front belongs to some other machine (usually
+    /// this one), and its directory means nothing over there.
     pub(crate) fn open_native_ssh_tab(
         &mut self,
         spec: Box<crate::daemon::protocol::NativeSshSpec>,
+        remote_start_dir: Option<std::path::PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cwd = self.tabs.get(self.active).and_then(|t| {
-            t.pane
-                .focused_or_first(window, cx)
-                .and_then(|leaf| leaf.read(cx).cwd())
-        });
-        let view = match new_terminal_native(self.font_size, cwd, spec, window, cx) {
+        let view = match new_terminal_native(self.font_size, remote_start_dir, spec, window, cx) {
             Ok(view) => view,
             Err(e) => {
                 log::error!("native SSH spawn failed: {e}");
                 window.push_notification(
-                    t_fmt(
-                        L10nKey::AppSshConnectionFailed,
-                        &[("error", &e.to_string())],
+                    crate::ui::host_ops::failure(
+                        t_fmt(
+                            L10nKey::AppSshConnectionFailed,
+                            &[("error", &e.to_string())],
+                        ),
+                        &e,
                     ),
                     cx,
                 );
@@ -4000,13 +4487,18 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cwd = dead.read(cx).cwd();
-        let fresh = match new_terminal_native(self.font_size, cwd, spec, window, cx) {
+        // The far shell's last report, not a local path: a native SSH pane's
+        // cwd only ever comes from OSC 7 sent across the link.
+        let remote_start_dir = dead.read(cx).cwd();
+        let fresh = match new_terminal_native(self.font_size, remote_start_dir, spec, window, cx) {
             Ok(view) => view,
             Err(e) => {
                 log::error!("native SSH respawn failed: {e}");
                 window.push_notification(
-                    t_fmt(L10nKey::AppSshReconnectFailed, &[("error", &e.to_string())]),
+                    crate::ui::host_ops::failure(
+                        t_fmt(L10nKey::AppSshReconnectFailed, &[("error", &e.to_string())]),
+                        &e,
+                    ),
                     cx,
                 );
                 return;
@@ -4038,28 +4530,50 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(target) = self
+        self.split_slot(axis, spawn, window, cx);
+    }
+
+    /// [`Self::split_into`], answering with the pane it placed, or `None`
+    /// when nothing was placed.
+    pub(crate) fn split_slot(
+        &mut self,
+        axis: Axis,
+        spawn: Option<SpawnAs>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<PaneSlot> {
+        let target = self
             .tabs
             .get(self.active)
-            .and_then(|t| t.pane.focused_or_first(window, cx))
-        else {
-            return;
-        };
+            .and_then(|t| t.pane.focused_or_first(window, cx))?;
         if !self.guard_local_spawn(window, cx) {
-            return;
+            return None;
         }
-        let cwd = target.read(cx).spawnable_cwd();
-        let spawn = match spawn {
-            Some(spawn) => spawn,
+        let (spawn, opened) = match spawn {
+            Some(spawn) => {
+                let opened = match spawn {
+                    SpawnAs::Ssh(_) => OpenedFrom::FreshSshHost,
+                    SpawnAs::Shell(_) => OpenedFrom::LocalShell,
+                };
+                (spawn, opened)
+            }
             // A stored spec is resolved against the saved host before it is
             // dialled; one handed in by a caller was just built from that host
             // and needs no second pass.
             None => match target.read(cx).ssh_spec() {
-                Some(spec) => {
-                    SpawnAs::Ssh(crate::ui::ssh_connect::resolve_persisted_ssh_spec(spec, cx))
-                }
-                None => SpawnAs::Shell(target.read(cx).shell_spec()),
+                Some(spec) => (
+                    SpawnAs::Ssh(crate::ui::ssh_connect::resolve_persisted_ssh_spec(spec, cx)),
+                    OpenedFrom::SameSshHost,
+                ),
+                None => (
+                    SpawnAs::Shell(target.read(cx).shell_spec()),
+                    OpenedFrom::LocalShell,
+                ),
             },
+        };
+        let cwd = {
+            let target = target.read(cx);
+            inherited_start_dir(opened, target.cwd(), target.remote_context().is_some())
         };
         let new = match spawn {
             SpawnAs::Ssh(spec) => {
@@ -4068,13 +4582,16 @@ impl Tty7App {
                     Err(e) => {
                         log::error!("native SSH split spawn failed: {e}");
                         window.push_notification(
-                            t_fmt(
-                                L10nKey::AppSshConnectionFailed,
-                                &[("error", &e.to_string())],
+                            crate::ui::host_ops::failure(
+                                t_fmt(
+                                    L10nKey::AppSshConnectionFailed,
+                                    &[("error", &e.to_string())],
+                                ),
+                                &e,
                             ),
                             cx,
                         );
-                        return;
+                        return None;
                     }
                 }
             }
@@ -4093,25 +4610,29 @@ impl Tty7App {
                     Err(e) => {
                         log::error!("split spawn failed: {e}");
                         window.push_notification(
-                            t_fmt(L10nKey::AppSplitPaneFailed, &[("error", &e.to_string())]),
+                            crate::ui::host_ops::failure(
+                                t_fmt(L10nKey::AppSplitPaneFailed, &[("error", &e.to_string())]),
+                                &e,
+                            ),
                             cx,
                         );
-                        return;
+                        return None;
                     }
                 }
             }
         };
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            if tab
-                .pane
-                .split_leaf(target.entity_id(), axis, false, new.clone())
-            {
-                self.maximized = None;
-                self.focus_leaf(&new, window, cx);
-                self.save_session(cx);
-                cx.notify();
-            }
+        let tab = self.tabs.get_mut(self.active)?;
+        if !tab
+            .pane
+            .split_leaf(target.entity_id(), axis, false, new.clone())
+        {
+            return None;
         }
+        self.maximized = None;
+        self.focus_leaf(&new, window, cx);
+        self.save_session(cx);
+        cx.notify();
+        Some(new)
     }
 
     fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4122,6 +4643,24 @@ impl Tty7App {
     /// so it travels with the close rather than being read back off shared
     /// state a second, unrelated close could have overwritten.
     fn close_pane_inner(&mut self, confirmed: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Closing the last pane closes the tab, and with it the files only
+        // this tab's editor shows.
+        if !confirmed
+            && self
+                .tabs
+                .get(self.active)
+                .is_some_and(|tab| tab.pane.leaves().len() <= 1)
+        {
+            let unsaved = self.editor_unsaved_in_tab(self.active);
+            if self.editor_guard_unsaved(
+                unsaved,
+                crate::ui::code_editor::AfterUnsaved::ClosePane,
+                window,
+                cx,
+            ) {
+                return;
+            }
+        }
         if !confirmed && let Some(reason) = self.focused_pane_close_reason(window, cx) {
             self.ask_before_closing(CloseTarget::Pane, reason, window, cx);
             return;
@@ -4165,6 +4704,11 @@ impl Tty7App {
         }
     }
 
+    /// The pane close a question about unsaved files was holding up.
+    pub(crate) fn close_pane_after_unsaved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_pane_inner(false, window, cx);
+    }
+
     fn on_child_exited(
         &mut self,
         view: Entity<TerminalView>,
@@ -4184,7 +4728,11 @@ impl Tty7App {
             return;
         }
         match self.tabs[index].pane.close_leaf(view.entity_id()) {
-            CloseOutcome::RemoveSelf => self.close_tab(index, window, cx),
+            // Not the asking close: the pane is already gone, so there is no
+            // tab left to keep open if the answer were Cancel. Unsaved editor
+            // files it had are handed to the tab in front instead (see
+            // `editor_sync`).
+            CloseOutcome::RemoveSelf => self.close_tab_inner(index, true, window, cx),
             CloseOutcome::NotFound => {}
             CloseOutcome::Collapsed => {
                 kill_pane_off_thread(view.read(cx).pane_route(), view.read(cx).pane_id, cx);
@@ -4433,13 +4981,19 @@ impl Tty7App {
             }
             return;
         }
+        let merged_id = moved.tree_id.get();
         let host = &mut self.tabs[self.active];
-        if host.code.is_none() {
-            host.code = moved.code;
+        match (host.code.as_deref_mut(), moved.code) {
+            (None, code) => host.code = code,
+            // Both had an editor: the files come along into this tab's strip
+            // rather than being dropped with the tab that brought them.
+            (Some(code), Some(theirs)) => code.adopt(&theirs.all_files()),
+            (Some(_), None) => {}
         }
         if host.diff_overlay.is_none() {
             host.diff_overlay = moved.diff_overlay;
         }
+        self.editor_forget_tab(merged_id, cx);
         if self
             .renaming
             .as_ref()
@@ -4608,9 +5162,7 @@ impl Tty7App {
             .and_then(|view| view.read(cx).spawnable_cwd());
         let group = self.spawn_group(cwd.as_deref(), cx);
         let fresh = Tab::new(crate::ui::pane::Pane::leaf(slot));
-        if let Some(group) = group {
-            *fresh.sidebar_group.borrow_mut() = group;
-        }
+        group.seat(&fresh);
         let at = at.min(self.tabs.len());
         self.tabs.insert(at, fresh);
         self.maximized = None;
@@ -4728,7 +5280,28 @@ impl Tty7App {
         }
     }
 
+    /// Reorders the active tab one slot — the keyboard form of the drag that
+    /// the strip and the sidebar both do. Left is back along the order and
+    /// right is forward (on a left tab bar that reads as up and down), and
+    /// both wrap: past the last tab the first one follows, so a tab can walk
+    /// the whole list without letting go of the key. On a left tab bar the
+    /// list is the tab's own sidebar group: the grouping keys off the tab,
+    /// not its position, so a step out of the group would move nothing.
+    fn move_tab(&mut self, right: bool, cx: &mut Context<Self>) {
+        let run = self.tab_run(self.active, cx);
+        if let Some(permutation) = one_slot_move(&run, self.tabs.len(), self.active, right) {
+            self.apply_tab_order(&permutation, cx);
+        }
+    }
+
     pub(crate) fn activate(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // A tab is woken by being looked at, the way a browser reloads a
+        // discarded tab when it is selected: a tab on screen is always a
+        // running one, so there is no third state to draw. A wake that fails
+        // leaves the tab asleep and the window where it was.
+        if self.tabs.get(index).is_some_and(Tab::is_asleep) && !self.wake_tab(index, window, cx) {
+            return;
+        }
         if index < self.tabs.len() && index != self.active {
             self.remember_active_pane(window, cx);
             // Zoom rides with its tab (#599): stash the outgoing tab's zoom
@@ -4749,7 +5322,8 @@ impl Tty7App {
                     .any(|l| l.entity_id() == leaf.entity_id())
             });
             self.maybe_refresh_diff_overlay(cx);
-            self.sidebar_scroll.scroll_to_item(index);
+            self.sidebar_reveal
+                .set(Some(self.tabs[index].tree_id.get()));
             if self.code_panel_visible() {
                 self.file_tree_refresh_roots(window, cx);
                 self.file_tree.focus_handle.focus(window, cx);
@@ -4758,6 +5332,149 @@ impl Tty7App {
             }
             self.save_session(cx);
             cx.notify();
+        }
+    }
+
+    /// Whether tab `index` can be put to sleep right now (#762).
+    ///
+    /// Not while it is connecting: a pane still on its way has no id the
+    /// machine knows, so it would be lost rather than stopped. Not with a
+    /// native SSH pane in a remote window either — that pane runs on this
+    /// computer, beyond the reach of the machine asked to stop the tab. Not on
+    /// a machine whose server cannot do it. And not the one tab left awake:
+    /// the window has to have something on screen, and looking at a tab is
+    /// what wakes it.
+    pub(crate) fn can_hibernate_tab(&self, index: usize, cx: &App) -> bool {
+        let Some(tab) = self.tabs.get(index) else {
+            return false;
+        };
+        if tab.is_asleep() || !crate::ui::tree_sync::can_hibernate_on(cx, self.workspace) {
+            return false;
+        }
+        let remote = WorkspaceStore::all(cx)
+            .get(self.workspace)
+            .is_some_and(|w| w.is_remote());
+        let leaves = tab.pane.leaves();
+        let all_hibernatable = !leaves.is_empty()
+            && leaves.iter().all(|leaf| match leaf {
+                PaneSlot::Ready(view) => !(remote && view.read(cx).ssh_spec().is_some()),
+                PaneSlot::Connecting(_) => false,
+            });
+        all_hibernatable && self.awake_tab_besides(index).is_some()
+    }
+
+    /// The tab to show instead of `index` when that one goes to sleep: the
+    /// awake tab used most recently, the nearest one on a tie.
+    fn awake_tab_besides(&self, index: usize) -> Option<usize> {
+        (0..self.tabs.len())
+            .filter(|&i| i != index && !self.tabs[i].is_asleep())
+            .max_by_key(|&i| {
+                (
+                    self.tabs[i].last_used.get(),
+                    std::cmp::Reverse(i.abs_diff(index)),
+                )
+            })
+    }
+
+    /// Put tab `index` to sleep: stop its panes, keep its place (#762).
+    ///
+    /// The window lets go of the panes first and the machine stops them after,
+    /// from the sync this ends with. That order is what keeps a stopped pane
+    /// from reading as one that died: by the time its shell exits there is no
+    /// view left here to take the exit as a reason to close the pane, or the
+    /// tab with it. The machine, for its part, marks the tab before it stops
+    /// anything, so a restore reading the tree in between never takes the
+    /// panes for dead ones and spawns them straight back.
+    pub(crate) fn hibernate_tab(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_hibernate_tab(index, cx) {
+            return;
+        }
+        if index == self.active {
+            let Some(next) = self.awake_tab_besides(index) else {
+                return;
+            };
+            self.activate(next, window, cx);
+        }
+        self.put_to_sleep(index, window, cx);
+    }
+
+    /// The part of [`Self::hibernate_tab`] that does not ask whether it may:
+    /// the tab lets go of its panes and keeps what a wake needs instead.
+    fn put_to_sleep(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index).filter(|t| !t.is_asleep()) else {
+            return;
+        };
+        let (mut view, home) = tab.label_view(Some(window), cx);
+        view.live = false;
+        view.status = None;
+        let layout = pane_to_session(&tab.pane, cx);
+        let tab = &mut self.tabs[index];
+        let panes = std::mem::replace(&mut tab.pane, Pane::Empty);
+        tab.zoomed = None;
+        tab.last_focused = None;
+        tab.focus_origin.clear();
+        tab.asleep = Some(Asleep { layout, view, home });
+        drop(panes);
+        self.save_session(cx);
+        cx.notify();
+    }
+
+    /// Bring a sleeping tab back, through the restore every pane takes after a
+    /// reboot: each pane is spawned in its old one's place, opens on the screen
+    /// that one left behind, and resumes its agent session when it had one.
+    /// Returns whether the tab is awake now; a tab none of whose panes could
+    /// be started stays asleep, and says so.
+    pub(crate) fn wake_tab(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(asleep) = self.tabs.get_mut(index).and_then(|t| t.asleep.take()) else {
+            return true;
+        };
+        let pane_ws = self.window_workspace(cx);
+        let layout = redial_native_ssh(&asleep.layout);
+        // No listing: every pane in here was stopped on purpose, so the attach
+        // each one tries first fails and falls through to the fresh spawn —
+        // unless the stop never landed, in which case attaching to the pane
+        // that is still running is exactly right.
+        let pane = session_to_pane(
+            pane_ws.as_ref(),
+            self.workspace,
+            &layout,
+            None,
+            self.font_size,
+            window,
+            cx,
+        );
+        let tab = &mut self.tabs[index];
+        let Some(pane) = pane else {
+            tab.asleep = Some(asleep);
+            window.push_notification(
+                gpui_component::notification::Notification::error(t(L10nKey::TabWakeFailed)),
+                cx,
+            );
+            return false;
+        };
+        tab.pane = pane;
+        tab.last_focused = None;
+        self.save_session(cx);
+        cx.notify();
+        true
+    }
+
+    /// Wake the tab on screen if it is asleep — for the paths that land on a
+    /// tab without going through [`Self::activate`]: a neighbour taking over
+    /// from a closed tab, a window restored onto a sleeping one.
+    pub(crate) fn wake_active_if_asleep(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.get(self.active).is_some_and(Tab::is_asleep) {
+            self.wake_tab(self.active, window, cx);
         }
     }
 
@@ -4833,20 +5550,65 @@ impl Tty7App {
         if index >= self.tabs.len() {
             return;
         }
+        if !confirmed {
+            let id = self.tabs[index].tree_id.get();
+            let unsaved = self.editor_unsaved_in_tab(index);
+            if self.editor_guard_unsaved(
+                unsaved,
+                crate::ui::code_editor::AfterUnsaved::CloseTab(id),
+                window,
+                cx,
+            ) {
+                return;
+            }
+        }
         if !confirmed && let Some(reason) = self.tab_close_reason(index, cx) {
             let id = self.tabs[index].tree_id.get();
             self.ask_before_closing(CloseTarget::Tab(id), reason, window, cx);
             return;
         }
         self.maximized = None;
+        let closing = self.tabs[index].tree_id.get();
+        self.editor_close_tab_files(index, cx);
+        self.editor_forget_tab(closing, cx);
         let worktree_cwd = self.tab_host_cwd(index, window, cx);
         let snapshot = tab_to_session(&self.tabs[index], cx);
-        self.closed.push(snapshot);
-        if self.closed.len() > MAX_CLOSED_TABS {
-            self.closed.remove(0);
+        let leaves: Vec<(u64, crate::terminal::PaneRoute, bool)> = self.tabs[index]
+            .pane
+            .terminals()
+            .iter()
+            .map(|leaf| {
+                let view = leaf.read(cx);
+                (view.pane_id, view.pane_route(), view.ssh_spec().is_some())
+            })
+            .collect();
+        // Where the machine keeps closed tabs, the tab is closed into its list
+        // and the machine stops the panes: a kill from here would drop the
+        // screens a reopen restores from. That happens in the sync the
+        // `save_session` below runs, once the tab is gone from the window.
+        crate::ui::tree_sync::intend_close(cx, self.workspace, closing);
+        let remembered = crate::ui::tree_sync::remembers_closed_tab(cx, self.workspace, closing);
+        let remote = WorkspaceStore::all(cx)
+            .get(self.workspace)
+            .is_some_and(|w| w.is_remote());
+        let (held, here) = split_machine_held(remote, &leaves);
+        if remembered {
+            let retiring = crate::ui::tree_sync::Retiring {
+                tab: closing,
+                panes: held.iter().map(|(id, _)| *id).collect(),
+                route: crate::terminal::PaneRoute::for_workspace(
+                    self.window_workspace(cx).as_ref(),
+                ),
+            };
+            crate::ui::tree_sync::retire_tab(cx, self.workspace, retiring);
+        } else {
+            self.remember_closed_here(snapshot.clone());
         }
-        for leaf in self.tabs[index].pane.terminals() {
-            kill_pane_off_thread(leaf.read(cx).pane_route(), leaf.read(cx).pane_id, cx);
+        for (pane, route) in match remembered {
+            true => here,
+            false => held.into_iter().chain(here).collect(),
+        } {
+            kill_pane_off_thread(route, pane, cx);
         }
         self.tabs.remove(index);
         // Only losing the renaming tab itself ends the rename — closing an
@@ -4865,10 +5627,32 @@ impl Tty7App {
         } else if index < self.active {
             self.active -= 1;
         }
+        self.wake_active_if_asleep(window, cx);
         self.focus_active(window, cx);
         self.save_session(cx);
+        if remembered
+            && let Some(unsent) =
+                crate::ui::tree_sync::take_unsent_retirement(cx, self.workspace, closing)
+        {
+            // The sync never got the close to the machine — the link went, or
+            // the window was told to re-pull just now. Close it the way a
+            // machine without the list would: kept here, ended from here.
+            self.remember_closed_here(snapshot);
+            for pane in unsent.panes {
+                kill_pane_off_thread(unsent.route.clone(), pane, cx);
+            }
+        }
         cx.notify();
         self.offer_worktree_cleanup(worktree_cwd, cx);
+    }
+
+    /// Keep a closed tab in this window's own list, for a machine that keeps
+    /// none — see [`Self::reopen_closed_tab`].
+    fn remember_closed_here(&mut self, snapshot: SessionTab) {
+        self.closed.push(snapshot);
+        if self.closed.len() > MAX_CLOSED_TABS {
+            self.closed.remove(0);
+        }
     }
 
     fn offer_worktree_cleanup(
@@ -4898,8 +5682,16 @@ impl Tty7App {
             move |_this, found, cx| {
                 let Some(wt) = found else { return };
                 let path = wt.path.display().to_string();
+                let name = wt
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 let detail = if wt.dirty {
-                    t_fmt(L10nKey::AppWorktreeRemoveDetailDirty, &[("path", &path)])
+                    t_fmt(
+                        L10nKey::AppWorktreeRemoveDetailDirty,
+                        &[("path", &path), ("name", &name)],
+                    )
                 } else {
                     t_fmt(L10nKey::AppWorktreeRemoveDetailClean, &[("path", &path)])
                 };
@@ -4938,14 +5730,24 @@ impl Tty7App {
                             cx,
                             move |h| crate::core::worktree::remove(h, &wt, force),
                             move |_this, result, window, cx| match result {
-                                Ok(()) => window.push_notification(
-                                    t_fmt(L10nKey::AppWorktreeRemoved, &[("branch", &branch)]),
+                                Ok(removed) => window.push_notification(
+                                    t_fmt(
+                                        if removed.branch_kept {
+                                            L10nKey::AppWorktreeRemovedBranchKept
+                                        } else {
+                                            L10nKey::AppWorktreeRemoved
+                                        },
+                                        &[("branch", &branch)],
+                                    ),
                                     cx,
                                 ),
                                 Err(e) => window.push_notification(
-                                    t_fmt(
-                                        L10nKey::AppWorktreeRemoveFailed,
-                                        &[("error", &e.to_string())],
+                                    crate::ui::host_ops::failure(
+                                        t_fmt(
+                                            L10nKey::AppWorktreeRemoveFailed,
+                                            &[("error", &e.to_string())],
+                                        ),
+                                        &e,
                                     ),
                                     cx,
                                 ),
@@ -4964,8 +5766,56 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_other_tabs_inner(index, false, window, cx);
+    }
+
+    /// Which of the tabs at `indices` a bulk close takes: all but the ones
+    /// whose connection asked to be warned about, or that hold unsaved editor
+    /// files — see [`Self::close_other_tabs_inner`].
+    fn bulk_closable(&self, indices: impl Iterator<Item = usize>, cx: &App) -> Vec<usize> {
+        indices
+            .filter(|&i| !self.tab_has_warn_ssh(i, cx) && self.editor_unsaved_in_tab(i).is_empty())
+            .collect()
+    }
+
+    /// Under [`ConfirmClose::Always`](crate::core::config::ConfirmClose::Always)
+    /// a bulk close is asked about once, for all the tabs it takes; one dialog
+    /// per tab would be a question nobody can answer. Answers whether the
+    /// question went up, in which case the close waits for it.
+    fn ask_before_bulk_close(
+        &mut self,
+        target: CloseTarget,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let always =
+            cx.global::<Config>().confirm_close == crate::core::config::ConfirmClose::Always;
+        if !always || count == 0 {
+            return false;
+        }
+        self.ask_before_closing(target, CloseReason::Tabs(count), window, cx);
+        true
+    }
+
+    fn close_other_tabs_inner(
+        &mut self,
+        index: usize,
+        confirmed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if index >= self.tabs.len() {
             return;
+        }
+        if !confirmed {
+            let count = self
+                .bulk_closable((0..self.tabs.len()).filter(|&i| i != index), cx)
+                .len();
+            let keep = CloseTarget::OtherTabs(self.tabs[index].tree_id.get());
+            if self.ask_before_bulk_close(keep, count, window, cx) {
+                return;
+            }
         }
         // A bulk close skips the tabs whose profile asked to be warned about,
         // and closes the rest outright — one dialog per tab is not a question
@@ -4974,7 +5824,12 @@ impl Tty7App {
         // that is most of them, and a menu item that quietly closes nothing is
         // worse than one that closes what it says.
         for i in (0..self.tabs.len()).rev() {
-            if i == index || self.tab_has_warn_ssh(i, cx) {
+            // Unsaved editor files are skipped the same way: a bulk close
+            // cannot ask about them one tab at a time, and must not lose them.
+            if i == index
+                || self.tab_has_warn_ssh(i, cx)
+                || !self.editor_unsaved_in_tab(i).is_empty()
+            {
                 continue;
             }
             self.close_tab_inner(i, true, window, cx);
@@ -4987,9 +5842,26 @@ impl Tty7App {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_tabs_right_of_inner(index, false, window, cx);
+    }
+
+    fn close_tabs_right_of_inner(
+        &mut self,
+        index: usize,
+        confirmed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !confirmed && let Some(tab) = self.tabs.get(index) {
+            let count = self.bulk_closable((index + 1)..self.tabs.len(), cx).len();
+            let from = CloseTarget::TabsRightOf(tab.tree_id.get());
+            if self.ask_before_bulk_close(from, count, window, cx) {
+                return;
+            }
+        }
         // Same bargain as `close_other_tabs`.
         for i in ((index + 1)..self.tabs.len()).rev() {
-            if self.tab_has_warn_ssh(i, cx) {
+            if self.tab_has_warn_ssh(i, cx) || !self.editor_unsaved_in_tab(i).is_empty() {
                 continue;
             }
             self.close_tab_inner(i, true, window, cx);
@@ -5088,9 +5960,12 @@ impl Tty7App {
             self.activate(index, window, cx);
         }
 
+        // The directory the source runs in, on whichever host it runs on: an
+        // agent keys its history by directory, and a fork started anywhere
+        // else finds nothing to branch.
         let (cwd, shell) = {
             let view = source.read(cx);
-            (view.local_cwd(), view.shell_spec())
+            (view.spawnable_cwd(), view.shell_spec())
         };
         let group = self.spawn_group(cwd.as_deref(), cx);
         let new = match new_terminal(
@@ -5107,18 +5982,18 @@ impl Tty7App {
             Err(e) => {
                 log::error!("fork spawn failed: {e}");
                 window.push_notification(
-                    t_fmt(L10nKey::AppOpenTerminalFailed, &[("error", &e.to_string())]),
+                    crate::ui::host_ops::failure(
+                        t_fmt(L10nKey::AppOpenTerminalFailed, &[("error", &e.to_string())]),
+                        &e,
+                    ),
                     cx,
                 );
                 return;
             }
         };
-        let Some(terminal) = new.terminal() else {
-            log::error!("fork spawn produced a pane that is still connecting");
-            window.push_notification(t(L10nKey::AppForkStillConnecting), cx);
-            return;
-        };
-        terminal.read(cx).run_command_line(&cmd);
+        // A remote workspace's pane is still dialling here; the fork runs
+        // the moment it lands.
+        crate::ui::agent_launch::run_when_ready(&new, cmd, cx);
 
         match placement {
             ForkPlacement::NewTab => {
@@ -5126,9 +6001,7 @@ impl Tty7App {
                 self.maximized = None;
                 let insert_at = self.new_tab_insert_at(cx);
                 let tab = Tab::new(Pane::leaf(new));
-                if let Some(group) = group {
-                    *tab.sidebar_group.borrow_mut() = group;
-                }
+                group.seat(&tab);
                 self.tabs.insert(insert_at, tab);
                 self.active = insert_at;
                 self.focus_active(window, cx);
@@ -5269,16 +6142,22 @@ impl Tty7App {
             move |this, result, window, cx| match result {
                 Ok(defaults) => this.open_worktree_prompt(sheet_host, cwd, defaults, window, cx),
                 Err(e) => window.push_notification(
-                    t_fmt(L10nKey::AppNewWorktreeFailed, &[("error", &e.to_string())]),
+                    crate::ui::host_ops::failure(
+                        t_fmt(L10nKey::AppNewWorktreeFailed, &[("error", &e.to_string())]),
+                        &e,
+                    ),
                     cx,
                 ),
             },
         );
     }
 
+    /// Open `wt` in a new tab named after its branch, typing `first` — its
+    /// setup and agent — into the shell there.
     pub(crate) fn open_worktree_tab(
         &mut self,
         wt: crate::core::worktree::NewWorktree,
+        first: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5296,12 +6175,18 @@ impl Tty7App {
             Err(e) => {
                 log::error!("worktree tab spawn failed: {e}");
                 window.push_notification(
-                    t_fmt(L10nKey::AppOpenTerminalFailed, &[("error", &e.to_string())]),
+                    crate::ui::host_ops::failure(
+                        t_fmt(L10nKey::AppOpenTerminalFailed, &[("error", &e.to_string())]),
+                        &e,
+                    ),
                     cx,
                 );
                 return;
             }
         };
+        if let Some(first) = first {
+            crate::ui::agent_launch::run_when_ready(&view, first, cx);
+        }
         self.remember_active_pane(window, cx);
         self.maximized = None;
         let insert_at = self.new_tab_insert_at(cx);
@@ -5433,8 +6318,98 @@ impl Tty7App {
         cx.notify();
     }
 
-    pub(crate) fn palette_commands(&self, window: &Window, cx: &App) -> Vec<Command> {
-        let mut commands = Command::base_commands(
+    /// Everything the search offers from this window, gathered when it opens.
+    pub(crate) fn search_catalog(&self, window: &Window, cx: &App) -> Catalog {
+        let mut catalog = Catalog::new(
+            self.search_actions(window, cx),
+            self.search_terminals(cx),
+            crate::ui::search::host_items(cx),
+        );
+        let last = last_sessions(self.spawn_host(cx));
+        let (sessions, here) = self.search_sessions(last, window, cx);
+        catalog.sessions = sessions;
+        catalog.sessions_here = here;
+        catalog.files = self.file_list_now(cx);
+        catalog
+    }
+
+    /// The Sessions tab's rows from `found`: those that ran in the focused
+    /// pane's directory first, under its name, then the rest by recency. The
+    /// second value is how many lead.
+    ///
+    /// `found` are the sessions of the machine this window's workspace is
+    /// on: a remote window's new tab opens there, and so resumes there.
+    pub(crate) fn search_sessions(
+        &self,
+        found: Vec<crate::core::agent_history::PastSession>,
+        window: &Window,
+        cx: &App,
+    ) -> (Vec<Item>, usize) {
+        let here = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.pane.focused_or_first(window, cx))
+            .and_then(|leaf| leaf.read(cx).spawnable_cwd());
+        let home = crate::ui::path_display::home_for_host(cx, self.spawn_host(cx));
+        let now = crate::core::config::unix_now();
+        let hidden = &cx.global::<Config>().hidden_agent_sessions;
+        let (mut mine, mut rest): (Vec<_>, Vec<_>) = found
+            .into_iter()
+            .filter(|s| !hidden.contains(&crate::core::agent_history::session_key(s.agent, &s.id)))
+            .partition(|s| here.is_some() && s.cwd == here);
+        let here_section: Option<gpui::SharedString> = here.as_ref().map(|dir| {
+            t_fmt(
+                L10nKey::SearchSectionSessionsHere,
+                &[("dir", &crate::ui::home::display_path(dir, home.as_deref()))],
+            )
+            .into()
+        });
+        let recent: gpui::SharedString = t(L10nKey::SearchSectionSessionsRecent).into();
+        let row = |s: crate::core::agent_history::PastSession, section: gpui::SharedString| {
+            let place = s
+                .cwd
+                .as_deref()
+                .map(|p| crate::ui::home::display_path(p, home.as_deref()));
+            let subtitle = match (&place, &s.branch) {
+                (Some(place), Some(branch)) => Some(format!("{place} · {branch}")),
+                (Some(place), None) => Some(place.clone()),
+                (None, Some(branch)) => Some(branch.clone()),
+                (None, None) => None,
+            };
+            let mut item = Item::new(
+                s.title,
+                CommandKind::ResumeSession {
+                    agent: s.agent,
+                    session_id: s.id.clone(),
+                    cwd: s.cwd,
+                },
+            )
+            .with_note(crate::ui::home::relative_time(now, s.updated))
+            .with_avatar(Avatar {
+                agent: Some(s.agent),
+                ..Avatar::default()
+            })
+            .with_alias(s.id)
+            .with_alias(s.agent.display_name())
+            .in_section(section);
+            if let Some(subtitle) = subtitle {
+                item = item.with_subtitle(subtitle);
+            }
+            item
+        };
+        let count = mine.len();
+        let mut out: Vec<Item> = match here_section {
+            Some(section) => mine.drain(..).map(|s| row(s, section.clone())).collect(),
+            None => Vec::new(),
+        };
+        out.extend(rest.drain(..).map(|s| row(s, recent.clone())));
+        (out, count)
+    }
+
+    /// The Actions tab: the fixed set, plus the rows only this window can
+    /// judge are worth offering.
+    pub(crate) fn search_actions(&self, window: &Window, cx: &App) -> Vec<Item> {
+        let mut actions = Item::actions(
             cx,
             ChromeState {
                 rail_collapsed: self.sidebar_collapsed,
@@ -5447,13 +6422,73 @@ impl Tty7App {
             },
         );
 
+        // The editor's navigation, while there is a file in front of it.
+        actions.extend(self.editor_palette_items());
+
+        // Groups are something the sidebar draws, so they are offered only
+        // while the tabs are in it. Opening a folder as a group asks the
+        // system picker, which browses this computer: a path picked there
+        // names nothing on a remote workspace's machine, where "Pin as
+        // Group" in the file tree is the way in instead.
+        if cx.global::<Config>().tab_bar_position == TabBarPosition::Left {
+            actions.push(
+                Item::localized(L10nKey::CmdNewGroup, CommandKind::NewGroup)
+                    .with_subtitle(t(L10nKey::CmdNewGroupSubtitle))
+                    .in_group(CommandGroup::TabsPanes),
+            );
+            if !WorkspaceStore::all(cx)
+                .get(self.workspace)
+                .is_some_and(|w| w.is_remote())
+            {
+                actions.push(
+                    Item::localized(
+                        L10nKey::CmdOpenFolderAsGroup,
+                        CommandKind::OpenFolderAsGroup,
+                    )
+                    .with_subtitle(t(L10nKey::CmdOpenFolderAsGroupSubtitle))
+                    .in_group(CommandGroup::TabsPanes),
+                );
+            }
+        }
+
+        // The editor's text commands, while there is a buffer to run them on.
+        if self.editor_can_dispatch() {
+            actions.extend(
+                [
+                    Item::localized(
+                        L10nKey::CmdEditorTransformUppercase,
+                        CommandKind::EditorTransformUppercase,
+                    ),
+                    Item::localized(
+                        L10nKey::CmdEditorTransformLowercase,
+                        CommandKind::EditorTransformLowercase,
+                    ),
+                    Item::localized(
+                        L10nKey::CmdEditorTransformTitleCase,
+                        CommandKind::EditorTransformTitleCase,
+                    ),
+                    Item::localized(
+                        L10nKey::CmdEditorTrimTrailingWhitespace,
+                        CommandKind::EditorTrimTrailingWhitespace,
+                    ),
+                    Item::localized(L10nKey::CmdEditorJoinLines, CommandKind::EditorJoinLines),
+                    Item::localized(
+                        L10nKey::CmdEditorRemoveSurroundingBrackets,
+                        CommandKind::EditorRemoveSurroundingBrackets,
+                    ),
+                ]
+                .into_iter()
+                .map(|item| item.in_group(CommandGroup::View)),
+            );
+        }
+
         // Offered only where it would do something. A connection opened from a
         // saved host has nothing to save, and a pane that is not an SSH one has
         // no connection at all — either would be a row that quietly did nothing
         // (#549).
         if self.unsaved_ssh_session(window, cx).is_some() {
-            commands.push(
-                Command::localized(
+            actions.push(
+                Item::localized(
                     L10nKey::CmdSshSaveConnection,
                     CommandKind::SaveSshSessionAsHost,
                 )
@@ -5461,101 +6496,262 @@ impl Tty7App {
                 .in_group(CommandGroup::Ssh),
             );
         }
-
-        for p in crate::ui::ssh_connect::ssh_profiles_by_frecency(cx) {
-            let subtitle = crate::core::ssh_profile::to_connect_string(&p);
-            let title = if p.name.is_empty() {
-                subtitle.clone()
-            } else {
-                p.name.clone()
-            };
-            commands.push(
-                Command::new(
-                    t_fmt(L10nKey::AppCmdSshProfileTitle, &[("title", &title)]),
-                    CommandKind::ConnectSavedProfile(p.id),
-                )
-                .with_subtitle(subtitle)
-                .in_group(CommandGroup::Ssh),
-            );
-        }
-
-        for (i, tab) in self.tabs.iter().enumerate() {
-            if i == self.active {
-                continue;
-            }
-            let label = self.tab_label(tab, i, None, cx);
-            commands.push(
-                Command::new(
-                    t_fmt(L10nKey::AppCmdSwitchToTab, &[("label", &label)]),
-                    CommandKind::ActivateTab(i),
-                )
-                .in_group(CommandGroup::TabsPanes),
-            );
-        }
-        commands
+        actions
     }
 
-    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.is_some() {
-            self.close_palette(window, cx);
+    /// The Terminals tab: every open tab of every workspace this process
+    /// knows — this window's first, most recently used first and without the
+    /// one you are in — then every way to open a new one.
+    pub(crate) fn search_terminals(&self, cx: &App) -> Vec<Item> {
+        let mut out = Vec::new();
+        let store = WorkspaceStore::all(cx);
+        let name_of = |id: WorkspaceId| {
+            store
+                .get(id)
+                .and_then(|w| crate::ui::machine_mirror::display_name(cx, w))
+                .unwrap_or_else(|| t(L10nKey::WindowUntitled).to_string())
+        };
+        // This window's own workspace leads, and is listed whether or not the
+        // store has caught up with it: its tabs are right here in the window.
+        let mut others: Vec<_> = store
+            .views
+            .iter()
+            .filter(|w| w.id != self.workspace)
+            .collect();
+        others.sort_by_key(|w| std::cmp::Reverse(w.last_active));
+        let workspaces = std::iter::once(self.workspace).chain(others.into_iter().map(|w| w.id));
+        for id in workspaces {
+            let name = name_of(id);
+            let here = id == self.workspace;
+            for tab in self.tab_rows_for(id, true, cx) {
+                if here && tab.active {
+                    continue;
+                }
+                let mut item = Item::new(
+                    tab.label.clone(),
+                    CommandKind::GoToTab {
+                        workspace: id,
+                        tab: tab.id,
+                    },
+                )
+                .with_avatar(Avatar {
+                    agent: tab.agent,
+                    status: tab.status,
+                    unread: tab.unread,
+                    attention: tab.attention,
+                    ssh: tab.ssh,
+                })
+                .with_alias(name.clone())
+                .in_section(name.clone());
+                // A label derived from the path already says where; one that
+                // is a name or an agent leaves the place worth printing.
+                if tab.named && !tab.path.is_empty() {
+                    item = item.with_subtitle(tab.path.clone());
+                } else if !tab.path.is_empty() {
+                    item = item.with_alias(tab.path.clone());
+                }
+                if let Some(agent) = tab.agent {
+                    item = item.with_alias(agent.display_name());
+                }
+                if !here {
+                    item = item.with_note(name.clone());
+                }
+                out.push(item);
+            }
+        }
+
+        let new_terminal: gpui::SharedString = t(L10nKey::SearchSectionNewTerminal).into();
+        // Every shell the window's machine has, named alike in every language
+        // so the New Tab menu's "Other Shells…" row can land on exactly these
+        // by typing one word. Listed in the order that menu uses.
+        let default_shell = self.default_shell_label(cx);
+        let usage = &cx.global::<Config>().shell_frecency;
+        let now = crate::core::config::unix_now();
+        for s in crate::ui::tab_strip::shells_by_frecency(
+            &self.shells.shells,
+            &default_shell,
+            usage,
+            now,
+        ) {
+            let mut item = Item::new(
+                t_fmt(L10nKey::AppCmdShellTitle, &[("title", &s.label)]),
+                CommandKind::OpenShell(s.label.clone()),
+            )
+            .in_section(new_terminal.clone());
+            if s.label == default_shell {
+                item = item.with_subtitle(t(L10nKey::ShellDefault));
+            }
+            out.push(item);
+        }
+        for agent in self.offered_agents(cx) {
+            out.push(
+                Item::new(
+                    t_fmt(
+                        L10nKey::AppCmdAgentLaunchTitle,
+                        &[("name", agent.display_name())],
+                    ),
+                    CommandKind::LaunchAgent(agent),
+                )
+                .with_subtitle(agent.launch_command(&cx.global::<Config>().agent_launch))
+                .with_avatar(Avatar {
+                    agent: Some(agent),
+                    ..Avatar::default()
+                })
+                .in_section(new_terminal.clone()),
+            );
+        }
+        out
+    }
+
+    pub(crate) fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.is_some() {
+            self.close_search(window, cx);
             return;
         }
-        self.open_palette("", window, cx);
+        self.open_search(SearchTab::All, "", window, cx);
     }
 
-    /// Open the palette with `query` already in its search field.
+    /// Open the search on `tab` with `query` already in its field.
     ///
-    /// Unlike [`Self::toggle_palette`] this always opens. A row that names
+    /// Unlike [`Self::toggle_search`] this always opens. A row that names
     /// what it will show cannot also be the thing that dismisses it, and the
     /// only ways in here are rows like that.
-    pub(crate) fn open_palette(
+    pub(crate) fn open_search(
         &mut self,
+        tab: SearchTab,
         query: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let commands = self.palette_commands(window, cx);
-        let view = cx.new(|cx| PaletteView::seeded(commands, query, window, cx));
-        self.palette_sub = Some(cx.subscribe_in(&view, window, Self::on_palette_event));
-        self.palette = Some(view);
+        let catalog = self.search_catalog(window, cx);
+        let view = cx.new(|cx| SearchView::new(catalog, tab, query, window, cx));
+        if tab.in_editor_row() {
+            let tabs = self.editor_search_tabs();
+            view.update(cx, |view, cx| view.set_editor_tabs(tabs, cx));
+        }
+        self.search_sub = Some(cx.subscribe_in(&view, window, Self::on_search_event));
+        self.search = Some(view.clone());
+        self.refresh_search_sessions(view, window, cx);
+        self.refresh_file_index(window, cx);
         cx.notify();
     }
 
-    fn on_palette_event(
+    /// Asks the machine this window's workspace is on — this one, or a
+    /// remote one's server — for its agents' history, and hands what changed
+    /// to the open search. The search opened on the last scan's answer, so this is
+    /// only ever news: a session run since, or the first scan of the process.
+    fn refresh_search_sessions(
         &mut self,
-        _view: &Entity<PaletteView>,
-        ev: &PaletteEvent,
+        view: Entity<SearchView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let host_id = self.spawn_host(cx);
+        let Some(host) = self.active_host(cx) else {
+            return;
+        };
+        // Where this window's tabs are, on that machine: they place the
+        // chats Cursor files only under a hash of their directory.
+        let mut known_dirs: Vec<std::path::PathBuf> = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.pane.terminals())
+            .filter_map(|leaf| leaf.read(cx).spawnable_cwd())
+            .collect();
+        known_dirs.sort();
+        known_dirs.dedup();
+        // Weak: a slow host must not keep a closed search alive.
+        let view = view.downgrade();
+        crate::ui::host_ops::HostOps::run_in(
+            host,
+            window,
+            cx,
+            move |h| h.agent_sessions(&known_dirs),
+            move |this, found, window, cx| {
+                let found = match found {
+                    Ok(found) => found,
+                    Err(e) => {
+                        log::warn!("listing agent sessions: {e}");
+                        return;
+                    }
+                };
+                remember_sessions(host_id, found.clone());
+                // Closed, or closed and opened again, since: nothing to update.
+                let Some(view) = view
+                    .upgrade()
+                    .filter(|view| this.search.as_ref() == Some(view))
+                else {
+                    return;
+                };
+                let (sessions, here) = this.search_sessions(found, window, cx);
+                view.update(cx, |view, cx| view.set_sessions(sessions, here, window, cx));
+            },
+        );
+    }
+
+    fn on_search_event(
+        &mut self,
+        _view: &Entity<SearchView>,
+        ev: &SearchEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match ev {
-            PaletteEvent::Confirm(kind) => {
+            SearchEvent::Confirm(kind) => {
                 let kind = kind.clone();
                 // The picker is already showing this theme; keep it through the
                 // close instead of reverting and re-applying it.
                 if matches!(kind, CommandKind::SetTheme(_)) {
                     self.theme_preview_restore = None;
                 }
-                self.close_palette(window, cx);
+                // Likewise the symbol Go to Symbol has the caret on.
+                if matches!(
+                    kind,
+                    CommandKind::GoToSymbol { .. } | CommandKind::GoToLocation { .. }
+                ) {
+                    self.editor_symbol_preview_commit();
+                }
+                self.close_search(window, cx);
                 self.run_command(kind, window, cx);
             }
-            PaletteEvent::Dismiss => self.close_palette(window, cx),
-            PaletteEvent::PreviewTheme(i) => {
+            // Done inside the search, which stays open on the list it was.
+            SearchEvent::RunInPlace(kind) => self.run_command(kind.clone(), window, cx),
+            SearchEvent::Dismiss => self.close_search(window, cx),
+            SearchEvent::PreviewTheme(i) => {
                 if let Some(id) = crate::ui::presets::all(cx).get(*i).map(|t| t.id.clone()) {
                     self.preview_preset(&id, window, cx);
                 }
             }
-            PaletteEvent::CancelThemePreview => self.cancel_preset_preview(window, cx),
+            SearchEvent::CancelThemePreview => self.cancel_preset_preview(window, cx),
+            SearchEvent::PreviewSymbol { line, column } => {
+                self.editor_symbol_preview(*line, *column, cx)
+            }
+            SearchEvent::PreviewLocation { path, line, column } => {
+                self.lsp_preview_location(path, *line, *column, cx)
+            }
+            // Each editor tab is opened the way its own chord opens it, so
+            // it arrives set up: the outline around the caret, the server
+            // to ask. Closing first puts back a caret Go to Symbol moved.
+            SearchEvent::SwitchEditorTab(tab) => {
+                self.close_search(window, cx);
+                match tab {
+                    SearchTab::Symbols => self.editor_go_to_symbol(window, cx),
+                    _ => self.open_search(SearchTab::Files, "", window, cx),
+                }
+            }
         }
     }
 
-    pub(crate) fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = None;
-        self.palette_sub = None;
-        // A previewed theme was never persisted: closing the palette any way
+    pub(crate) fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search = None;
+        self.search_sub = None;
+        // A previewed theme was never persisted: closing the search any way
         // other than confirming the pick puts the old one back.
         self.cancel_preset_preview(window, cx);
         self.focus_active(window, cx);
+        // Nor was a symbol Go to Symbol previewed: the caret goes back, and
+        // the keyboard with it to the editor it came from.
+        self.editor_symbol_preview_cancel(window, cx);
         cx.notify();
     }
 
@@ -5602,6 +6798,8 @@ impl Tty7App {
             SwapPanePrev => self.swap_pane(false, window, cx),
             SelectNextTab => self.cycle_tab(true, window, cx),
             SelectPrevTab => self.cycle_tab(false, window, cx),
+            MoveTabLeft => self.move_tab(false, cx),
+            MoveTabRight => self.move_tab(true, cx),
             ToggleMaximizePane => self.toggle_maximize(window, cx),
             ToggleFullscreen => self.toggle_fullscreen(window, cx),
             ToggleTabSidebar => self.toggle_tab_sidebar(cx),
@@ -5612,6 +6810,11 @@ impl Tty7App {
             FindInTerminal => {
                 if let Some(leaf) = self.focused_leaf(window, cx) {
                     leaf.update(cx, |view, cx| view.open_search(window, cx));
+                }
+            }
+            ToggleComposer => {
+                if let Some(leaf) = self.focused_leaf(window, cx) {
+                    leaf.update(cx, |view, cx| view.toggle_composer(window, cx));
                 }
             }
             FindNext => {
@@ -5656,11 +6859,21 @@ impl Tty7App {
             ReopenClosedTab => self.reopen_closed_tab(window, cx),
             RenameTab => self.start_rename(self.active, window, cx),
             NewWorktreeTab => self.new_worktree_tab(self.active, window, cx),
+            NewGroup => self.new_empty_group(window, cx),
+            OpenFolderAsGroup => self.open_folder_as_group(cx),
             CloseOtherTabs => self.close_other_tabs(self.active, window, cx),
             CloseTabsToTheRight => self.close_tabs_right_of(self.active, window, cx),
             CopyWorkingDirectory => self.copy_active_cwd(window, cx),
             MarkTabUnread => self.mark_tab_unread(self.active, cx),
+            HibernateTab => self.hibernate_tab(self.active, window, cx),
             ForkAgentSession => self.fork_active_pane_session(ForkPlacement::NewTab, window, cx),
+            NewAgentTab => self.new_agent_tab(window, cx),
+            // Picked from the palette with ⌥ held, the way a New Tab menu row
+            // is: a split beside the focused pane instead of a tab.
+            LaunchAgent(agent) => {
+                let at = SpawnWhere::from_modifiers(window.modifiers());
+                self.launch_agent(agent, at, window, cx)
+            }
             CopyAgentSessionId => self.copy_agent_session_id(self.active, window, cx),
             RenameWorkspace => self.start_workspace_rename(window, cx),
             OpenSettings => self.toggle_settings(window, cx),
@@ -5694,6 +6907,34 @@ impl Tty7App {
             }
             ToggleDocumentPreview => self.toggle_document_preview(cx),
             ToggleDocumentWrap => self.toggle_document_wrap(window, cx),
+            EditorTransformUppercase => {
+                self.editor_dispatch(&gpui_component::input::TransformToUppercase, window, cx);
+            }
+            EditorTransformLowercase => {
+                self.editor_dispatch(&gpui_component::input::TransformToLowercase, window, cx);
+            }
+            EditorTransformTitleCase => {
+                self.editor_dispatch(&gpui_component::input::TransformToTitleCase, window, cx);
+            }
+            EditorTrimTrailingWhitespace => {
+                self.editor_dispatch(&gpui_component::input::TrimTrailingWhitespace, window, cx);
+            }
+            EditorJoinLines => {
+                self.editor_dispatch(&gpui_component::input::JoinLines, window, cx);
+            }
+            EditorRemoveSurroundingBrackets => {
+                self.editor_dispatch(
+                    &gpui_component::input::RemoveSurroundingBrackets,
+                    window,
+                    cx,
+                );
+            }
+            EditorGoToSymbol => self.editor_go_to_symbol(window, cx),
+            EditorNavigateBack => self.editor_navigate(false, window, cx),
+            EditorNavigateForward => self.editor_navigate(true, window, cx),
+            EditorSplitRight => {
+                self.editor_split(window, cx);
+            }
             RestartSshSession => self.restart_ssh_session(window, cx),
             SetTheme(i) => {
                 if let Some(id) = crate::ui::presets::all(cx).get(i).map(|t| t.id.clone()) {
@@ -5702,6 +6943,11 @@ impl Tty7App {
             }
             OpenSshConnect(input) => self.open_typed_ssh_connect(&input, window, cx),
             ConnectSavedProfile(id) => self.connect_ssh_profile(id, window, cx),
+            // ⌥ held as the row is taken splits, as it does on the menu's row.
+            OpenShell(label) => {
+                let at = SpawnWhere::from_modifiers(window.modifiers());
+                self.open_listed_shell(&label, at, window, cx)
+            }
             EditSavedProfile(id) => self.open_ssh_profile_in_settings(id, window, cx),
             QuickConnect(target) => {
                 if let Some(qc) = crate::core::ssh_profile::parse_quick_connect(&target) {
@@ -5724,8 +6970,33 @@ impl Tty7App {
             ScmCreateBranch => self.run_scm_action(ScmIntent::CreateBranch, window, cx),
             OpenBranchPicker => self.run_scm_action(ScmIntent::CheckoutBranch, window, cx),
             ToggleDiffViewMode => self.toggle_diff_view_mode(cx),
-            OpenThemePicker | OpenSshConnectInput => {}
-            ActivateTab(i) => self.activate(i, window, cx),
+            // Both are the search's own, and handled inside it.
+            OpenThemePicker => {}
+            SearchHosts => self.open_search(SearchTab::Hosts, "", window, cx),
+            QuickOpenFile => self.open_search(SearchTab::Files, "", window, cx),
+            OpenFile { path, line, column } => {
+                self.open_indexed_file(&path, line, column, window, cx)
+            }
+            GoToSymbol { line, column } => self.editor_go_to_position(line, column, window, cx),
+            GoToLocation { path, line, column } => {
+                self.open_file_in_editor_at(&path, Some(line + 1), Some(column + 1), window, cx)
+            }
+            GoToTab { workspace, tab } => self.go_to_tab(workspace, tab, false, window, cx),
+            ResumeSession {
+                agent,
+                session_id,
+                cwd,
+            } => self.resume_session(agent, &session_id, cwd, false, window, cx),
+            ForkSession {
+                agent,
+                session_id,
+                cwd,
+            } => self.resume_session(agent, &session_id, cwd, true, window, cx),
+            CopySessionId(id) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(id)),
+            HideSession { agent, session_id } => self.update_config(cx, |cfg| {
+                cfg.hidden_agent_sessions
+                    .insert(crate::core::agent_history::session_key(agent, &session_id));
+            }),
         }
     }
 
@@ -5831,17 +7102,24 @@ impl Tty7App {
             L10nKey::SettingsDimInactivePanes => {
                 self.set_dim_inactive_panes(defaults.dim_inactive_panes, cx)
             }
+            L10nKey::SettingsAutoHideTitlebarButtons => {
+                self.set_auto_hide_titlebar_buttons(defaults.auto_hide_titlebar_buttons, cx)
+            }
             L10nKey::SettingsCursorBlink => self.set_cursor_blink(defaults.cursor_blink, cx),
             L10nKey::SettingsCursorShape => self.set_cursor_style(defaults.cursor_style, cx),
+            L10nKey::SettingsPromptCursorShape => {
+                self.set_prompt_cursor_style(defaults.prompt_cursor_style, cx)
+            }
             L10nKey::SettingsScrollback => self.set_scrollback_limit(defaults.scrollback_limit, cx),
             L10nKey::SettingsNewTabPosition => {
                 self.set_new_tab_position(defaults.new_tab_position, cx)
             }
+            L10nKey::SettingsConfirmClose => self.set_confirm_close(defaults.confirm_close, cx),
             L10nKey::SettingsTabBarPosition => {
                 self.set_tab_bar_position(defaults.tab_bar_position, cx)
             }
             L10nKey::SettingsSidebarGrouping => {
-                self.set_sidebar_grouping(defaults.sidebar_grouping, cx)
+                self.set_sidebar_grouping(defaults.effective_sidebar_grouping(), cx)
             }
             L10nKey::SettingsTabFullPath => {
                 self.update_config(cx, |cfg| cfg.tab_full_path = defaults.tab_full_path)
@@ -5851,6 +7129,16 @@ impl Tty7App {
             }
             L10nKey::SettingsDiffPreviewFromCounts => {
                 self.set_sidebar_diff_preview(defaults.sidebar_diff_preview, cx)
+            }
+            L10nKey::SettingsEditorGitGutter => {
+                self.set_editor_git_gutter(defaults.editor_git_gutter, cx)
+            }
+            L10nKey::SettingsEditorLsp => self.set_editor_lsp(defaults.editor_lsp, cx),
+            L10nKey::SettingsEditorSoftWrap => {
+                self.set_editor_soft_wrap(defaults.editor_soft_wrap, cx)
+            }
+            L10nKey::SettingsEditorMarkdownPreview => {
+                self.set_editor_markdown_preview(defaults.editor_markdown_preview, cx)
             }
             L10nKey::SettingsNotifyOnCommandFinish => {
                 self.set_notify_mode(defaults.notify_on_command_finish, cx)
@@ -6004,24 +7292,6 @@ impl Tty7App {
     ) {
         let mut subs = Vec::new();
         match title {
-            L10nKey::SettingsFontFamily
-            | L10nKey::SettingsBoldFont
-            | L10nKey::SettingsItalicFont
-            | L10nKey::SettingsUiFontFamily => {
-                let (font, bold, italic, ui) = self.build_font_selects(&mut subs, window, cx);
-                if let Some(s) = self.active_settings_mut() {
-                    s.font_select = font;
-                    s.font_bold_select = bold;
-                    s.font_italic_select = italic;
-                    s.ui_font_select = ui;
-                }
-            }
-            L10nKey::SettingsLanguage => {
-                let value = self.build_language_select(&mut subs, window, cx);
-                if let Some(s) = self.active_settings_mut() {
-                    s.language_select = value;
-                }
-            }
             L10nKey::SettingsProgram | L10nKey::SettingsArguments => {
                 let (program, args, _) = self.build_shell_inputs(&mut subs, window, cx);
                 if let Some(s) = self.active_settings_mut() {
@@ -6047,18 +7317,6 @@ impl Tty7App {
                 let value = self.build_http_proxy_input(&mut subs, window, cx);
                 if let Some(s) = self.active_settings_mut() {
                     s.http_proxy_input = value;
-                }
-            }
-            L10nKey::SettingsScrollSpeed => {
-                let value = self.build_scroll_slider(&mut subs, window, cx);
-                if let Some(s) = self.active_settings_mut() {
-                    s.scroll_slider = value;
-                }
-            }
-            L10nKey::SettingsOpacity | L10nKey::SettingsBlur | L10nKey::SettingsBackdrop => {
-                let value = self.build_window_opacity_slider(&mut subs, window, cx);
-                if let Some(s) = self.active_settings_mut() {
-                    s.window_opacity_slider = value;
                 }
             }
             _ => {}
@@ -6135,27 +7393,63 @@ impl Tty7App {
         });
     }
 
+    /// Every family the settings font menus offer, with the configured ones
+    /// kept even when the system no longer has them — a menu that cannot show
+    /// the current value cannot say what it is.
+    fn settings_font_names(cx: &App) -> Vec<String> {
+        let cfg = cx.global::<Config>();
+        let mut names = cx.text_system().all_font_names();
+        for configured in [
+            Some(&cfg.font_family),
+            cfg.ui_font_family.as_ref(),
+            cfg.font_family_bold.as_ref(),
+            cfg.font_family_italic.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !names.contains(configured) {
+                names.push(configured.clone());
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Build the settings page's state against `window` — the window it will
     /// be drawn in, which owns its inputs' focus.
     fn build_settings_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let focus_handle = cx.focus_handle();
         let mut subs = Vec::new();
-        let (font_select, font_bold_select, font_italic_select, ui_font_select) =
-            self.build_font_selects(&mut subs, window, cx);
-        let language_select = self.build_language_select(&mut subs, window, cx);
-        #[cfg(target_os = "windows")]
-        let window_backdrop_select = self.build_window_backdrop_select(&mut subs, window, cx);
+        let font_names = std::rc::Rc::new(Self::settings_font_names(cx));
         let (shell_program_input, shell_args_input, wd_path_input) =
             self.build_shell_inputs(&mut subs, window, cx);
         let link_file_command_input = self.build_link_file_command_input(&mut subs, window, cx);
         let http_proxy_input = self.build_http_proxy_input(&mut subs, window, cx);
-        let scroll_slider = self.build_scroll_slider(&mut subs, window, cx);
-        let window_opacity_slider = self.build_window_opacity_slider(&mut subs, window, cx);
-        let theme_search = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(t(crate::ui::i18n::L10nKey::SearchThemes))
-        });
+        // One query box for whichever popover is open — a theme list or a
+        // font list — since only one is ever open at a time.
+        // Shared by every searchable dropdown on the page, so the hint is the
+        // generic one; without it the field was a bare caret under the list.
+        let menu_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t(L10nKey::SearchTheme)));
         subs.push(
-            cx.subscribe_in(&theme_search, window, |_this, _i, ev, _w, cx| {
+            cx.subscribe_in(&menu_query, window, |this, input, ev, _w, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    // A new query starts from the top; the clear that opens a
+                    // popover keeps the row it opened on.
+                    let typed = !input.read(cx).value().is_empty();
+                    if let Some(s) = this.active_settings_mut().filter(|_| typed) {
+                        s.menu_hi = 0;
+                    }
+                    cx.notify();
+                }
+            }),
+        );
+        let agent_query =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t(L10nKey::SettingsSearchAgents)));
+        subs.push(
+            cx.subscribe_in(&agent_query, window, |_this, _i, ev, _w, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
                 }
@@ -6177,7 +7471,7 @@ impl Tty7App {
         );
 
         let shortcut_search = cx
-            .new(|cx| InputState::new(window, cx).placeholder(t(L10nKey::SettingsNavKeybindings)));
+            .new(|cx| InputState::new(window, cx).placeholder(t(L10nKey::SettingsSearchShortcuts)));
         subs.push(
             cx.subscribe_in(&shortcut_search, window, |_, _, ev, _, cx| {
                 if matches!(ev, InputEvent::Change) {
@@ -6191,17 +7485,6 @@ impl Tty7App {
         });
         subs.push(
             cx.subscribe_in(&ssh_filter, window, |_this, _i, ev, _w, cx| {
-                if matches!(ev, InputEvent::Change) {
-                    cx.notify();
-                }
-            }),
-        );
-
-        let ssh_quick_connect = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(t(L10nKey::AppPlaceholderSshQuickConnect))
-        });
-        subs.push(
-            cx.subscribe_in(&ssh_quick_connect, window, |_this, _i, ev, _w, cx| {
                 if matches!(ev, InputEvent::Change) {
                     cx.notify();
                 }
@@ -6224,44 +7507,46 @@ impl Tty7App {
             search_rows: std::cell::RefCell::new(None),
             focused_setting: None,
             content_scroll,
-            ssh_master_scroll: gpui::ScrollHandle::new(),
-            ssh_detail_scroll: gpui::ScrollHandle::new(),
-            theme_list_scroll: gpui::ScrollHandle::new(),
             search_anchor,
             reveal_first_hit: Cell::new(false),
-            font_select,
-            font_bold_select,
-            font_italic_select,
-            ui_font_select,
-            language_select,
-            #[cfg(target_os = "windows")]
-            window_backdrop_select,
+            font_names,
             shell_program_input,
             shell_args_input,
             wd_path_input,
             link_file_command_input,
             http_proxy_input,
-            scroll_slider,
-            window_opacity_slider,
             theme_editor: None,
             theme_draft: None,
             theme_draft_error: None,
             save_error: None,
             saved_config: cx.global::<Config>().clone(),
-            theme_panel_open: false,
-            theme_panel_slot: crate::ui::settings::ThemeSlot::Manual,
-            theme_search,
+            menu: None,
+            menu_query,
+            menu_hi: 0,
+            menu_scroll: gpui::ScrollHandle::new(),
+            focused: std::cell::RefCell::new(None),
+            kb_conflict: None,
             recording: None,
             rebinding_note: None,
             ssh_form: None,
-            ssh_detail: crate::ui::settings::SshDetail::None,
+            ssh_open: None,
+            ssh_show_all: false,
+            ssh_confirm_remove: false,
+            ssh_copied: None,
+            mobile_pairing: None,
+            mobile_paired: None,
+            mobile_copied: false,
+            mobile_starting: false,
             ssh_filter,
             ssh_collapsed_groups: std::collections::HashSet::new(),
-            ssh_quick_connect,
             agent_hooks_host: crate::ui::host_ops::HostId::LOCAL,
             agent_hooks_states: crate::ui::settings::AgentHooksView::Loading,
             agent_hooks_seq: 0,
             agent_hooks_note: None,
+            agent_query,
+            agent_show_all: false,
+            agent_touched: std::collections::HashSet::new(),
+            agent_busy: std::collections::HashSet::new(),
             _subs: subs,
         });
         let search_focus = self
@@ -6277,212 +7562,10 @@ impl Tty7App {
         cx.notify();
     }
 
-    fn build_font_selects(
-        &mut self,
-        subs: &mut Vec<Subscription>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> (
-        Entity<SelectState<SearchableVec<String>>>,
-        Entity<SelectState<SearchableVec<String>>>,
-        Entity<SelectState<SearchableVec<String>>>,
-        Entity<SelectState<SearchableVec<String>>>,
-    ) {
-        let cfg = cx.global::<Config>();
-        let family = cfg.font_family.clone();
-        let font_bold = cfg.font_family_bold.clone();
-        let font_italic = cfg.font_family_italic.clone();
-        let ui_font_family = cfg.ui_font_family.clone();
-        let mut font_names = cx.text_system().all_font_names();
-        if !font_names.contains(&family) {
-            font_names.push(family.clone());
-            font_names.sort_unstable();
-        }
-        if let Some(ui_font) = &ui_font_family
-            && !font_names.contains(ui_font)
-        {
-            font_names.push(ui_font.clone());
-            font_names.sort_unstable();
-        }
-        let selected_font_index = font_names
-            .iter()
-            .position(|n| *n == family)
-            .map(|row| IndexPath::default().row(row));
-        let font_select = cx.new(|cx| {
-            SelectState::new(
-                SearchableVec::new(font_names.clone()),
-                selected_font_index,
-                window,
-                cx,
-            )
-            .searchable(true)
-        });
-        let build_alt_font_select = |value: &Option<String>,
-                                     default_label: &str,
-                                     names: &[String],
-                                     window: &mut Window,
-                                     cx: &mut Context<Self>| {
-            let mut rows = Vec::with_capacity(names.len() + 1);
-            rows.push(default_label.to_string());
-            rows.extend(names.iter().cloned());
-            let selected = value
-                .as_ref()
-                .and_then(|v| rows.iter().position(|n| n == v))
-                .unwrap_or(0);
-            cx.new(|cx| {
-                SelectState::new(
-                    SearchableVec::new(rows),
-                    Some(IndexPath::default().row(selected)),
-                    window,
-                    cx,
-                )
-                .searchable(true)
-            })
-        };
-        let alt_default = crate::ui::settings::font_default_label();
-        let font_bold_select =
-            build_alt_font_select(&font_bold, alt_default, &font_names, window, cx);
-        let font_italic_select =
-            build_alt_font_select(&font_italic, alt_default, &font_names, window, cx);
-        let ui_font_select = build_alt_font_select(
-            &ui_font_family,
-            crate::ui::settings::ui_font_default_label(),
-            &font_names,
-            window,
-            cx,
-        );
-        subs.push(cx.subscribe_in(
-            &font_select,
-            window,
-            |this, _select, ev: &SelectEvent<SearchableVec<String>>, _window, cx| {
-                if let SelectEvent::Confirm(Some(family)) = ev {
-                    this.commit_font_family(family.clone(), cx);
-                }
-            },
-        ));
-        subs.push(cx.subscribe_in(
-            &font_bold_select,
-            window,
-            |this, _s, ev: &SelectEvent<SearchableVec<String>>, _w, cx| {
-                if let SelectEvent::Confirm(Some(name)) = ev {
-                    this.commit_font_family_emphasis(true, name.clone(), cx);
-                }
-            },
-        ));
-        subs.push(cx.subscribe_in(
-            &font_italic_select,
-            window,
-            |this, _s, ev: &SelectEvent<SearchableVec<String>>, _w, cx| {
-                if let SelectEvent::Confirm(Some(name)) = ev {
-                    this.commit_font_family_emphasis(false, name.clone(), cx);
-                }
-            },
-        ));
-        subs.push(cx.subscribe_in(
-            &ui_font_select,
-            window,
-            |this, _s, ev: &SelectEvent<SearchableVec<String>>, window, cx| {
-                if let SelectEvent::Confirm(Some(name)) = ev {
-                    this.commit_ui_font_family(name.clone(), window, cx);
-                }
-            },
-        ));
-        (
-            font_select,
-            font_bold_select,
-            font_italic_select,
-            ui_font_select,
-        )
-    }
-
-    fn build_language_select(
-        &mut self,
-        subs: &mut Vec<Subscription>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<SelectState<SearchableVec<String>>> {
-        let labels = || {
-            crate::ui::i18n::SUPPORTED_LANGUAGES
-                .iter()
-                .map(|lang| t(lang.label_key).to_string())
-                .collect::<Vec<_>>()
-        };
-        let cfg = cx.global::<Config>();
-        let current = Self::normalize_gui_language(&cfg.gui_language);
-        let rows = labels();
-        let selected = crate::ui::i18n::SUPPORTED_LANGUAGES
-            .iter()
-            .position(|lang| lang.code == current)
-            .unwrap_or(0);
-        let language_select = cx.new(|cx| {
-            SelectState::new(
-                SearchableVec::new(rows),
-                Some(IndexPath::default().row(selected)),
-                window,
-                cx,
-            )
-        });
-        subs.push(cx.subscribe_in(
-            &language_select,
-            window,
-            move |this, _select, ev: &SelectEvent<SearchableVec<String>>, window, cx| {
-                if let SelectEvent::Confirm(Some(label)) = ev {
-                    let rows = labels();
-                    if let Some(idx) = rows.iter().position(|r| r == label) {
-                        if let Some(lang) = crate::ui::i18n::SUPPORTED_LANGUAGES.get(idx) {
-                            this.set_gui_language(lang.code, window, cx);
-                        }
-                    }
-                }
-            },
-        ));
-        language_select
-    }
-
-    fn normalize_gui_language(code: &str) -> &'static str {
+    pub(crate) fn normalize_gui_language(code: &str) -> &'static str {
         crate::ui::i18n::find_language(code)
             .map(|lang| lang.code)
             .unwrap_or_else(crate::ui::i18n::default_language_code)
-    }
-
-    /// The backdrop dropdown only lists the presets this Windows build
-    /// supports, in the order of `theme::supported_backdrops`; the select
-    /// resolves the picked label back through that same list.
-    #[cfg(target_os = "windows")]
-    fn build_window_backdrop_select(
-        &mut self,
-        subs: &mut Vec<Subscription>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<SelectState<SearchableVec<String>>> {
-        let rows = window_backdrop_labels(cx.global::<Config>().window_backdrop);
-        let selected = window_backdrop_index(cx.global::<Config>().window_backdrop);
-        let select = cx.new(|cx| {
-            SelectState::new(
-                SearchableVec::new(rows),
-                Some(IndexPath::default().row(selected)),
-                window,
-                cx,
-            )
-        });
-        subs.push(cx.subscribe_in(
-            &select,
-            window,
-            move |this, _select, ev: &SelectEvent<SearchableVec<String>>, window, cx| {
-                if let SelectEvent::Confirm(Some(label)) = ev {
-                    let current = cx.global::<Config>().window_backdrop;
-                    let rows = window_backdrop_labels(current);
-                    if let Some(idx) = rows.iter().position(|row| row == label) {
-                        this.set_window_backdrop(
-                            window_backdrop_from_index(idx, current),
-                            window,
-                            cx,
-                        );
-                    }
-                }
-            },
-        ));
-        select
     }
 
     pub(crate) fn set_gui_language(
@@ -6520,45 +7603,17 @@ impl Tty7App {
             state.set_placeholder(t(L10nKey::SearchFiles), window, cx)
         });
         if let Some(s) = self.active_settings() {
-            let rows = crate::ui::i18n::SUPPORTED_LANGUAGES
-                .iter()
-                .map(|lang| t(lang.label_key).to_string())
-                .collect::<Vec<_>>();
-            s.language_select.update(cx, |state, cx| {
-                state.set_items(SearchableVec::new(rows), window, cx);
-                let code = Self::normalize_gui_language(&cx.global::<Config>().gui_language);
-                let selected = crate::ui::i18n::SUPPORTED_LANGUAGES
-                    .iter()
-                    .position(|lang| lang.code == code)
-                    .unwrap_or(0);
-                state.set_selected_index(Some(IndexPath::default().row(selected)), window, cx);
-            });
-            #[cfg(target_os = "windows")]
-            s.window_backdrop_select.update(cx, |state, cx| {
-                let current = cx.global::<Config>().window_backdrop;
-                let rows = window_backdrop_labels(current);
-                state.set_items(SearchableVec::new(rows), window, cx);
-                // `set_items` does not preserve the selection; restore the
-                // index of the stored value so a locale refresh (which
-                // re-translates the labels) cannot leave the dropdown
-                // showing no — or the wrong — selection.
-                state.set_selected_index(
-                    Some(IndexPath::default().row(window_backdrop_index(current))),
-                    window,
-                    cx,
-                );
-            });
             s.search.update(cx, |state, cx| {
                 state.set_placeholder(t(L10nKey::SearchSettings), window, cx)
-            });
-            s.theme_search.update(cx, |state, cx| {
-                state.set_placeholder(t(L10nKey::SearchThemes), window, cx)
             });
             s.ssh_filter.update(cx, |state, cx| {
                 state.set_placeholder(t(L10nKey::FilterHosts), window, cx)
             });
-            s.ssh_quick_connect.update(cx, |state, cx| {
-                state.set_placeholder(t(L10nKey::AppPlaceholderSshQuickConnect), window, cx)
+            s.shortcut_search.update(cx, |state, cx| {
+                state.set_placeholder(t(L10nKey::SettingsSearchShortcuts), window, cx)
+            });
+            s.agent_query.update(cx, |state, cx| {
+                state.set_placeholder(t(L10nKey::SettingsSearchAgents), window, cx)
             });
             s.shell_args_input.update(cx, |state, cx| {
                 state.set_placeholder(t(L10nKey::AppPlaceholderNone), window, cx)
@@ -6737,63 +7792,6 @@ impl Tty7App {
         cx.notify();
     }
 
-    fn build_window_opacity_slider(
-        &mut self,
-        subs: &mut Vec<Subscription>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<SliderState> {
-        let eff = Self::effective_window_opacity(cx);
-        let slider = cx.new(|_| {
-            SliderState::new()
-                .min(0.2)
-                .max(1.0)
-                .step(0.01)
-                .default_value(eff)
-        });
-        subs.push(cx.subscribe_in(
-            &slider,
-            window,
-            |this, _s, ev: &SliderEvent, window, cx| match ev {
-                SliderEvent::Change(v) => {
-                    cx.global_mut::<Config>().window_opacity = Some(v.start().clamp(0.2, 1.0));
-                    apply_theme(Some(window), cx);
-                    cx.notify();
-                }
-                SliderEvent::Release(_) => this.persist_settings_config(cx),
-            },
-        ));
-        slider
-    }
-
-    fn build_scroll_slider(
-        &mut self,
-        subs: &mut Vec<Subscription>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<SliderState> {
-        let scroll_mult = cx.global::<Config>().mouse_scroll_multiplier;
-        let scroll_slider = cx.new(|_| {
-            SliderState::new()
-                .min(0.5)
-                .max(5.0)
-                .step(0.25)
-                .default_value(scroll_mult)
-        });
-        subs.push(cx.subscribe_in(
-            &scroll_slider,
-            window,
-            |this, _s, ev: &SliderEvent, _w, cx| match ev {
-                SliderEvent::Change(v) => {
-                    cx.global_mut::<Config>().mouse_scroll_multiplier = v.start().clamp(0.1, 10.0);
-                    cx.notify();
-                }
-                SliderEvent::Release(_) => this.persist_settings_config(cx),
-            },
-        ));
-        scroll_slider
-    }
-
     pub(crate) fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(s) = self.settings.take() {
             self.last_settings_location = (
@@ -6962,7 +7960,7 @@ impl Tty7App {
         self.open_ssh_profile_form(profile, window, cx);
     }
 
-    fn commit_font_family(&mut self, family: String, cx: &mut Context<Self>) {
+    pub(crate) fn commit_font_family(&mut self, family: String, cx: &mut Context<Self>) {
         self.font_family = family.clone();
         for tab in &self.tabs {
             for leaf in tab.pane.terminals() {
@@ -6976,7 +7974,12 @@ impl Tty7App {
         cx.notify();
     }
 
-    fn commit_font_family_emphasis(&mut self, bold: bool, name: String, cx: &mut Context<Self>) {
+    pub(crate) fn commit_font_family_emphasis(
+        &mut self,
+        bold: bool,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
         let family = (name != crate::ui::settings::font_default_label()).then_some(name);
         for tab in &self.tabs {
             for leaf in tab.pane.terminals() {
@@ -7005,7 +8008,12 @@ impl Tty7App {
         cx.notify();
     }
 
-    fn commit_ui_font_family(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn commit_ui_font_family(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let family = (name != crate::ui::settings::ui_font_default_label()).then_some(name);
         let cfg = cx.global_mut::<Config>();
         if cfg.ui_font_family == family {
@@ -7020,14 +8028,6 @@ impl Tty7App {
 
     fn reload_from_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         apply_theme(Some(window), cx);
-        self.sync_window_opacity_slider(window, cx);
-        // Another window — or a hand edit / config sync picked up by the
-        // `Config` watcher — can change the backdrop while this window's
-        // settings panel is open. The window itself already switched
-        // material above, so the dropdown has to follow or it contradicts
-        // what it describes.
-        #[cfg(target_os = "windows")]
-        self.sync_window_backdrop_select(window, cx);
         let config = cx.global::<Config>().clone();
         if config.cursor_style != self.terminal_cursor_style
             || config.scrollback_limit != self.terminal_scrollback_limit
@@ -7352,6 +8352,16 @@ impl Tty7App {
                         }
                     }
                     CloseTarget::Pane => this.close_pane_inner(true, window, cx),
+                    CloseTarget::OtherTabs(id) => {
+                        if let Some(i) = this.tabs.iter().position(|t| t.tree_id.get() == id) {
+                            this.close_other_tabs_inner(i, true, window, cx);
+                        }
+                    }
+                    CloseTarget::TabsRightOf(id) => {
+                        if let Some(i) = this.tabs.iter().position(|t| t.tree_id.get() == id) {
+                            this.close_tabs_right_of_inner(i, true, window, cx);
+                        }
+                    }
                 }
             });
         })
@@ -7360,10 +8370,16 @@ impl Tty7App {
 
     /// The first reason this pane should not simply vanish.
     fn leaf_close_reason(&self, leaf: &Entity<TerminalView>, cx: &App) -> Option<CloseReason> {
-        if self.leaf_is_warn_ssh(leaf, cx) {
-            return Some(CloseReason::LiveSsh);
-        }
-        leaf.read(cx).busy().map(CloseReason::Busy)
+        self.leaf_close_reason_as(cx.global::<Config>().confirm_close, leaf, cx)
+    }
+
+    fn leaf_close_reason_as(
+        &self,
+        mode: crate::core::config::ConfirmClose,
+        leaf: &Entity<TerminalView>,
+        cx: &App,
+    ) -> Option<CloseReason> {
+        close_reason(mode, self.leaf_is_warn_ssh(leaf, cx), leaf.read(cx).busy())
     }
 
     /// Whether closing this tab would drop a connection the user asked to be
@@ -7378,13 +8394,24 @@ impl Tty7App {
         })
     }
 
+    /// The first reason any pane of the tab gives. Under `Always` a busy pane
+    /// or a warned connection still names itself — the idle question is only
+    /// what is left when no pane has anything more specific to say.
     fn tab_close_reason(&self, index: usize, cx: &App) -> Option<CloseReason> {
-        self.tabs
+        use crate::core::config::ConfirmClose;
+        let mode = cx.global::<Config>().confirm_close;
+        let asked_as = match mode {
+            ConfirmClose::Always => ConfirmClose::WhenBusy,
+            other => other,
+        };
+        let specific = self
+            .tabs
             .get(index)?
             .pane
             .terminals()
             .iter()
-            .find_map(|l| self.leaf_close_reason(l, cx))
+            .find_map(|l| self.leaf_close_reason_as(asked_as, l, cx));
+        specific.or((mode == ConfirmClose::Always).then_some(CloseReason::Idle))
     }
 
     fn focused_pane_close_reason(&self, window: &Window, cx: &App) -> Option<CloseReason> {
@@ -7615,6 +8642,10 @@ impl Tty7App {
         use crate::core::agent_hooks::HookOutcome as O;
         match outcome {
             O::Installed => t(L10nKey::AppAgentHooksInstalled).to_string(),
+            O::MuseInstallManually(command) => t_fmt(
+                L10nKey::AppAgentHooksMuseManualInstall,
+                &[("command", command)],
+            ),
             O::InstalledEnableCodexThere => {
                 t(L10nKey::AppAgentHooksInstalledEnableCodexThere).to_string()
             }
@@ -7650,6 +8681,11 @@ impl Tty7App {
             return;
         };
 
+        if let Some(s) = self.settings.as_mut() {
+            s.agent_busy.insert(agent);
+            s.agent_touched.insert(agent);
+        }
+        cx.notify();
         crate::ui::host_ops::HostOps::run(
             host,
             cx,
@@ -7668,6 +8704,7 @@ impl Tty7App {
             },
             move |this, result, cx| {
                 if let Some(s) = this.settings.as_mut() {
+                    s.agent_busy.remove(&agent);
                     s.agent_hooks_note = Some((
                         agent,
                         match result {
@@ -7727,6 +8764,7 @@ impl Tty7App {
         self.record_gen = self.record_gen.wrapping_add(1);
         if let Some(s) = self.active_settings_mut() {
             s.rebinding_note = None;
+            s.kb_conflict = None;
             s.recording = Some(Recording {
                 action,
                 chords: Vec::new(),
@@ -7812,7 +8850,54 @@ impl Tty7App {
             return;
         };
         self.stop_recording(cx);
-        self.assign_keybinding(action, chords.join(" "), cx);
+        let spec = chords.join(" ");
+        // A chord another action answers to is not taken silently: the row
+        // asks whether to take it over, and only Replace moves it.
+        if let Some(other) = Self::keybinding_owner(&action, &spec, cx) {
+            if let Some(s) = self.active_settings_mut() {
+                s.kb_conflict = Some(crate::ui::settings::KeyConflict {
+                    action,
+                    spec,
+                    other,
+                });
+            }
+            cx.notify();
+            return;
+        }
+        self.assign_keybinding(action, spec, cx);
+    }
+
+    /// The other action that already answers to `spec`, if any.
+    fn keybinding_owner(action: &str, spec: &str, cx: &App) -> Option<String> {
+        use crate::ui::keymap::same_chord;
+        crate::ui::keymap::effective_chords(cx)
+            .into_iter()
+            .find(|(a, chords)| a != action && chords.iter().any(|k| same_chord(k, spec)))
+            .map(|(a, _)| a)
+            .or_else(|| {
+                crate::ui::keymap::extra_bindings(cx)
+                    .into_iter()
+                    .find(|(a, k)| a != action && same_chord(k, spec))
+                    .map(|(a, _)| a)
+            })
+    }
+
+    /// Takes the conflicting chord over, as the row's Replace button says.
+    pub(crate) fn resolve_keybinding_conflict(&mut self, replace: bool, cx: &mut Context<Self>) {
+        let Some(conflict) = self
+            .active_settings_mut()
+            .and_then(|s| s.kb_conflict.take())
+        else {
+            return;
+        };
+        if replace {
+            self.assign_keybinding(conflict.action, conflict.spec, cx);
+            if let Some(s) = self.active_settings_mut() {
+                // The row already said what Replace would do.
+                s.rebinding_note = None;
+            }
+        }
+        cx.notify();
     }
 
     fn stop_recording(&mut self, cx: &mut Context<Self>) {
@@ -7928,36 +9013,7 @@ impl Tty7App {
         cx.notify();
     }
 
-    pub(crate) fn restore_default_keybindings(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        // Nothing here is recoverable: the overrides are dropped from config
-        // and the only record of them was the config.
-        if cx.global::<Config>().keybindings.is_empty() {
-            return;
-        }
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaults),
-            Some(t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaultsBody)),
-            &crate::ui::confirm_answers(
-                t(crate::ui::i18n::L10nKey::SettingsRestoreAllDefaults),
-                t(crate::ui::i18n::L10nKey::Cancel),
-            ),
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(0) = answer.await else { return };
-            let _ = this.update(cx, |this, cx| {
-                this.restore_default_keybindings_confirmed(cx)
-            });
-        })
-        .detach();
-    }
-
-    fn restore_default_keybindings_confirmed(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn restore_default_keybindings_confirmed(&mut self, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.keybindings.clear());
         crate::ui::keymap::rebind(cx);
         if let Some(s) = self.active_settings_mut() {
@@ -8103,6 +9159,51 @@ impl Tty7App {
                 .child(bar)
                 .into_any_element(),
         )
+    }
+
+    /// One pill per pane in the active tab that a phone is running at its own
+    /// size. The window keeps its grid meanwhile and shows the pane's output
+    /// laid out for the phone, so it says why, and offers the pane back.
+    fn render_lease_notices(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        use gpui_component::Sizable as _;
+        use gpui_component::button::ButtonVariants as _;
+        let Some(tab) = self.tabs.get(self.active) else {
+            return Vec::new();
+        };
+        let theme = cx.theme();
+        let (info, foreground, popover) = (theme.info, theme.foreground, theme.popover);
+        tab.pane
+            .terminals()
+            .into_iter()
+            .filter_map(|leaf| {
+                let by = leaf.read(cx).terminal.leased_by()?;
+                let id = leaf.entity_id().as_u64();
+                Some(
+                    crate::ui::notice::pill(info, cx)
+                        .child(
+                            div()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(foreground)
+                                .child(crate::ui::i18n::t_fmt(
+                                    crate::ui::i18n::L10nKey::PaneLeasedBy,
+                                    &[("by", &by)],
+                                )),
+                        )
+                        .child(
+                            gpui_component::button::Button::new(gpui::SharedString::from(format!(
+                                "lease-take-back-{id}"
+                            )))
+                            .label(crate::ui::i18n::t(
+                                crate::ui::i18n::L10nKey::RemoteActionTakeBack,
+                            ))
+                            .custom(crate::ui::theme::inverted_button(popover, cx))
+                            .small()
+                            .on_click(move |_, _, cx| leaf.read(cx).terminal.take_back()),
+                        )
+                        .into_any_element(),
+                )
+            })
+            .collect()
     }
 
     fn render_remote_input_notice(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -8257,6 +9358,31 @@ impl ForwardRoute {
         }
     }
 
+    pub(crate) fn set_enabled(
+        &self,
+        forward_id: u64,
+        enabled: bool,
+    ) -> anyhow::Result<Vec<crate::daemon::protocol::ManagedForward>> {
+        let Some(req) =
+            self.workspace_op(crate::daemon::protocol::WorkspaceOp::SetForwardEnabled {
+                forward_id,
+                enabled,
+            })
+        else {
+            return crate::terminal::RemoteTerminal::set_forward_enabled(
+                self.pane_id,
+                forward_id,
+                enabled,
+            );
+        };
+        match crate::terminal::RemoteTerminal::on_workspace(req)? {
+            crate::daemon::protocol::DaemonMsg::ForwardList(list) => Ok(list),
+            other => Err(anyhow::anyhow!(
+                "unexpected reply to SetForwardEnabled: {other:?}"
+            )),
+        }
+    }
+
     pub(crate) fn remove(
         &self,
         forward_id: u64,
@@ -8281,9 +9407,13 @@ impl Render for Tty7App {
         // terminal grid, sized in absolute px from `font_size`, does not move.
         window.set_rem_size(px(cx.global::<Config>().ui_font_size));
         self.claim_pending_tab(window, cx);
+        // Before anything asks where a tab is drawn: a tab that walked into a
+        // pinned folder since the last frame is filed there on this one.
+        self.settle_sidebar_groups(cx);
         self.touch_active_tab();
         self.declare_displayed_panes(cx);
         self.scm_sync_watchers(window, cx);
+        self.editor_sync(window, cx);
         // Keeps looking for new listening ports on the pane in front, panel
         // open or not — a port that appears while the panel is shut is exactly
         // the one worth forwarding unasked.
@@ -8297,14 +9427,23 @@ impl Render for Tty7App {
             let landed = crate::ui::reorder::take_landed(&self.reorder);
             if let Some((tab, zone)) = self.tab_merge.take() {
                 self.merge_tab(tab, zone, window, cx);
-            } else if let Some((tab, key)) = landed.regroup {
+            } else if let Some((tab, target)) = landed.regroup {
                 // A drop into another group outranks the reordering the drag
                 // did on its way out of the one it came from. The pointer
                 // left that group; the shuffle it caused before leaving is
                 // not what was being asked for.
-                self.regroup_tab(tab, key, cx);
+                self.regroup_tab(tab, target, cx);
+            } else if let Some(key) = landed.pin {
+                // The same for a header let go above the divider: it was
+                // carried there to be pinned, not to be reordered on the way.
+                self.pin_auto_group(key, cx);
             } else if let Some(order) = landed.order {
-                self.apply_tab_order(&order, cx);
+                match landed.surface {
+                    Some(crate::ui::reorder::Surface::PinnedGroups) => {
+                        self.apply_pinned_order(&order, cx)
+                    }
+                    _ => self.apply_tab_order(&order, cx),
+                }
             }
             // Also what ends the pane drag, so it is taken whichever of the two
             // readings the last frame left behind.
@@ -8334,6 +9473,19 @@ impl Render for Tty7App {
         // two spellings of "is the rail up" is one more than the layout can
         // afford to have disagree.
         let rail = self.sidebar_open(cx);
+        // A hover flag is only written by its sheet, and only on a change of
+        // state it saw. A sheet that is not in the tree sees none: the rail
+        // hidden by its own tile with the pointer on it, or the switch turned
+        // off mid-hover, would leave its flag set, and the tiles would come
+        // back painted, with nobody pointing at them, the next time the sheet
+        // does. Clear the flag of every sheet not built this frame.
+        let auto_hide_chrome = cx.global::<Config>().auto_hide_titlebar_buttons;
+        if !auto_hide_chrome || !rail {
+            self.sidebar_chrome_hover.set(false);
+        }
+        if !auto_hide_chrome {
+            self.strip_chrome_hover.set(false);
+        }
         // Both read before the strip and the sidebar are built: a tab held out
         // over the layout suspends the reorder, which is what those two ask
         // what to draw, and a pane held over *them* is measured against where
@@ -8445,6 +9597,7 @@ impl Render for Tty7App {
                     [self.render_remote_input_notice(cx), ssh_status]
                         .into_iter()
                         .flatten()
+                        .chain(self.render_lease_notices(cx))
                         .collect(),
                 ),
                 |this, el| this.child(el),
@@ -8581,7 +9734,7 @@ impl Render for Tty7App {
                                         .right_0()
                                         .w(px(panel_px))
                                         .bg(crate::ui::theme::workspace_surface_color(cx))
-                                        .border_l_1()
+                                        .border_l(crate::ui::theme::hairline(window))
                                         .border_color(cx.theme().sidebar_border),
                                 )
                             })
@@ -8594,7 +9747,7 @@ impl Render for Tty7App {
                                         .right(px(panel_px))
                                         .w(px(document_px))
                                         .bg(crate::ui::theme::workspace_surface_color(cx))
-                                        .border_l_1()
+                                        .border_l(crate::ui::theme::hairline(window))
                                         .border_color(cx.theme().sidebar_border),
                                 )
                             })
@@ -8776,6 +9929,12 @@ impl Render for Tty7App {
                 .on_action(cx.listener(|this, _: &SelectPrevTab, window, cx| {
                     this.cycle_tab(false, window, cx)
                 }))
+                .on_action(
+                    cx.listener(|this, _: &MoveTabLeft, _window, cx| this.move_tab(false, cx)),
+                )
+                .on_action(
+                    cx.listener(|this, _: &MoveTabRight, _window, cx| this.move_tab(true, cx)),
+                )
                 .on_action(cx.listener(|this, _: &ActivateTab1, window, cx| {
                     this.activate_visual(0, window, cx)
                 }))
@@ -8812,8 +9971,13 @@ impl Render for Tty7App {
                 .on_action(
                     cx.listener(|this, _: &ResetFontSize, _window, cx| this.reset_font_size(cx)),
                 )
-                .on_action(cx.listener(|this, _: &TogglePalette, window, cx| {
-                    this.toggle_palette(window, cx)
+                .on_action(
+                    cx.listener(|this, _: &TogglePalette, window, cx| {
+                        this.toggle_search(window, cx)
+                    }),
+                )
+                .on_action(cx.listener(|this, _: &QuickOpenFile, window, cx| {
+                    this.quick_open_file(window, cx)
                 }))
                 .on_action(cx.listener(|this, _: &ReopenClosedTab, window, cx| {
                     this.reopen_closed_tab(window, cx)
@@ -8843,6 +10007,12 @@ impl Render for Tty7App {
                 }))
                 .on_action(cx.listener(|this, _: &ShowRightPanelFiles, _window, cx| {
                     this.set_right_panel_tab(crate::core::config::RightPanelTab::Files, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ShowRightPanelSearch, _window, cx| {
+                    this.set_right_panel_tab(crate::core::config::RightPanelTab::Search, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ShowRightPanelGitHub, _window, cx| {
+                    this.set_right_panel_tab(crate::core::config::RightPanelTab::GitHub, cx)
                 }))
                 .on_action(
                     cx.listener(|this, _: &ScmToggleGraph, _window, cx| this.scm_toggle_graph(cx)),
@@ -8922,11 +10092,101 @@ impl Render for Tty7App {
                     this.toggle_code_panel(window, cx)
                 }))
                 .on_action(cx.listener(|this, _: &EditorSave, window, cx| {
-                    if !this.editor_has_focus(window, cx) {
+                    if !this.editor_panel_has_focus(window, cx) {
                         cx.propagate();
                         return;
                     }
                     this.editor_save_active(window, cx)
+                }))
+                // Same shape as `EditorSave`: the chord belongs to the editor
+                // only while it has the focus, and reaches the terminal
+                // otherwise — Ctrl+G is BEL to a shell.
+                .on_action(cx.listener(|this, _: &EditorSaveAs, window, cx| {
+                    if !this.editor_panel_has_focus(window, cx) {
+                        cx.propagate();
+                        return;
+                    }
+                    this.editor_save_as_active(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &EditorGoToLine, window, cx| {
+                    if !this.editor_panel_has_focus(window, cx) {
+                        cx.propagate();
+                        return;
+                    }
+                    this.editor_go_to_line(window, cx)
+                }))
+                // The language-server commands (`ui::lsp`) belong to the
+                // editor only while it has the focus; F2 and F12 mean
+                // something to programs in the terminal too.
+                .on_action(cx.listener(|this, _: &EditorGoToDefinition, window, cx| {
+                    if !this.editor_has_focus(window, cx) {
+                        cx.propagate();
+                        return;
+                    }
+                    this.lsp_go_to_definition(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &EditorQuickFix, window, cx| {
+                    if !this.editor_has_focus(window, cx) {
+                        cx.propagate();
+                        return;
+                    }
+                    this.lsp_code_actions(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &EditorRenameSymbol, window, cx| {
+                    if !this.editor_has_focus(window, cx) {
+                        cx.propagate();
+                        return;
+                    }
+                    this.lsp_rename_start(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &EditorFormatDocument, window, cx| {
+                    if !this.editor_has_focus(window, cx) {
+                        cx.propagate();
+                        return;
+                    }
+                    this.lsp_format_document(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &EditorFindReferences, window, cx| {
+                    if !this.editor_has_focus(window, cx) {
+                        cx.propagate();
+                        return;
+                    }
+                    this.lsp_find_references(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &EditorNewFile, window, cx| {
+                    this.editor_new_file(window, cx)
+                }))
+                // The gutter's change markers. Each one lets the chord through
+                // when the editor is not focused or has nothing to do.
+                .on_action(cx.listener(|this, _: &EditorNextChange, window, cx| {
+                    if !this.editor_gutter_step(true, window, cx) {
+                        cx.propagate();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &EditorPrevChange, window, cx| {
+                    if !this.editor_gutter_step(false, window, cx) {
+                        cx.propagate();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &EditorRevertChange, window, cx| {
+                    if !this.editor_gutter_revert_at_cursor(window, cx) {
+                        cx.propagate();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &ToggleEditorGitGutter, _, cx| {
+                    this.toggle_editor_git_gutter(cx)
+                }))
+                .on_action(cx.listener(|this, _: &EditorPeekChange, window, cx| {
+                    if !this.editor_gutter_peek_at_cursor(window, cx) {
+                        cx.propagate();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &ToggleEditorProblems, _, cx| {
+                    if !this.code_panel_visible() {
+                        cx.propagate();
+                        return;
+                    }
+                    this.toggle_editor_problems(cx)
                 }))
                 .on_action(
                     cx.listener(|this, _: &Quit, window, cx| this.quit_stop_sessions(window, cx)),
@@ -8955,6 +10215,9 @@ impl Render for Tty7App {
                 .on_action(cx.listener(|this, _: &MarkTabUnread, _window, cx| {
                     this.mark_tab_unread(this.active, cx)
                 }))
+                .on_action(cx.listener(|this, _: &HibernateTab, window, cx| {
+                    this.hibernate_tab(this.active, window, cx)
+                }))
                 .on_action(cx.listener(|this, _: &ForkAgentSession, window, cx| {
                     this.fork_active_pane_session(ForkPlacement::NewTab, window, cx)
                 }))
@@ -8972,6 +10235,15 @@ impl Render for Tty7App {
                 }))
                 .on_action(cx.listener(|this, _: &CopyAgentSessionId, window, cx| {
                     this.copy_agent_session_id(this.active, window, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &NewAgentTab, window, cx| this.new_agent_tab(window, cx)),
+                )
+                .on_action(cx.listener(|this, action: &LaunchAgent, window, cx| {
+                    this.launch_agent(action.agent, SpawnWhere::NewTab, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &SaveAgentLaunchArgs, window, cx| {
+                    this.save_agent_launch_args(window, cx)
                 }))
                 .on_action(cx.listener(|this, _: &ShowKeyboardShortcuts, window, cx| {
                     this.open_settings_section(SettingsSection::Keybindings, window, cx)
@@ -9018,8 +10290,9 @@ impl Render for Tty7App {
                     this.child(el)
                 })
                 .children(self.render_switcher(window, cx))
-                .when_some(self.palette.clone(), |this, palette| this.child(palette))
+                .when_some(self.search.clone(), |this, search| this.child(search))
                 .children(gpui_component::Root::render_notification_layer(window, cx));
+        let root = Self::with_editor_text_commands(root, cx);
 
         if let Some(start) = prof {
             crate::ui::perf::record("window", start.elapsed());
@@ -9050,6 +10323,35 @@ fn step_in_order(order: &[usize], active: usize, forward: bool) -> Option<usize>
     Some(order[next]).filter(|&i| i != active)
 }
 
+/// The `apply_tab_order` permutation that moves the active tab one slot
+/// within `run` — a move, not a trade: the tab is lifted out and put back at
+/// the neighbour's place, so through a wrap the run it crossed shifts one slot
+/// (`[a, b, c]` with `c` moved right becomes `[c, a, b]`, not `[c, b, a]`).
+/// `run` is the tabs drawn together (a sidebar section, or every tab on a top
+/// bar) as ascending `self.tabs` indices out of `n`; only their slots are
+/// reassigned, so no tab in another run moves, not even out of sight. `None`
+/// when there is nothing to move: a run of fewer than two tabs, or one that
+/// does not hold the active tab.
+fn one_slot_move(run: &[usize], n: usize, active: usize, right: bool) -> Option<Vec<usize>> {
+    let len = run.len();
+    if len < 2 {
+        return None;
+    }
+    let pos = run.iter().position(|&i| i == active)?;
+    let mut moved = run.to_vec();
+    match (right, pos) {
+        (true, p) if p + 1 == len => moved.rotate_right(1),
+        (false, 0) => moved.rotate_left(1),
+        (true, p) => moved.swap(p, p + 1),
+        (false, p) => moved.swap(p, p - 1),
+    }
+    let mut permutation: Vec<usize> = (0..n).collect();
+    for (&slot, &tab) in run.iter().zip(&moved) {
+        permutation[slot] = tab;
+    }
+    Some(permutation)
+}
+
 fn mru_order(stamps: &[u64], active: usize) -> Vec<usize> {
     let mut order: Vec<usize> = (0..stamps.len()).collect();
     order.sort_by_key(|&i| (stamps[i] == 0, std::cmp::Reverse(stamps[i]), i));
@@ -9063,9 +10365,15 @@ fn mru_order(stamps: &[u64], active: usize) -> Vec<usize> {
 fn tab_to_session(tab: &Tab, cx: &App) -> SessionTab {
     SessionTab {
         name: tab.name.clone(),
-        pane: pane_to_session(&tab.pane, cx),
-        sidebar_group: tab.sidebar_group.borrow().clone(),
+        pane: match tab.asleep_layout() {
+            Some(layout) => layout.clone(),
+            None => pane_to_session(&tab.pane, cx),
+        },
+        group: tab.group.get(),
+        last_auto: tab.auto_group.borrow().clone(),
         tree_id: None,
+        hibernated: false,
+        asleep_view: None,
     }
 }
 
@@ -9073,6 +10381,7 @@ fn agent_resume_command(
     agent: &Option<crate::core::cli_agent::CLIAgent>,
     session_id: Option<&str>,
     launch_argv: Option<&[String]>,
+    view: &TerminalView,
     cx: &App,
 ) -> Option<String> {
     if !cx.global::<Config>().restore_agent_sessions {
@@ -9086,7 +10395,28 @@ fn agent_resume_command(
         );
         return None;
     };
-    agent.resume_command(session_id, launch_argv)
+    agent.restore_command(
+        session_id,
+        launch_argv,
+        pane_shell_program(view, cx).as_deref(),
+    )
+}
+
+/// The shell `view` is running, for deciding what a line typed into it may
+/// use. A pane spawned without an explicit shell got the configured one or,
+/// failing that, the login shell — but only a local pane got this machine's;
+/// a workspace pane's default lives on its host, so it stays unknown.
+fn pane_shell_program(view: &TerminalView, cx: &App) -> Option<String> {
+    if let Some(spec) = view.shell_spec() {
+        return Some(spec.program);
+    }
+    if view.workspace().is_some() || view.ssh_spec().is_some() || view.remote_context().is_some() {
+        return None;
+    }
+    Some(match &cx.global::<Config>().shell {
+        Some(shell) if !shell.program.trim().is_empty() => shell.program.clone(),
+        _ => crate::core::shells::login_shell(),
+    })
 }
 
 fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
@@ -9106,7 +10436,16 @@ fn pane_to_session(pane: &Pane, cx: &App) -> SessionPane {
         Pane::Leaf(PaneSlot::Ready(view)) => {
             let view = view.read(cx);
             SessionPane::Leaf {
-                cwd: view.spawnable_cwd(),
+                // A native SSH leaf keeps the far shell's directory, so a
+                // sleeping SSH tab wakes where it was: the redial that wakes it
+                // takes this as its start directory on the same host, and the
+                // tree record it seeds holds the far directory for such a pane
+                // anyway. Any other remote pane's cwd is on a host no restore
+                // dials, so it is still left out.
+                cwd: match view.ssh_spec() {
+                    Some(_) => view.cwd(),
+                    None => view.spawnable_cwd(),
+                },
                 pane_id: Some(view.pane_id),
                 // `None` for a pane this window attached to rather than
                 // spawned: it never knew what was on the other end. The tree
@@ -9240,7 +10579,19 @@ fn tabs_from_session(
     let alive = alive_panes_on(&crate::terminal::PaneRoute::for_workspace(workspace));
     let mut tabs: Vec<Tab> = Vec::with_capacity(session.tabs.len());
     let mut dropped = 0usize;
-    for st in &session.tabs {
+    let home = crate::ui::path_display::home_for_host(
+        cx,
+        workspace.map_or(HostId::LOCAL, |w| w.target.host_id()),
+    );
+    for (index, st) in session.tabs.iter().enumerate() {
+        // Asleep stays asleep: nothing is spawned or attached for it, which is
+        // the point. The one exception is the tab the window opens onto — a
+        // tab on screen is awake, so that one is woken here, by the same
+        // restore every other tab is getting.
+        if st.hibernated && index != session.active {
+            tabs.push(asleep_tab(st, home.clone()));
+            continue;
+        }
         let Some(pane) = session_to_pane(
             workspace,
             owner,
@@ -9265,17 +10616,119 @@ fn tabs_from_session(
             code: None,
             overlay_top: OverlayTop::default(),
             document_layout: None,
-            sidebar_group: std::cell::RefCell::new(st.sidebar_group.clone()),
+            group: std::cell::Cell::new(st.group),
+            // The hint the tree kept: the tab is drawn in its auto group from
+            // the first frame, not parked in Ungrouped until its probe lands.
+            auto_group: std::cell::RefCell::new(st.last_auto.clone()),
+            folder_watch: std::cell::Cell::new(crate::core::group_key::EntryWatch::baseline()),
             tree_id: std::cell::Cell::new(
                 st.tree_id
                     .unwrap_or_else(tty7_core::core::machine::TabId::new),
             ),
             last_used: std::cell::Cell::new(0),
             focus_origin: Default::default(),
+            asleep: None,
         });
     }
     let active = session.active.min(tabs.len().saturating_sub(1));
     (tabs, active, dropped)
+}
+
+/// A tab restored asleep: its place, its name and its group, and nothing
+/// running behind them.
+fn asleep_tab(st: &SessionTab, home: Option<std::path::PathBuf>) -> Tab {
+    let mut tab = Tab::new(Pane::Empty);
+    tab.name = st.name.clone();
+    tab.group.set(st.group);
+    *tab.auto_group.borrow_mut() = st.last_auto.clone();
+    if let Some(id) = st.tree_id {
+        tab.tree_id.set(id);
+    }
+    tab.asleep = Some(Asleep {
+        layout: st.pane.clone(),
+        view: st
+            .asleep_view
+            .clone()
+            .unwrap_or_else(|| view_of_layout(tab.tree_id.get(), &st.pane)),
+        home,
+    });
+    tab
+}
+
+/// What to call a sleeping tab when the tree had nothing better to say: the
+/// first directory in its layout, and the agent in it if there was one.
+fn view_of_layout(
+    id: tty7_core::core::machine::TabId,
+    layout: &SessionPane,
+) -> tty7_core::core::tab_view::TabView {
+    fn leaves<'a>(pane: &'a SessionPane, out: &mut Vec<&'a SessionPane>) {
+        match pane {
+            SessionPane::Leaf { .. } => out.push(pane),
+            SessionPane::Split { a, b, .. } => {
+                leaves(a, out);
+                leaves(b, out);
+            }
+        }
+    }
+    let mut all = Vec::new();
+    leaves(layout, &mut all);
+    let cwd = all.iter().find_map(|leaf| match leaf {
+        SessionPane::Leaf { cwd, .. } => cwd.as_ref().map(|p| p.display().to_string()),
+        SessionPane::Split { .. } => None,
+    });
+    let agent = all.iter().find_map(|leaf| match leaf {
+        SessionPane::Leaf { agent, .. } => *agent,
+        SessionPane::Split { .. } => None,
+    });
+    tty7_core::core::tab_view::TabView {
+        id,
+        name: None,
+        title: String::new(),
+        osc_title: None,
+        cwd,
+        agent,
+        status: None,
+        live: false,
+        panes: all.len(),
+    }
+}
+
+/// A sleeping layout as a wake should read it: a native SSH pane dials its
+/// host again rather than standing on its old id. That id belongs to a pane
+/// whose connection is gone, and the restore reading it would put a local
+/// shell in its place.
+fn redial_native_ssh(layout: &SessionPane) -> SessionPane {
+    match layout {
+        SessionPane::Leaf {
+            ssh_spec: Some(_), ..
+        } => {
+            let mut leaf = layout.clone();
+            if let SessionPane::Leaf { pane_id, .. } = &mut leaf {
+                *pane_id = None;
+            }
+            leaf
+        }
+        SessionPane::Leaf { .. } => layout.clone(),
+        SessionPane::Split { axis, ratio, a, b } => SessionPane::Split {
+            axis: *axis,
+            ratio: *ratio,
+            a: Box::new(redial_native_ssh(a)),
+            b: Box::new(redial_native_ssh(b)),
+        },
+    }
+}
+
+/// Whether a native SSH pane can be attached to by its old id: only when the
+/// server lists it. A failed attach falls through to a fresh *local* shell,
+/// and after a server restart that put the user's own machine behind a tab
+/// that had been — and still looked like — a session on another one. Without
+/// a listing the host is dialled again: a second connection is recoverable,
+/// typing into the wrong machine is not.
+fn native_ssh_pane_alive(
+    alive: Option<&std::collections::HashMap<u64, Option<String>>>,
+    id: u64,
+) -> bool {
+    alive.is_some_and(|alive| alive.contains_key(&id))
 }
 
 fn leaf_shares_the_window_daemon(window_is_remote: bool, leaf_is_native_ssh: bool) -> bool {
@@ -9308,22 +10761,36 @@ fn session_to_pane(
                 // Not `pane_attachable`: a dead pane's id is what the restore
                 // is keyed on, so it has to survive being dead. The attach is
                 // still attempted first and still gives way to a fresh spawn.
-                false => (*pane_id).filter(|id| same_daemon && pane_free_for(alive, *id, owner)),
+                false => (*pane_id).filter(|id| {
+                    same_daemon
+                        && pane_free_for(alive, *id, owner)
+                        && (ssh_spec.is_none() || native_ssh_pane_alive(alive, *id))
+                }),
             };
             if restore.is_none() {
                 if let Some(spec) = ssh_spec.clone() {
                     let resolved = crate::ui::ssh_connect::resolve_persisted_ssh_spec(spec, cx);
+                    // A native SSH leaf's recorded cwd is the far shell's own
+                    // report, so it is where the redialled shell starts.
                     match new_terminal_native(font_size, cwd.clone(), resolved, window, cx) {
                         Ok(view) => return Some(Pane::leaf(PaneSlot::Ready(view))),
                         Err(e) => log::error!("restoring native SSH pane failed: {e}"),
                     }
                 }
             }
+            // Past here the leaf comes back as a shell on the window's own
+            // machine: reattached, or spawned fresh in place of one that is
+            // gone. A native SSH leaf's cwd is a path on the far host, so a
+            // fresh shell standing in for one must not start in it here.
+            let local_cwd = match ssh_spec {
+                Some(_) => None,
+                None => cwd.clone(),
+            };
             let view = match new_terminal(
                 workspace.cloned(),
                 Some(owner),
                 font_size,
-                cwd.clone(),
+                local_cwd,
                 restore,
                 shell.clone(),
                 window,
@@ -9341,6 +10808,7 @@ fn session_to_pane(
                         agent,
                         agent_session_id.as_deref(),
                         agent_launch_argv.as_deref(),
+                        terminal.read(cx),
                         cx,
                     ) {
                         terminal.read(cx).run_command_line(&cmd);
@@ -9408,6 +10876,7 @@ pub(crate) fn new_terminal(
         agent: None,
         agent_session_id: None,
         agent_launch_argv: None,
+        run_on_land: None,
         owner,
         font_size,
     };
@@ -9490,6 +10959,14 @@ fn build_terminal_view(
     cx.subscribe_in(
         &view,
         window,
+        |app, _view, ev: &crate::terminal::view::AgentDetected, _window, cx| {
+            app.note_agent_detected(ev.0, cx);
+        },
+    )
+    .detach();
+    cx.subscribe_in(
+        &view,
+        window,
         |app, view, _: &crate::terminal::view::AuthPromptReady, window, cx| {
             app.on_auth_prompt_ready(view.clone(), window, cx);
         },
@@ -9499,6 +10976,31 @@ fn build_terminal_view(
     let handle = view.read(cx).focus_handle.clone();
     watch_pane_focus(&handle, view.entity_id(), window, cx);
     view
+}
+
+/// Split a closing tab's panes into the ones its machine stops for it and the
+/// ones this window ends itself: `(pane id, route, is native SSH)` in, and the
+/// same pairs out, machine-held first.
+///
+/// A native SSH pane in a remote window lives in this computer's daemon, not
+/// on the window's machine — the tree never holds it (see
+/// `leaf_shares_the_window_daemon`) — so the machine cannot stop it and it is
+/// ended from here. Without `remote_window` every pane is the machine's.
+fn split_machine_held(
+    remote_window: bool,
+    leaves: &[(u64, crate::terminal::PaneRoute, bool)],
+) -> (
+    Vec<(u64, crate::terminal::PaneRoute)>,
+    Vec<(u64, crate::terminal::PaneRoute)>,
+) {
+    let (held, here): (Vec<_>, Vec<_>) = leaves
+        .iter()
+        .cloned()
+        .partition(|(_, _, native_ssh)| leaf_shares_the_window_daemon(remote_window, *native_ssh));
+    let strip = |v: Vec<(u64, crate::terminal::PaneRoute, bool)>| {
+        v.into_iter().map(|(id, route, _)| (id, route)).collect()
+    };
+    (strip(held), strip(here))
 }
 
 fn kill_pane_off_thread(route: crate::terminal::PaneRoute, pane_id: u64, cx: &mut App) {
@@ -9590,14 +11092,17 @@ fn watch_pane_focus(
         .detach();
 }
 
+/// A pane dialling `spec`. `remote_start_dir` is a directory on the far host
+/// for its shell to start in — never a local path; see
+/// [`inherited_start_dir`] for which openings carry one.
 pub(crate) fn new_terminal_native(
     font_size: f32,
-    working_directory: Option<std::path::PathBuf>,
+    remote_start_dir: Option<std::path::PathBuf>,
     spec: Box<crate::daemon::protocol::NativeSshSpec>,
     window: &mut Window,
     cx: &mut Context<Tty7App>,
 ) -> anyhow::Result<Entity<TerminalView>> {
-    let parts = TerminalView::spawn_native_ssh_terminal(spec, working_directory)?;
+    let parts = TerminalView::spawn_native_ssh_terminal(spec, remote_start_dir)?;
     let view = cx.new(|cx| {
         let mut view = TerminalView::from_native_ssh_parts(parts, window, cx);
         view.font_size = px(font_size);
@@ -10119,14 +11624,26 @@ mod window_drag_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::close_reason;
     use super::{
-        CloseReason, DOCUMENT_MIN_W, Dir, Pane, Rename, TERMINAL_MIN_W, TITLE_BAR_HEIGHT, Tab,
-        TabAgentSession, clear_window_override_values, close_prompt, document_column_px,
-        join_shell_args, leaf_shares_the_window_daemon, mru_order, pane_free_for,
-        parse_ssh_connect_input, parse_ssh_option_words, rename_outcome, side_panel_max,
+        CloseReason, DOCUMENT_MIN_W, Dir, OpenedFrom, Pane, Rename, TERMINAL_MIN_W,
+        TITLE_BAR_HEIGHT, Tab, TabAgentSession, clear_window_override_values, close_prompt,
+        document_column_px, inherited_start_dir, join_shell_args, leaf_shares_the_window_daemon,
+        mru_order, native_ssh_pane_alive, one_slot_move, pane_free_for, parse_ssh_connect_input,
+        parse_ssh_option_words, rename_outcome, side_panel_max, split_machine_held,
         split_shell_args, step_in_order, strip_band, wd_path_saveable,
     };
     use gpui::{Edges, point, px, size};
+
+    #[test]
+    fn title_bar_buttons_rest_out_of_sight_only_when_asked_to_and_nobody_points() {
+        // Off: painted whether or not the pointer is anywhere near.
+        assert!(super::titlebar_chrome_shown(false, false));
+        assert!(super::titlebar_chrome_shown(false, true));
+        // On: painted exactly while the pointer is over the bar.
+        assert!(!super::titlebar_chrome_shown(true, false));
+        assert!(super::titlebar_chrome_shown(true, true));
+    }
 
     #[test]
     fn a_rename_box_left_alone_is_not_a_rename() {
@@ -10400,6 +11917,75 @@ mod tests {
         assert!(!ssh_body.is_empty());
     }
 
+    /// `WhenBusy` is the question tty7 always asked; `Always` adds one for an
+    /// idle shell without hiding what a busy one is doing; `Never` drops the
+    /// busy question — and none of them touches the SSH warning, which the
+    /// user turned on separately.
+    #[test]
+    fn each_confirm_mode_asks_what_it_says_and_the_ssh_warning_always_stands() {
+        use crate::core::config::ConfirmClose::{Always, Never, WhenBusy};
+        use crate::terminal::view::PaneBusy;
+        let build = || Some(PaneBusy::Command("cargo build".into()));
+
+        assert_eq!(close_reason(WhenBusy, false, None), None);
+        assert_eq!(
+            close_reason(WhenBusy, false, build()),
+            Some(CloseReason::Busy(PaneBusy::Command("cargo build".into())))
+        );
+        assert_eq!(close_reason(Always, false, None), Some(CloseReason::Idle));
+        assert_eq!(
+            close_reason(Always, false, build()),
+            Some(CloseReason::Busy(PaneBusy::Command("cargo build".into())))
+        );
+        assert_eq!(close_reason(Never, false, build()), None);
+        for mode in [Never, WhenBusy, Always] {
+            assert_eq!(
+                close_reason(mode, true, build()),
+                Some(CloseReason::LiveSsh),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_idle_and_bulk_questions_say_what_goes() {
+        crate::ui::i18n::set_locale("en");
+        let (tab_title, body) = close_prompt(true, &CloseReason::Idle);
+        assert!(tab_title.contains("tab"), "{tab_title}");
+        assert!(!body.is_empty());
+        let (pane_title, _) = close_prompt(false, &CloseReason::Idle);
+        assert!(pane_title.contains("pane"), "{pane_title}");
+
+        let (three, _) = close_prompt(true, &CloseReason::Tabs(3));
+        assert_eq!(three, "Close 3 tabs?");
+        let (one, _) = close_prompt(true, &CloseReason::Tabs(1));
+        assert_eq!(one, "Close 1 tab?");
+    }
+
+    /// The machine stops the panes it holds; a native SSH pane in a remote
+    /// window lives in this computer's daemon and is ended from here, because
+    /// nothing on the window's machine could.
+    #[test]
+    fn a_remote_windows_native_ssh_pane_is_ended_here_and_the_rest_by_its_machine() {
+        let local = crate::terminal::PaneRoute::Local;
+        let leaves = vec![(4, local.clone(), false), (5, local.clone(), true)];
+
+        let (held, here) = split_machine_held(true, &leaves);
+        let ids = |v: &[(u64, crate::terminal::PaneRoute)]| {
+            v.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&held), vec![4]);
+        assert_eq!(ids(&here), vec![5]);
+
+        let (held, here) = split_machine_held(false, &leaves);
+        assert_eq!(
+            ids(&held),
+            vec![4, 5],
+            "a local window's machine holds its SSH panes too"
+        );
+        assert!(here.is_empty());
+    }
+
     #[test]
     fn a_layout_that_came_back_short_says_how_short() {
         crate::ui::i18n::set_locale("en");
@@ -10503,6 +12089,46 @@ mod tests {
     }
 
     #[test]
+    fn moving_a_tab_one_slot_puts_it_where_the_neighbour_was() {
+        // A move, not a trade: the neighbour it crossed shifts one slot.
+        assert_eq!(one_slot_move(&[0, 1, 2], 3, 1, true), Some(vec![0, 2, 1]));
+        assert_eq!(one_slot_move(&[0, 1, 2], 3, 1, false), Some(vec![1, 0, 2]));
+    }
+
+    #[test]
+    fn a_tab_moved_past_an_end_carries_the_whole_run_with_it() {
+        // Through the wrap the tab lands at the far end and the run it
+        // crossed shifts one slot — `[c, a, b]`, not `[c, b, a]`.
+        assert_eq!(one_slot_move(&[0, 1, 2], 3, 2, true), Some(vec![2, 0, 1]));
+        assert_eq!(one_slot_move(&[0, 1, 2], 3, 0, false), Some(vec![1, 2, 0]));
+    }
+
+    #[test]
+    fn a_move_inside_a_sidebar_group_leaves_the_other_groups_alone() {
+        // Tabs 0, 2 and 4 are one group, 1 and 3 another: only the group's
+        // own slots are reassigned, and the wrap stays inside it.
+        assert_eq!(
+            one_slot_move(&[0, 2, 4], 5, 2, true),
+            Some(vec![0, 1, 4, 3, 2])
+        );
+        assert_eq!(
+            one_slot_move(&[0, 2, 4], 5, 0, false),
+            Some(vec![2, 1, 4, 3, 0])
+        );
+        assert_eq!(
+            one_slot_move(&[1, 3], 5, 3, true),
+            Some(vec![0, 3, 2, 1, 4])
+        );
+    }
+
+    #[test]
+    fn a_move_with_nothing_to_move_is_refused() {
+        assert_eq!(one_slot_move(&[], 0, 0, true), None);
+        assert_eq!(one_slot_move(&[0], 3, 0, true), None);
+        assert_eq!(one_slot_move(&[0, 1, 2], 3, 7, true), None);
+    }
+
+    #[test]
     fn restore_only_attaches_panes_the_workspace_owns_or_nobody_claims() {
         let ours = crate::core::session::WorkspaceId::new();
         let theirs = crate::core::session::WorkspaceId::new();
@@ -10576,6 +12202,63 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_host_opened_from_a_local_pane_does_not_start_in_its_local_directory() {
+        let local = Some(std::path::PathBuf::from("/Users/alice/dev/tty7"));
+        assert_eq!(
+            inherited_start_dir(OpenedFrom::FreshSshHost, local.clone(), false),
+            None
+        );
+        let remote = Some(std::path::PathBuf::from("/home/alice/my_service"));
+        assert_eq!(
+            inherited_start_dir(OpenedFrom::FreshSshHost, remote, true),
+            None,
+            "another host's directory means nothing on the one being dialled"
+        );
+    }
+
+    #[test]
+    fn redialling_the_same_ssh_host_starts_in_the_far_directory_it_was_in() {
+        let remote = Some(std::path::PathBuf::from("/home/alice/my_service"));
+        assert_eq!(
+            inherited_start_dir(OpenedFrom::SameSshHost, remote.clone(), true),
+            remote
+        );
+        assert_eq!(
+            inherited_start_dir(OpenedFrom::SameSshHost, None, true),
+            None
+        );
+    }
+
+    #[test]
+    fn a_local_shell_inherits_only_a_local_directory() {
+        let dir = Some(std::path::PathBuf::from("/work/repo"));
+        assert_eq!(
+            inherited_start_dir(OpenedFrom::LocalShell, dir.clone(), false),
+            dir
+        );
+        assert_eq!(
+            inherited_start_dir(OpenedFrom::LocalShell, dir, true),
+            None,
+            "a remote pane's directory is on the far host"
+        );
+    }
+
+    #[test]
+    fn a_native_ssh_pane_the_server_no_longer_has_is_dialled_again() {
+        let mut alive = std::collections::HashMap::new();
+        alive.insert(4u64, None);
+        assert!(native_ssh_pane_alive(Some(&alive), 4));
+        assert!(
+            !native_ssh_pane_alive(Some(&alive), 9),
+            "gone: dial, don't attach"
+        );
+        assert!(
+            !native_ssh_pane_alive(None, 4),
+            "no listing: dial, don't guess"
+        );
+    }
+
+    #[test]
     fn a_fork_needs_a_command_an_id_and_a_local_pane() {
         let session = |fork_label, session_id: Option<&str>, remote| TabAgentSession {
             fork_label,
@@ -10617,6 +12300,7 @@ mod tests {
                         agent: Some(CLIAgent::Claude),
                         agent_session_id: Some("sid-abc".to_string()),
                         agent_launch_argv: Some(vec!["claude".to_string()]),
+                        run_on_land: None,
                         owner: None,
                         font_size: 14.0,
                     },
@@ -11067,8 +12751,10 @@ mod ssh_rebuild_gpui_tests {
             let tab = TreeTab {
                 id: app.tabs[0].tree_id.get(),
                 name: None,
-                sidebar_group: None,
+                group: None,
+                last_auto: None,
                 root: PaneNode::Leaf { pane: 1 },
+                hibernated: false,
             };
             app.apply_layout_delta(
                 &LayoutDelta::TabRestructured { tab, pane: None },
@@ -11102,6 +12788,93 @@ mod ssh_rebuild_gpui_tests {
                 "the remote pane's existing view is reused, not re-attached"
             );
         });
+    }
+
+    /// Two tabs on pane 1 and pane 2, with the window's sync primed on them the
+    /// way a landed pull leaves it.
+    fn primed_two_tab_window(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<super::Tty7App>,
+        gpui::VisualTestContext,
+        Vec<crate::daemon::transport::Stream>,
+    ) {
+        let (app, mut vcx, first) = harness_with_pane(cx);
+        let second = app.update_in(&mut vcx, |app, window, cx| {
+            let (view, stream) = crate::terminal::view::quiet_test_pane(2, window, cx);
+            app.tabs
+                .push(super::Tab::new(Pane::leaf(PaneSlot::Ready(view))));
+            let tabs = app
+                .tabs
+                .iter()
+                .zip([1u64, 2])
+                .map(|(tab, pane)| TreeTab {
+                    id: tab.tree_id.get(),
+                    name: None,
+                    group: None,
+                    last_auto: None,
+                    root: PaneNode::Leaf { pane },
+                    hibernated: false,
+                })
+                .collect();
+            WorkspaceStore::install_for_test(
+                cx,
+                WindowViews {
+                    views: vec![WindowView {
+                        id: app.workspace,
+                        ..WindowView::default()
+                    }],
+                    active: None,
+                },
+            );
+            crate::ui::tree_sync::prime_for_test(cx, app.workspace, tabs);
+            stream
+        });
+        (app, vcx, vec![first, second])
+    }
+
+    fn queued_closes(
+        app: &super::Tty7App,
+        cx: &mut gpui::App,
+    ) -> Vec<tty7_core::core::machine::TabId> {
+        use tty7_core::daemon::control::ControlRequest;
+        crate::ui::tree_sync::queued_for_test(cx, app.workspace)
+            .into_iter()
+            .filter_map(|op| match op {
+                ControlRequest::TabClose { tab, .. }
+                | ControlRequest::TabCloseRemembered { tab, .. } => Some(tab),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Restart Server empties the window and waits out the handoff, and every
+    /// delta that lands meanwhile syncs the emptied window. A window missing
+    /// its tabs is not a user closing them.
+    #[gpui::test]
+    fn emptying_the_window_closes_nothing_on_the_machine(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = primed_two_tab_window(cx);
+        let closes = app.update_in(&mut vcx, |app, _, cx| {
+            app.tabs.clear();
+            app.save_session(cx);
+            queued_closes(app, cx)
+        });
+        assert!(
+            closes.is_empty(),
+            "this is the regression: Restart Server closed all sixteen tabs of a workspace, \
+             unremembered, and left their shells running with no tab to hold them"
+        );
+    }
+
+    #[gpui::test]
+    fn closing_a_tab_closes_it_and_only_it_on_the_machine(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = primed_two_tab_window(cx);
+        let (closed, closes) = app.update_in(&mut vcx, |app, window, cx| {
+            let closed = app.tabs[1].tree_id.get();
+            app.close_tab_inner(1, true, window, cx);
+            (closed, queued_closes(app, cx))
+        });
+        assert_eq!(closes, vec![closed]);
     }
 
     #[gpui::test]
@@ -11184,16 +12957,46 @@ mod keybinding_gpui_tests {
         }
     }
 
+    /// Waits for the row to ask about a chord another action has, checks who
+    /// it names, and answers Replace.
+    fn replace_conflict(app: &Entity<Tty7App>, vcx: &mut VisualTestContext, owner: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            vcx.background_executor.run_until_parked();
+            let other = app.update_in(vcx, |app, _, _| {
+                app.active_settings()
+                    .and_then(|s| s.kb_conflict.as_ref().map(|c| c.other.clone()))
+            });
+            if let Some(other) = other {
+                assert_eq!(
+                    other, owner,
+                    "the conflict names the action that has the chord"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recording a taken chord never asked about it"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        app.update_in(vcx, |app, _, cx| app.resolve_keybinding_conflict(true, cx));
+    }
+
     #[gpui::test]
     fn recording_a_shortcut_writes_the_override_and_ends_capture(cx: &mut TestAppContext) {
         let (app, mut vcx) = harness(cx);
         begin_capture(&app, &mut vcx, "NewTab");
-        vcx.simulate_keystrokes("secondary-shift-n");
+        vcx.simulate_keystrokes("secondary-shift-f9");
         // A list, because recording a shortcut on the Settings page *sets* it:
         // the row showed one chord and now shows another. A bare string in
         // config adds a chord beside the default (#868), which is not what
         // the person at the row just did.
-        wait_for_binding(&mut vcx, "NewTab", serde_json::json!(["secondary-shift-n"]));
+        wait_for_binding(
+            &mut vcx,
+            "NewTab",
+            serde_json::json!(["secondary-shift-f9"]),
+        );
 
         let recording = app.update_in(&mut vcx, |app, _, _| {
             app.active_settings().map(|s| s.recording.is_some())
@@ -11230,6 +13033,7 @@ mod keybinding_gpui_tests {
         });
         begin_capture(&app, &mut vcx, "NewTab");
         vcx.simulate_keystrokes("secondary-alt-n");
+        replace_conflict(&app, &mut vcx, "NextTab");
         wait_for_binding(&mut vcx, "NewTab", serde_json::json!(["secondary-alt-n"]));
         // Emptying the other action was right when an action had one chord.
         // With two, it would take Ctrl+Tab away as well, for a keystroke that
@@ -11242,17 +13046,10 @@ mod keybinding_gpui_tests {
         let (app, mut vcx) = harness(cx);
         begin_capture(&app, &mut vcx, "NewTab");
         vcx.simulate_keystrokes("alt-enter");
+        // The row names the action that would lose the chord before it does.
+        replace_conflict(&app, &mut vcx, "InsertNewline");
         wait_for_binding(&mut vcx, "NewTab", serde_json::json!(["alt-enter"]));
         wait_for_binding(&mut vcx, "InsertNewline", serde_json::json!([]));
-
-        let note = app.update_in(&mut vcx, |app, _, _| {
-            app.active_settings().and_then(|s| s.rebinding_note.clone())
-        });
-        assert!(
-            note.as_deref()
-                .is_some_and(|n| n.contains("Insert Newline")),
-            "the takeover note must name the action that lost the chord (got {note:?})"
-        );
     }
 
     /// #901, the half that happens in the UI: Alt+1…9 belongs to vim, and the
@@ -11873,6 +13670,7 @@ mod managed_forward_gpui_tests {
             target_port: 80,
             description: None,
             status: ForwardStatus::Listening,
+            enabled: true,
         }
     }
 
@@ -12117,6 +13915,140 @@ mod new_window_action_tests {
 }
 
 #[cfg(test)]
+mod unfocused_shortcut_tests {
+    use crate::core::config::Config;
+    use crate::core::session::Session;
+    use crate::ui::app::Tty7App;
+    use crate::ui::windows::WindowRegistry;
+    use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+
+    fn open(cx: &mut TestAppContext) -> (Entity<Tty7App>, VisualTestContext) {
+        crate::core::config::pin_test_config_dir();
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            cx.set_global(Config::default());
+            crate::ui::keymap::init(cx);
+            WindowRegistry::init(cx);
+        });
+        let window = cx.add_window(|window, cx| {
+            let app =
+                cx.new(|cx| Tty7App::with_session(None, Some(Session::default()), window, cx));
+            gpui_component::Root::new(app, window, cx)
+        });
+        let app = window
+            .update(cx, |root, _, _| {
+                root.view().clone().downcast::<Tty7App>().ok().unwrap()
+            })
+            .unwrap();
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        (app, vcx)
+    }
+
+    /// Focus on a handle no element tracks — a panel that closed under it, a
+    /// field that went away — leaves gpui dispatching keys on the window root
+    /// alone, and `Tty7App`'s listeners sit one level below that. The
+    /// shortcuts have to answer anyway.
+    fn answers_with_focus_off_the_tree(
+        action: &str,
+        opened: fn(&Tty7App) -> bool,
+        blur: bool,
+        cx: &mut TestAppContext,
+    ) {
+        let (app, mut vcx) = open(cx);
+        let key = vcx
+            .update(|_, cx| crate::ui::keymap::effective_key(action, cx))
+            .unwrap();
+        vcx.update(|window, cx| {
+            if blur {
+                window.blur();
+            } else {
+                let orphan = cx.focus_handle();
+                window.focus(&orphan, cx);
+                std::mem::forget(orphan);
+            }
+            window.refresh();
+        });
+        vcx.run_until_parked();
+        assert!(!app.read_with(&vcx, |app, _| opened(app)));
+        vcx.simulate_keystrokes(&key);
+        vcx.run_until_parked();
+        assert!(
+            app.read_with(&vcx, |app, _| opened(app)),
+            "{action} ({key}) did nothing with focus off Tty7App's tree (blur: {blur})"
+        );
+    }
+
+    #[gpui::test]
+    fn palette_with_app_focus(cx: &mut TestAppContext) {
+        let (app, mut vcx) = open(cx);
+        let key = vcx
+            .update(|_, cx| crate::ui::keymap::effective_key("TogglePalette", cx))
+            .unwrap();
+        app.update_in(&mut vcx, |app, window, cx| app.focus_active(window, cx));
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes(&key);
+        vcx.run_until_parked();
+        assert!(app.read_with(&vcx, |app, _| app.search.is_some()));
+    }
+
+    #[gpui::test]
+    fn palette_after_blur(cx: &mut TestAppContext) {
+        answers_with_focus_off_the_tree("TogglePalette", |a| a.search.is_some(), true, cx);
+    }
+
+    #[gpui::test]
+    fn palette_with_orphan_focus(cx: &mut TestAppContext) {
+        answers_with_focus_off_the_tree("TogglePalette", |a| a.search.is_some(), false, cx);
+    }
+
+    #[gpui::test]
+    fn switcher_with_orphan_focus(cx: &mut TestAppContext) {
+        answers_with_focus_off_the_tree("ToggleSwitcher", |a| a.switcher.is_some(), false, cx);
+    }
+
+    #[gpui::test]
+    fn settings_with_orphan_focus(cx: &mut TestAppContext) {
+        answers_with_focus_off_the_tree("OpenSettings", |a| a.settings.is_some(), false, cx);
+    }
+
+    /// With settings up in a window of its own, the workspace window's focus
+    /// comes back to its own panes — the page's handle is drawn elsewhere.
+    #[gpui::test]
+    fn settings_in_its_own_window_leaves_the_workspace_its_focus(cx: &mut TestAppContext) {
+        let (app, mut vcx) = open(cx);
+        let elsewhere = cx.add_window(|_, _| gpui::EmptyView);
+        app.update_in(&mut vcx, |app, window, cx| {
+            // Tests build the page in place; point it at the other window, as
+            // a real ⌘, does.
+            app.toggle_settings(window, cx);
+            app.settings_window = Some((elsewhere.into(), window.window_handle()));
+            let orphan = cx.focus_handle();
+            window.focus(&orphan, cx);
+            std::mem::forget(orphan);
+            window.refresh();
+        });
+        vcx.run_until_parked();
+        app.update_in(&mut vcx, |app, window, cx| {
+            let expected = match app.tabs.get(app.active) {
+                Some(tab) => tab.focus_target().unwrap().focus_handle(cx),
+                None => app.home_focus.clone(),
+            };
+            assert!(
+                !app.settings
+                    .as_ref()
+                    .unwrap()
+                    .focus_handle
+                    .is_focused(window),
+                "the workspace window must not park focus on a page it does not draw"
+            );
+            assert!(expected.is_focused(window));
+        });
+    }
+}
+
+#[cfg(test)]
 mod close_window_action_tests {
     use crate::core::actions::CloseWindow;
     use crate::core::config::Config;
@@ -12232,6 +14164,7 @@ mod tab_focus_memory_tests {
                     agent: None,
                     agent_session_id: None,
                     agent_launch_argv: None,
+                    run_on_land: None,
                     owner: None,
                     font_size: 14.,
                 },
@@ -12579,4 +14512,145 @@ mod tab_focus_memory_tests {
             assert!(right.read(cx).focus_handle.is_focused(window));
         });
     }
+}
+
+#[cfg(test)]
+mod hibernate_gpui_tests {
+    use gpui::TestAppContext;
+
+    use crate::core::session::SessionPane;
+    use crate::ui::app::test_window::harness_with_tabs;
+    use crate::ui::pane::Pane;
+
+    fn leaf_pane_id(pane: &SessionPane) -> Option<u64> {
+        match pane {
+            SessionPane::Leaf { pane_id, .. } => *pane_id,
+            SessionPane::Split { .. } => None,
+        }
+    }
+
+    /// Asleep, a tab holds nothing running and still holds its place: the
+    /// pane id the wake restores from, the name it had on screen, and a seat in
+    /// the sync that tells the machine it is asleep rather than gone.
+    #[gpui::test]
+    fn a_sleeping_tab_keeps_its_place_its_pane_and_its_name(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 2);
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            let pane_id = app.tabs[1]
+                .pane
+                .first_leaf()
+                .and_then(|slot| slot.terminal().cloned())
+                .expect("tab 1 has a pane")
+                .read(cx)
+                .pane_id;
+            let (before, _) = app.tabs[1].label_view(Some(window), cx);
+
+            app.put_to_sleep(1, window, cx);
+
+            assert_eq!(app.tabs.len(), 2, "sleeping is not closing");
+            let tab = &app.tabs[1];
+            assert!(tab.is_asleep());
+            assert!(matches!(tab.pane, Pane::Empty));
+            assert!(tab.pane.terminals().is_empty(), "nothing is left running");
+            assert_eq!(tab.asleep_layout().and_then(leaf_pane_id), Some(pane_id));
+            let (after, _) = tab.label_view(Some(window), cx);
+            assert_eq!(
+                format!("{:?}", after.label()),
+                format!("{:?}", before.label()),
+                "it is called what it was called while awake"
+            );
+            assert!(!after.live);
+
+            let (desired, _, held) = crate::ui::tree_sync::desired_tabs(app, cx);
+            assert!(held.is_empty(), "a sleeping tab is not a tab gone missing");
+            assert_eq!(desired.len(), 2);
+            assert!(!desired[0].hibernated);
+            assert!(desired[1].hibernated);
+            match &desired[1].root {
+                crate::ui::tree_sync::DesiredNode::Leaf { pane, .. } => assert_eq!(*pane, pane_id),
+                other => panic!("expected the one leaf, got {other:?}"),
+            }
+        });
+    }
+
+    /// Looking at a tab is what wakes it, so the window has to keep one awake
+    /// to look at; the tab shown in a sleeping one's place is the awake tab
+    /// used last.
+    #[gpui::test]
+    fn the_last_awake_tab_has_nothing_to_hand_the_window_to(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 3);
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.tabs[1].last_used.set(5);
+            app.tabs[2].last_used.set(9);
+            assert_eq!(app.awake_tab_besides(0), Some(2), "the one used last");
+
+            app.put_to_sleep(2, window, cx);
+            assert_eq!(app.awake_tab_besides(0), Some(1));
+
+            app.put_to_sleep(1, window, cx);
+            assert_eq!(app.awake_tab_besides(0), None);
+            assert!(
+                !app.can_hibernate_tab(0, cx),
+                "the last awake tab stays awake"
+            );
+            assert!(
+                !app.can_hibernate_tab(1, cx),
+                "nor is a sleeping tab put to sleep twice"
+            );
+        });
+    }
+
+    /// Closing a sleeping tab closes it like any other, and what Reopen Closed
+    /// Tab gets back is the layout it slept with — not the empty stand-in.
+    #[gpui::test]
+    fn a_sleeping_tab_closes_into_what_it_would_have_woken_as(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 2);
+
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.put_to_sleep(1, window, cx);
+            let layout_id = app.tabs[1].asleep_layout().and_then(leaf_pane_id);
+            assert!(layout_id.is_some());
+
+            app.close_tab(1, window, cx);
+
+            assert_eq!(app.tabs.len(), 1);
+            let closed = app.closed.last().expect("the closed tab is remembered");
+            assert_eq!(leaf_pane_id(&closed.pane), layout_id);
+            assert!(!closed.hibernated, "reopening brings it back awake");
+        });
+    }
+}
+
+/// What each host's last session scan found: what the Sessions tab shows
+/// while the next scan runs, so it does not open empty.
+static LAST_SESSIONS: std::sync::LazyLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            crate::ui::host_ops::HostId,
+            Vec<crate::core::agent_history::PastSession>,
+        >,
+    >,
+> = std::sync::LazyLock::new(Default::default);
+
+fn last_sessions(
+    host: crate::ui::host_ops::HostId,
+) -> Vec<crate::core::agent_history::PastSession> {
+    LAST_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&host)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn remember_sessions(
+    host: crate::ui::host_ops::HostId,
+    found: Vec<crate::core::agent_history::PastSession>,
+) {
+    LAST_SESSIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(host, found);
 }

@@ -60,6 +60,12 @@ pub struct Neutrals {
     pub selection: u32,
     pub sidebar: u32,
     pub sidebar_fg: u32,
+    /// The left rail's own fill: a small step off the window toward the
+    /// foreground, so the tab column reads as navigation beside the work.
+    /// The right panel keeps `sidebar` (the window fill).
+    pub rail: u32,
+    /// The tab title ink on `rail`, floored the way `sidebar_fg` is.
+    pub rail_fg: u32,
     pub accent: u32,
 }
 
@@ -97,6 +103,12 @@ pub mod state {
     pub const SELECTED: f32 = 1.30;
     pub const PRESSED: f32 = 1.55;
     pub const CURSOR: f32 = 1.70;
+    /// The side panels' own, lighter rungs (see `Theme::panel_surface`).
+    /// A panel lists many rows at once, and at the window's 1.30 the current
+    /// one read as a dark slab; these land on #ededec / #e8e8e7 on the
+    /// default light rail (#f5f5f4).
+    pub const PANEL_HOVER: f32 = 1.07;
+    pub const PANEL_SELECTED: f32 = 1.12;
     pub const TEXT_RESTING: f32 = 4.6;
     pub const TEXT_STEP: f32 = 1.4;
 }
@@ -125,6 +137,8 @@ pub struct Scrim {
 pub struct Surfaces {
     pub window: Surface,
     pub sidebar: Surface,
+    /// The left tab rail's ladder, built on `Neutrals::rail`.
+    pub rail: Surface,
     pub popover: Surface,
     pub scrim: Scrim,
 }
@@ -172,6 +186,10 @@ impl Theme {
         // told apart from the pane area by a hairline alone. A tinted rail
         // made the workspace read as three boxes set side by side.
         let sidebar = bg;
+        // The left rail is the one tinted surface: 3% toward the ink, which
+        // lands on #f5f5f3 / #1e1e20 for the default pair. Everything painted
+        // on it is floored against it below, the same as the other fills.
+        let rail = mix(bg, fg, RAIL_TINT);
         // Light overlays sit above the grey rail; dark overlays lift toward
         // the foreground. A light menu must not be darker than its backdrop.
         let popover = if self.dark { mix(bg, fg, 0.06) } else { bg };
@@ -191,7 +209,7 @@ impl Theme {
         // Both are floored on all three neutral fills, not only on the window:
         // the same value has to be worth something wherever it is painted.
         let hairline = |seed: f32, floor: f32| {
-            [bg, sidebar, popover]
+            [bg, sidebar, rail, popover]
                 .into_iter()
                 .fold(mix(bg, fg, seed), |ink, surface| {
                     at_least(ink, fg, surface, floor)
@@ -201,12 +219,34 @@ impl Theme {
         let divider = hairline(0.16, DIVIDER_FLOOR);
         // This shared caption role is painted on all three opaque surfaces.
         // Calibrating only against the window loses contrast on raised fills.
-        let muted_foreground = [bg, sidebar, popover]
+        let muted_foreground = [bg, sidebar, rail, popover]
             .into_iter()
             .fold(dim(fg, bg, state::TEXT_RESTING), |ink, surface| {
                 legible_ink(surface, ink, TEXT_FLOOR)
             });
         let title_floor = TITLE_FLOOR.max(contrast(muted_foreground, sidebar) * state::TEXT_STEP);
+        let rail_title_floor = TITLE_FLOOR.max(contrast(muted_foreground, rail) * state::TEXT_STEP);
+        // Blended, not bisected, so a palette's own softness carries into the
+        // rails — but floored on the fill it is actually painted on. This is
+        // the tab title, the top rung of a three-rung column (title / branch /
+        // group header), and it is floored at `TITLE_FLOOR` rather than
+        // `TEXT_FLOOR` because the rung under it, `muted_foreground`, already
+        // sits at `TEXT_RESTING`: a title at 4.5:1 next to a caption at 4.6:1
+        // is the same grey twice, and the column reads as one flat wash with
+        // nothing to look at first.
+        let title_ink = |surface: u32, floor: f32| {
+            let title = legible_ink(surface, mix(fg, bg, 0.10), floor);
+            // …and capped so the selected label keeps its `TEXT_STEP` above
+            // it: on a white-on-black palette a 10% blend lands so close to
+            // `fg` that there is nothing brighter left to step to. The floor
+            // wins over the cap on a soft palette, where the step is taken
+            // past `fg` instead (see `stepped_ink`).
+            let headroom = (contrast(fg, surface) / state::TEXT_STEP).max(floor);
+            match headroom > floor && contrast(title, surface) > headroom {
+                true => dim(title, surface, headroom),
+                false => title,
+            }
+        };
         Neutrals {
             background: bg,
             foreground: fg,
@@ -228,19 +268,9 @@ impl Theme {
             // `TEXT_RESTING`: a title at 4.5:1 next to a caption at 4.6:1 is
             // the same grey twice, and the column reads as one flat wash with
             // nothing to look at first.
-            sidebar_fg: {
-                let title = legible_ink(sidebar, mix(fg, bg, 0.10), title_floor);
-                // …and capped so the selected label keeps its `TEXT_STEP`
-                // above it: on a white-on-black palette a 10% blend lands so
-                // close to `fg` that there is nothing brighter left to step
-                // to. The floor wins over the cap on a soft palette, where
-                // the step is taken past `fg` instead (see `stepped_ink`).
-                let headroom = (contrast(fg, sidebar) / state::TEXT_STEP).max(title_floor);
-                match headroom > title_floor && contrast(title, sidebar) > headroom {
-                    true => dim(title, sidebar, headroom),
-                    false => title,
-                }
-            },
+            sidebar_fg: title_ink(sidebar, title_floor),
+            rail,
+            rail_fg: title_ink(rail, rail_title_floor),
             accent: legible_accent(bg, self.accent),
         }
     }
@@ -258,6 +288,24 @@ impl Theme {
             cursor: raise(base, fg, state::CURSOR),
             text_resting,
             text_selected: stepped_ink(selected, base, fg, text_resting),
+        }
+    }
+
+    /// A side panel's surface — the tab rail on the left, the docked panel on
+    /// the right. Both list many rows at once, so they step on the lighter
+    /// `PANEL_*` rungs, and toward the panel's own shade rather than `fg`: a
+    /// cool foreground (the default light's #1c1c1e) bleaches a warm panel's
+    /// tint out of a rung this faint, and the row reads as a grey patch on
+    /// cream.
+    fn panel_surface(&self, base: u32, text_resting: u32, fg: u32) -> Surface {
+        let shade = shade_of(base, fg);
+        let selected = raise(base, shade, state::PANEL_SELECTED);
+        Surface {
+            hover: raise(base, shade, state::PANEL_HOVER),
+            selected,
+            text_resting,
+            text_selected: stepped_ink(selected, base, fg, text_resting),
+            ..self.surface(base)
         }
     }
 
@@ -302,7 +350,7 @@ impl Theme {
     /// darkest one.
     fn clear_ink(&self, seed: u32, floor: f32) -> u32 {
         let m = self.neutrals();
-        [m.background, m.sidebar, m.popover]
+        [m.background, m.sidebar, m.rail, m.popover]
             .into_iter()
             .fold(seed, |ink, surface| legible_ink(surface, ink, floor))
     }
@@ -328,10 +376,12 @@ impl Theme {
                 on_fill: ink_on(fill, fg, TEXT_FLOOR),
             }
         };
+        // Green and amber are the v4 Git inks (added / modified); the floors
+        // in `build` still walk them to legibility on every surface.
         let (red, green, amber) = if self.dark {
-            (0xf07878, 0x78bd95, 0xd6b55a)
+            (0xf07878, 0x4cc27a, 0xe0a345)
         } else {
-            (0xc43c43, 0x28794b, 0x92651c)
+            (0xc43c43, 0x2f8a52, 0xb7791f)
         };
         Semantics {
             danger: build(red),
@@ -377,24 +427,25 @@ impl Theme {
     pub fn surfaces(&self) -> Surfaces {
         let m = self.neutrals();
         let fg = legible_foreground(self.background_color(), self.foreground);
-        // The rail climbs the window's ladder. It used to take a rung above
-        // (1.50) because a regular-weight current tab measured as the faintest
-        // mark in its column; the current title is SEMIBOLD now and carries
-        // that on its own, and at 1.50 on a white rail the row read as a
-        // pressed button rather than as a place.
-        let mut sidebar = self.surface(m.sidebar);
-        sidebar.text_resting = m.sidebar_fg;
-        sidebar.text_selected =
-            stepped_ink(sidebar.selected, sidebar.base, fg, sidebar.text_resting);
+        // The panels once climbed a rung *above* the window (1.50), when a
+        // regular-weight current tab was the faintest mark in its column. The
+        // current title is SEMIBOLD now and carries that on its own; a heavy
+        // fill on top of it read as a pressed button rather than as a place.
+        let sidebar = self.panel_surface(m.sidebar, m.sidebar_fg, fg);
+        let rail = self.panel_surface(m.rail, m.rail_fg, fg);
         Surfaces {
             window: self.surface(m.background),
             sidebar,
+            rail,
             popover: self.surface(m.popover),
+            // The v5 scrim: a dim, not a blackout. Dark lands on near-black at
+            // 45%; light on a warm near-black at 14%, just enough to say the
+            // window is waiting without turning the page grey.
             scrim: Scrim {
-                ink: mix(m.background, 0x000000, 0.82),
+                ink: mix(m.background, 0x000000, 0.92),
                 alpha: match self.dark {
-                    true => 0.55,
-                    false => 0.30,
+                    true => 0.45,
+                    false => 0.14,
                 },
             },
         }
@@ -472,6 +523,18 @@ fn bisect_contrast(from: u32, toward: u32, against: u32, target: f32) -> u32 {
 
 fn raise(base: u32, toward: u32, target: f32) -> u32 {
     bisect_contrast(base, toward, base, target)
+}
+
+/// The darkest (or, on a dark surface, lightest) colour that keeps every
+/// channel of `base` the same distance apart, so blending toward it only
+/// changes lightness: #f5f5f3 steps to #e8e8e6, never to #e8e8e8.
+fn shade_of(base: u32, fg: u32) -> u32 {
+    let ch = [base >> 16 & 0xff, base >> 8 & 0xff, base & 0xff];
+    let shift = match relative_luminance(fg) < relative_luminance(base) {
+        true => ch.map(|c| c - ch.iter().min().unwrap()),
+        false => ch.map(|c| c + (0xff - ch.iter().max().unwrap())),
+    };
+    (shift[0] << 16) | (shift[1] << 8) | shift[2]
 }
 
 fn dim(ink: u32, surface: u32, target: f32) -> u32 {
@@ -611,7 +674,7 @@ pub(crate) fn legible_dim(ink: u32, bg: u32, opacity: f32) -> Option<u32> {
     Some(bisect_contrast(faded, ink, bg, floor))
 }
 
-fn is_dark(bg: u32) -> bool {
+pub(crate) fn is_dark(bg: u32) -> bool {
     relative_luminance(bg) < 0.5
 }
 
@@ -681,6 +744,9 @@ pub(crate) fn wash(surface: u32, tint: u32, target: f32) -> u32 {
 }
 
 const TEXT_FLOOR: f32 = 4.5;
+
+/// How far the left rail's fill steps off the window toward the ink.
+const RAIL_TINT: f32 = 0.03;
 
 /// The floor for the top rung of a text column whose second rung rests at
 /// `TEXT_RESTING`. WCAG AAA's 7:1, which also happens to be the smallest
@@ -1122,7 +1188,11 @@ fn load_iterm_theme(path: &std::path::Path) -> Result<Theme, String> {
     let color = |key: &str| -> Option<u32> {
         let c = dict.get(key)?.as_dictionary()?;
         let comp = |k: &str| -> Option<u32> {
-            let f = c.get(k)?.as_real()?;
+            // iTerm2 and plistlib write exact 0 and 1 as `<integer>`.
+            let v = c.get(k)?;
+            let f = v
+                .as_real()
+                .or_else(|| v.as_signed_integer().map(|i| i as f64))?;
             Some((f.clamp(0.0, 1.0) * 255.0).round() as u32)
         };
         Some(
@@ -1200,8 +1270,8 @@ static BUILTINS: [BuiltinSpec; 13] = [
     BuiltinSpec {
         id: "light",
         name: "Light",
-        background: 0xffffff,
-        foreground: 0x0f1419,
+        background: 0xfcfcfb,
+        foreground: 0x1c1c1e,
         accent: 0x1f6bf0,
         caret: None,
         ansi16: [
@@ -1304,8 +1374,8 @@ static BUILTINS: [BuiltinSpec; 13] = [
     BuiltinSpec {
         id: "dark",
         name: "Dark",
-        background: 0x191b20,
-        foreground: 0xe2e5eb,
+        background: 0x18181a,
+        foreground: 0xececed,
         accent: 0x78a8f5,
         caret: None,
         ansi16: [
@@ -1714,11 +1784,9 @@ mod tests {
     fn state_ladder_is_separable_on_every_surface() {
         for t in builtins() {
             let s = t.surfaces();
-            for (name, sf) in [
-                ("window", s.window),
-                ("sidebar", s.sidebar),
-                ("popover", s.popover),
-            ] {
+            // The side panels run their own lighter rungs;
+            // `panel_state_ladder_…` holds those apart instead.
+            for (name, sf) in [("window", s.window), ("popover", s.popover)] {
                 let sel_base = contrast(sf.selected, sf.base);
                 let sel_hover = contrast(sf.selected, sf.hover);
                 let hover_base = contrast(sf.hover, sf.base);
@@ -1741,6 +1809,32 @@ mod tests {
                 assert!(
                     hover_base >= 1.1,
                     "{}/{name}: hover is only {hover_base:.2}:1 from the surface",
+                    t.id
+                );
+                assert!(
+                    contrast(sf.pressed, sf.base) > sel_base,
+                    "{}/{name}: pressed must read past selected",
+                    t.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn panel_state_ladder_is_separable_in_every_theme() {
+        for t in builtins() {
+            let s = t.surfaces();
+            for (name, sf) in [("sidebar", s.sidebar), ("rail", s.rail)] {
+                let hover_base = contrast(sf.hover, sf.base);
+                let sel_base = contrast(sf.selected, sf.base);
+                assert!(
+                    hover_base >= state::PANEL_HOVER - 0.02,
+                    "{}/{name}: hover is only {hover_base:.2}:1 from the surface",
+                    t.id
+                );
+                assert!(
+                    sel_base >= state::PANEL_SELECTED - 0.02 && sel_base > hover_base,
+                    "{}/{name}: selected is only {sel_base:.2}:1 from the surface",
                     t.id
                 );
                 assert!(
@@ -2112,7 +2206,7 @@ mod tests {
     fn captions_are_readable_on_every_surface_they_are_used_on() {
         for theme in builtins() {
             let m = theme.neutrals();
-            for surface in [m.background, m.sidebar, m.popover] {
+            for surface in [m.background, m.sidebar, m.rail, m.popover] {
                 assert!(
                     contrast(m.muted_foreground, surface) >= TEXT_FLOOR,
                     "{}: caption {:#08x} on {surface:#08x}",
@@ -2182,7 +2276,34 @@ mod tests {
                 m.sidebar_fg,
                 m.sidebar
             );
+            let ratio = contrast(m.rail_fg, m.rail);
+            assert!(
+                ratio >= TITLE_FLOOR - 0.01,
+                "{}: rail text {:#08x} is only {ratio:.2}:1 on the rail fill {:#08x}",
+                t.id,
+                m.rail_fg,
+                m.rail
+            );
         }
+    }
+
+    #[test]
+    fn the_rail_is_tinted_and_the_right_panel_is_not() {
+        for t in builtins() {
+            let m = t.neutrals();
+            assert_eq!(m.sidebar, m.background, "{}: right panel fill", t.id);
+            assert_ne!(m.rail, m.background, "{}: rail fill", t.id);
+            let s = t.surfaces().rail;
+            assert!(
+                contrast(s.selected, s.text_selected) >= TEXT_FLOOR,
+                "{}: current rail row",
+                t.id
+            );
+        }
+        let light = builtins().into_iter().find(|t| t.id == "light").unwrap();
+        assert!(channel_distance(light.neutrals().rail, 0xf5f5f3) <= 1);
+        let dark = builtins().into_iter().find(|t| t.id == "dark").unwrap();
+        assert!(channel_distance(dark.neutrals().rail, 0x1e1e20) <= 1);
     }
 
     #[test]
@@ -2465,6 +2586,35 @@ ansi:
         let img = file.background_image.expect("image field lost");
         assert_eq!(img.path, "/pictures/koi.jpg");
         assert_eq!(img.opacity, 0.4);
+    }
+
+    #[test]
+    fn iterm_theme_accepts_integer_components_and_no_alpha() {
+        let entry = |key: String, r: &str| {
+            format!(
+                "<key>{key}</key><dict><key>Red Component</key>{r}\
+                 <key>Green Component</key><real>0.5</real>\
+                 <key>Blue Component</key><integer>0</integer></dict>"
+            )
+        };
+        let mut body: String = (0..16)
+            .map(|i| entry(format!("Ansi {i} Color"), "<integer>1</integer>"))
+            .collect();
+        body += &entry("Background Color".into(), "<integer>0</integer>");
+        body += &entry("Foreground Color".into(), "<real>1.0</real>");
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <plist version=\"1.0\"><dict>{body}</dict></plist>"
+        );
+        let path =
+            std::env::temp_dir().join(format!("tty7-int-{}.itermcolors", std::process::id()));
+        std::fs::write(&path, xml).unwrap();
+        let theme = load_iterm_theme(&path);
+        let _ = std::fs::remove_file(&path);
+        let theme = theme.unwrap();
+        assert_eq!(theme.ansi16[2], (0xff, 0x80, 0x00));
+        assert_eq!(theme.background_color(), 0x008000);
+        assert_eq!(theme.foreground, 0xff8000);
     }
 
     #[test]

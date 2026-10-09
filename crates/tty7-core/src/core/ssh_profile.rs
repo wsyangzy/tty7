@@ -153,6 +153,16 @@ pub struct ForwardRule {
     pub bind: HostPort,
     pub target: HostPort,
     pub description: String,
+    /// Whether the rule is opened with the connection. A switched-off rule
+    /// keeps its whole configuration and simply binds nothing, so one local
+    /// port can be pointed at different targets by switching rules rather
+    /// than retyping them.
+    ///
+    /// Missing from every profile saved before the switch existed, and those
+    /// rules were all live: the container's `#[serde(default)]` fills it from
+    /// `Default`, which says `true`, or upgrading would silently turn every
+    /// saved forward off.
+    pub enabled: bool,
 }
 
 impl Default for ForwardRule {
@@ -162,6 +172,7 @@ impl Default for ForwardRule {
             bind: HostPort::default(),
             target: HostPort::default(),
             description: String::new(),
+            enabled: true,
         }
     }
 }
@@ -250,6 +261,22 @@ fn parse_port(s: &str) -> Option<u16> {
 
 fn try_parse_port(s: &str) -> Option<u16> {
     s.parse::<u16>().ok().filter(|&p| p != 0)
+}
+
+/// The user a profile logs in as: its own, or — left blank, as the form's
+/// "resolved at connect" says — this machine's login name, the way `ssh`
+/// itself does. Sending the blank on was an empty user name the server
+/// refused, reported as every key being rejected.
+pub fn login_user(profile_user: &str) -> String {
+    if !profile_user.trim().is_empty() {
+        return profile_user.to_string();
+    }
+    ["USER", "LOGNAME", "USERNAME"]
+        .iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .map(|name| name.trim().to_string())
+        .find(|name| !name.is_empty())
+        .unwrap_or_default()
 }
 
 pub fn to_connect_string(profile: &SshProfile) -> String {
@@ -354,6 +381,14 @@ fn default_identity_candidates_in(home: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blank_user_logs_in_as_this_machines_user() {
+        assert_eq!(login_user("deploy"), "deploy");
+        let here = login_user("");
+        assert!(!here.is_empty(), "a blank user must resolve to someone");
+        assert_eq!(login_user("  "), here);
+    }
 
     #[test]
     fn profiles_saved_before_the_switch_existed_default_to_integrated() {
@@ -569,6 +604,7 @@ mod tests {
             bind: HostPort::new("127.0.0.1", 8080),
             target: HostPort::new("10.0.0.1", 80),
             description: "web".to_string(),
+            enabled: false,
         }];
         original.socks_proxy = Some(HostPort::new("proxy", 1080));
         original.algorithms.kex = vec!["curve25519-sha256".to_string()];
@@ -596,6 +632,25 @@ mod tests {
         );
         let m: AuthMode = serde_json::from_str("\"agent\"").unwrap();
         assert_eq!(m, AuthMode::Agent);
+    }
+
+    #[test]
+    fn a_forward_rule_saved_before_the_switch_existed_loads_enabled() {
+        let old = r#"{"name":"box","host":"h","forwards":[
+            {"kind":"local","bind":{"host":"127.0.0.1","port":8080},
+             "target":{"host":"srv","port":80},"description":"web"}
+        ]}"#;
+        let p: SshProfile = serde_json::from_str(old).unwrap();
+        assert_eq!(p.forwards.len(), 1);
+        assert!(p.forwards[0].enabled, "an old rule must stay live");
+        assert!(ForwardRule::default().enabled);
+
+        let mut off = p.forwards[0].clone();
+        off.enabled = false;
+        let back: ForwardRule =
+            serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.enabled, "a switched-off rule stays off across a save");
+        assert_eq!(back, off);
     }
 }
 

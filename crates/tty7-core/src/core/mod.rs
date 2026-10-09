@@ -1,3 +1,4 @@
+pub mod agent_history;
 pub mod agent_hooks;
 pub mod cli_agent;
 pub mod clipboard;
@@ -5,6 +6,7 @@ pub mod codename;
 pub mod config;
 pub mod crash;
 pub mod git;
+pub mod github;
 pub mod gitignore;
 pub mod group_key;
 #[allow(dead_code)]
@@ -13,9 +15,11 @@ pub mod kitty_graphics;
 pub mod logfile;
 pub mod machine;
 pub mod osc;
+pub mod paste;
 pub mod path_spelling;
 pub mod proc;
 pub mod session;
+pub mod shell_quote;
 pub mod shells;
 #[allow(dead_code)]
 pub mod ssh_profile;

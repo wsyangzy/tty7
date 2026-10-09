@@ -87,6 +87,26 @@ fn main() {
             "procs_says_where_the_panes_session_lives",
             procs_says_where_the_panes_session_lives,
         ),
+        (
+            "exec_returns_the_commands_output_and_exit_code",
+            exec_returns_the_commands_output_and_exit_code,
+        ),
+        (
+            "exec_refuses_a_pane_with_no_prompt_marks",
+            exec_refuses_a_pane_with_no_prompt_marks,
+        ),
+        (
+            "send_stdin_delivers_bytes_it_never_echoes",
+            send_stdin_delivers_bytes_it_never_echoes,
+        ),
+        (
+            "send_paste_asks_the_pane_for_its_bracketed_paste_mode",
+            send_paste_asks_the_pane_for_its_bracketed_paste_mode,
+        ),
+        (
+            "worktree_new_sets_up_the_checkout_and_rm_takes_it_down",
+            worktree_new_sets_up_the_checkout_and_rm_takes_it_down,
+        ),
     ];
 
     let mut failed = 0;
@@ -1051,4 +1071,307 @@ fn capture_tail_trims_a_real_panes_answer(daemon: &Daemon) {
         );
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// A pane running `program` with no shell in front of it — so no prompt marks
+/// and no line editor, just the pty's own echo. What the tests below type into
+/// it comes back exactly as the pane received it.
+fn bare_pane(daemon: &Daemon, program: &str) -> u64 {
+    let shell = ShellSpec {
+        program: program.into(),
+        args: Vec::new(),
+        args_are_tty7_defaults: false,
+    };
+    let session = PaneClient::at(daemon.pane_endpoint())
+        .spawn(
+            None,
+            WinSize {
+                cols: 80,
+                rows: 24,
+                cell_w: 8,
+                cell_h: 16,
+            },
+            Some(shell),
+            Some("bare-pane-e2e".into()),
+            None,
+        )
+        .unwrap_or_else(|e| panic!("spawn {program}: {e}"));
+    let pane = session.pane_id();
+    session.detach().expect("leave the bare pane running");
+    pane
+}
+
+/// Block until the pane's shell has drawn its first prompt: before that there
+/// are no marks for `exec` to follow, and it refuses rather than guesses.
+fn await_prompt(daemon: &Daemon, address: &str) {
+    let deadline = Instant::now() + SETTLE_WITHIN;
+    loop {
+        let procs = daemon.run_json(&["procs", address]);
+        if procs["context"]["at_prompt"].as_bool() == Some(true) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the shell never reported a prompt; last procs: {procs}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn exec_returns_the_commands_output_and_exit_code(daemon: &Daemon) {
+    // The marks come from tty7's integration for zsh/bash/fish/nushell/pwsh;
+    // the shell a Windows runner defaults to is not one this can count on.
+    if cfg!(windows) {
+        return;
+    }
+    let created = daemon.run_json(&["new", &workdir()]);
+    let pane = created["pane"].as_u64().expect("new prints the pane id");
+    let address = format!("%{pane}");
+    await_prompt(daemon, &address);
+
+    // `sh -c` so the exit code does not depend on which shell the pane runs.
+    let out = daemon.run(&[
+        "exec",
+        &address,
+        "--timeout",
+        "60",
+        "--",
+        "sh",
+        "-c",
+        "'echo tty7_e2e_exec_$((6*7)); exit 3'",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "exec exits with the command's code; stdout {stdout:?}, stderr {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("tty7_e2e_exec_42"), "{stdout:?}");
+    assert!(
+        !stdout.contains("6*7") && !stdout.contains("exit 3"),
+        "the typed line is not the command's output: {stdout:?}"
+    );
+
+    // The pane is back at its prompt, so it takes the next one straight away.
+    // `--json` ahead of `--`: after it, it would be an argument to `true`.
+    let out = daemon.run_ok(&["exec", &address, "--json", "--timeout", "60", "--", "true"]);
+    let json: serde_json::Value = serde_json::from_str(&out).expect("--json prints JSON");
+    assert_eq!(json["exit"], 0, "{json}");
+    assert_eq!(json["exit_code_known"], true, "{json}");
+    assert_eq!(json["pane"], pane, "{json}");
+    assert_eq!(
+        json["output"], "",
+        "a command that prints nothing has nothing to show — not the shell's \
+         prompt preparation: {json}"
+    );
+}
+
+fn exec_refuses_a_pane_with_no_prompt_marks(daemon: &Daemon) {
+    if cfg!(windows) {
+        return;
+    }
+    let pane = bare_pane(daemon, "/bin/cat");
+    let out = daemon.run(&["exec", &format!("%{pane}"), "--", "echo", "never"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("shell-integration"), "{stderr}");
+    // Refused before typing: nothing reached the pane.
+    let seen = daemon.run_ok(&["capture", &format!("%{pane}"), "--scrollback"]);
+    assert!(!seen.contains("never"), "{seen:?}");
+}
+
+fn send_via_stdin(daemon: &Daemon, args: &[&str], input: &[u8]) -> Output {
+    let mut child = daemon
+        .cli(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("could not run tty7 {args:?}: {e}"));
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(input)
+        .expect("feed tty7's stdin");
+    child.wait_with_output().expect("tty7 ran to completion")
+}
+
+fn await_capture(daemon: &Daemon, address: &str, marker: &str) -> String {
+    let deadline = Instant::now() + SETTLE_WITHIN;
+    loop {
+        let seen = daemon.run_ok(&["capture", address, "--scrollback"]);
+        if seen.contains(marker) {
+            return seen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{marker:?} never showed up; last capture:\n{seen}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn send_stdin_delivers_bytes_it_never_echoes(daemon: &Daemon) {
+    if cfg!(windows) {
+        return;
+    }
+    let pane = bare_pane(daemon, "/bin/cat");
+    let address = format!("%{pane}");
+    let out = send_via_stdin(
+        daemon,
+        &["send", &address, "--stdin", "--json"],
+        b"tty7_e2e_stdin_secret\n",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !stdout.contains("tty7_e2e_stdin_secret"),
+        "the payload must not come back in the report: {stdout}"
+    );
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("--json prints JSON");
+    assert_eq!(json["source"], "stdin", "{json}");
+    assert_eq!(json["bytes"], 22, "{json}");
+    await_capture(daemon, &address, "tty7_e2e_stdin_secret");
+}
+
+fn send_paste_asks_the_pane_for_its_bracketed_paste_mode(daemon: &Daemon) {
+    if cfg!(windows) {
+        return;
+    }
+    let pane = bare_pane(daemon, "/bin/cat");
+    let address = format!("%{pane}");
+
+    // Off to begin with: nothing in the pane has asked for it.
+    let json = daemon.run_json(&["send", &address, "tty7_e2e_one\ntty7_e2e_two", "--paste"]);
+    assert_eq!(json["bracketed_paste_mode"], false, "{json}");
+    assert_eq!(json["bracketed"], false, "{json}");
+    await_capture(daemon, &address, "tty7_e2e_two");
+
+    // `cat` hands back what it reads, so the program in the pane is now the
+    // one that switched mode 2004 on — the daemon sees it in the output.
+    let out = send_via_stdin(daemon, &["send", &address, "--stdin"], b"\x1b[?2004h\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let deadline = Instant::now() + SETTLE_WITHIN;
+    loop {
+        let procs = daemon.run_json(&["procs", &address]);
+        if procs["context"]["bracketed_paste"].as_bool() == Some(true) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pane never reported bracketed paste on: {procs}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let json = daemon.run_json(&["send", &address, "tty7_e2e_framed", "--paste"]);
+    assert_eq!(json["bracketed"], true, "{json}");
+    // The frame reached the pty: cat's echo of it carries the opener's tail.
+    let seen = await_capture(daemon, &address, "tty7_e2e_framed");
+    assert!(seen.contains("[200~"), "{seen:?}");
+}
+
+/// `worktree new` end to end against a real server: the checkout, its
+/// `.worktreeinclude` copy, the tab, and `.tty7/setup` actually running in
+/// that tab with its variables; then `ls` sees the pane in it, and `rm` will
+/// not take the checkout from under the pane unless told to.
+fn worktree_new_sets_up_the_checkout_and_rm_takes_it_down(daemon: &Daemon) {
+    // The setup script is a POSIX executable; Windows has no `env` to run it.
+    if cfg!(windows) {
+        return;
+    }
+    let repo_dir = tempfile::tempdir().expect("temp repo");
+    let repo = repo_dir.path();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::write(repo.join(".gitignore"), ".env\nsetup-ran\n").unwrap();
+    std::fs::write(repo.join(".worktreeinclude"), ".env\n").unwrap();
+    std::fs::create_dir(repo.join(".tty7")).unwrap();
+    let script = repo.join(".tty7/setup");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho \"$TTY7_PORT $TTY7_WORKTREE_NAME\" > setup-ran\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    std::fs::write(repo.join(".env"), "SECRET=1\n").unwrap();
+
+    let ws = daemon.run_json(&["new", &workdir()]);
+    let ws = ws["id"].as_str().expect("new prints the workspace id");
+    let repo_arg = repo.to_str().unwrap();
+    let made = daemon.run_json(&["worktree", "new", "e2e-wt", "--ws", ws, "--repo", repo_arg]);
+    let path = std::path::PathBuf::from(made["path"].as_str().expect("new prints the path"));
+    let pane = made["pane"].as_u64().expect("worktree new prints the pane");
+    let port = made["port"].as_u64().expect("worktree new prints the port");
+    assert_eq!(made["setup"], true, "{made}");
+    assert_eq!(
+        std::fs::read_to_string(path.join(".env")).unwrap(),
+        "SECRET=1\n"
+    );
+
+    let ran = path.join("setup-ran");
+    let deadline = Instant::now() + SETTLE_WITHIN;
+    let written = loop {
+        let text = std::fs::read_to_string(&ran).unwrap_or_default();
+        if text.ends_with('\n') {
+            break text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "setup never ran; the pane shows:\n{}",
+            daemon.run_ok(&["capture", &format!("%{pane}"), "--scrollback"])
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(written, format!("{port} e2e-wt\n"));
+
+    let listed = daemon.run_json(&["worktree", "ls", "--repo", repo_arg]);
+    let rows = listed["worktrees"].as_array().expect("ls lists worktrees");
+    assert_eq!(rows.len(), 2, "{listed}");
+    assert_eq!(rows[1]["managed"], true, "{listed}");
+    assert_eq!(rows[1]["panes"][0].as_u64(), Some(pane), "{listed}");
+
+    let refused = daemon.run(&["worktree", "rm", "e2e-wt", "--repo", repo_arg]);
+    assert!(
+        !refused.status.success(),
+        "rm took the checkout from under its pane"
+    );
+    assert!(path.exists());
+    let removed = daemon.run_json(&[
+        "worktree",
+        "rm",
+        "e2e-wt",
+        "--repo",
+        repo_arg,
+        "--close-panes",
+    ]);
+    assert_eq!(removed["snapshot"], "refs/tty7/trash/e2e-wt", "{removed}");
+    assert!(!path.exists());
 }

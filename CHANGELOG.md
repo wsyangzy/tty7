@@ -5,6 +5,694 @@ All notable changes to tty7 are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Volta shims, and anything else that reads its own argv[0], work again in
+  the Linux AppImage** (#1100). The AppImage runtime exports `ARGV0` into
+  tty7's environment and every pane inherited it. zsh gives an exported
+  `ARGV0` to every external command as its argv[0], so `node` started up as
+  `tty7-….AppImage` and Volta answered `Could not find executable`. Panes now
+  start without `ARGV0`. An `env` entry in the config can still set it.
+
+- **Sidebar controls keep their size and alignment when toggled** — New Tab
+  and the left sidebar toggle now use the same title-bar button and icon sizes
+  with the sidebar open or closed. On macOS, the right panel toggle keeps the
+  same trailing inset and vertical centre when it moves into the open panel's
+  header, preventing a position jump during toggling (#1099).
+
+- **A pane with a long history keeps updating on the phone.** Opening it
+  showed the latest screen, and then nothing more until it was closed and
+  opened again. The server charges a watcher for the history it replays, but
+  never credited that replay back once sent. Its budget was also no larger
+  than a full history, so a busy pane could drop the phone while the replay
+  was still going out. The drop was silent, too: the connection stayed open
+  with nothing ever sent down it again. Now the replay is credited by the same
+  rule as live output, and the budget leaves room for a full replay plus as
+  much live output again. A watcher that really does fall behind is told so
+  and its stream ends, so the phone reconnects on its own.
+
+- **The phone app no longer drops its connection every time the screen
+  locks.** Coming back from the background, the app now asks the computer
+  whether the connection still answers (a round trip of up to three seconds)
+  and, if it does, keeps the open pane and tree as they were. Before, it
+  closed the pane and opened it again every time, clearing the screen and
+  replaying it. A connection that did drop is retried quietly under the
+  screen that is up, and the "Reconnecting…" banner shows only if that takes
+  more than three seconds. Lost keystrokes are still reported at once. On
+  iOS, leaving the app asks for the system's background grace period (about
+  half a minute), so a short screen lock comes back to the same connection.
+  On Android, a foreground service with a "Connected to …" notification
+  keeps the connection up while a machine or pane is open, as SSH apps there
+  do.
+
+
+- **Escape keeps reaching an agent CLI after the window reopens on a long
+  session** (#1074). A program that asks for the kitty keyboard protocol does
+  so once, at startup, and a long enough session pushes that request out of the
+  8 MB the daemon keeps for replay. A window that reattached after that — a
+  restart, or reopening from the tray — rebuilt the pane without the protocol
+  and sent Escape as a bare `ESC`, which the program, still parsing the kitty
+  form, never took for a key. The daemon now tracks the kitty keyboard flag
+  stacks, one per screen, alongside the modes it already restores, and puts
+  them back as they stood where the replay begins, so the pushes and pops the
+  replay still carries land on the stack they were written against.
+
+- **A title that only swaps its status mark no longer repaints the window.**
+  An agent that animates its title (Claude Code turns a circle one quadrant at
+  a time) sends a new OSC title every few hundred milliseconds, and each one
+  rebuilt the whole window for a tab that reads the same: the tab never draws
+  the mark. The pane's own title now takes the same `strip_status_mark` reading
+  as the label, so `settle_title` drops such a frame, and a pane-facts delta
+  that leaves everything a tab shows as it was no longer ends in a
+  `cx.notify()` on the root view. A title whose words change still lands as
+  before, so a ticking counter in the title repaints as often as it did.
+
+- **The macOS traffic lights sit on the same line as the tiles beside them.**
+  The buttons AppKit draws are 14 points tall and gpui hangs the top of the
+  frame `y` points below the window's top edge, so the lights' centre falls
+  seven points under the bar's top; the New Tab and sidebar tiles are centred
+  in the bar's content box instead — its height less the hairline `TitleBar`
+  draws along the bottom edge. The position was still the one the 40-point bar
+  called for, carried over by hand when the bar grew to 48 without that
+  hairline in it, which left the lights half a point below everything else in
+  the row: one device pixel on a Retina panel. `traffic_light_position()` now
+  derives it from `TITLE_BAR_HEIGHT`, and a test holds the lights to the tile
+  line through the next change of bar height.
+
+### Changed
+
+- **Sidebar toggle icons reflect whether the sidebar is visible** — The left
+  and right toggles leave the sidebar region unfilled when collapsed and fill
+  it when expanded, keeping the same outline, stroke weight, and size (#1099).
+
+## [26.9.4] - 2026-09-29
+
+### Added
+
+- **The New Tab menu names the agents you actually run** (#955). Beside Local
+  and SSH, an Agents section lists up to three agents that have been launched
+  or seen running, most-used first — the same short list the shells get. A row
+  opens that agent in a new tab (hold ⌥ to split) and types its `agent_launch`
+  command, or the bare binary when none is set. Agents that are installed but
+  not in those rows are one click away: **Other Agents…** opens Search
+  Everywhere already filtered to `agent`. The section is absent when this
+  machine has no agent to offer. **New Agent Tab** (⌘⇧A) is unchanged: it
+  still starts the one used last.
+
+- **Find in files, from the right panel's Files tab.** Its field now matches
+  file names and file contents at once, in two sections. Type and the active
+  tab's project — the same roots the tree shows — is searched as you go, with
+  content hits grouped by file, a count per file, and each match highlighted in
+  its line. Click a hit to open the file in the built-in editor at that line
+  and column; Enter searches again. Toggles for match case, whole word and
+  regular expressions sit at the end of the field. The walk honours
+  `.gitignore` with or without a repository, skips dot-directories, binary
+  files and files over 1 MB, and says so when a cap (2,000 lines, 100 per
+  file, 20,000 files, ten seconds) cut it short. In a remote workspace the
+  search runs on the remote machine through `tty7-server`; a server that
+  predates it is never sent the request — the tab asks for the server to be
+  updated instead of showing an empty result.
+
+- **A GitHub tab in the right panel: issues and pull requests, read-only.** It
+  follows the focused pane's repository, binds to its `github.com` remote
+  (`upstream` over `origin` in a fork, with a menu to pick another), and lists
+  open or closed issues or pull requests with state glyphs, labels and
+  relative times; a label click filters by it. A row opens the detail —
+  description and comments as Markdown, and for a pull request its branches,
+  size and changed files, each of which opens its patch in the diff overlay.
+  Sign-in reuses the GitHub CLI (`GH_TOKEN`, `GITHUB_TOKEN`, then
+  `gh auth token`, found even from a Finder launch); public repositories work
+  signed out, and a private repository or a spent rate limit says to run
+  `gh auth login`. Screenshots pasted into an issue are shown; images from
+  any other host are shown as links rather than loaded, and non-web link
+  targets are disabled. The tab talks to `api.github.com` only while you use
+  it.
+
+- **Reorder the active tab from the keyboard** (`MoveTabLeft` / `MoveTabRight`).
+  The tab moves one slot past its neighbour — the keyboard form of dragging it
+  in the tab strip or the sidebar — and wraps past either end, so one held key
+  walks a tab the whole way down the list. On a left tab bar the same pair
+  reads as up and down, and the tab stays inside its sidebar group, wrapping
+  at the group's ends. Shipped unbound like the pane-swap pair: bind it under
+  Settings → Keyboard shortcuts ("Move Tab Left" / "Move Tab Right"), in
+  `config.json`, or run it from the palette.
+
+- **Quick launch for the coding agents on your PATH** (#955). Every agent tty7
+  recognises whose binary is on `PATH` is a palette command — "Agent: Claude
+  Code", "Agent: Codex", … — ordered by how often and how recently it was
+  launched or seen running, and each is bindable as `LaunchAgent:<slug>`. "New
+  Agent Tab" (⌘⇧A on macOS, unbound elsewhere, where Ctrl+Shift+A is
+  select-all) starts the one used last. A launch always opens a new tab in the
+  current tab's directory and types the agent's command into its shell once the
+  pane exists, never into a pane that was already there, so detection, status
+  and resume work as for a hand-typed agent and quitting it returns to the
+  shell. The command is the agent's bare binary unless `agent_launch` in
+  `config.json` gives it one (`"claude": "claude --dangerously-skip-permissions"`);
+  a wrapper named there is detected as that agent without an `agent_commands`
+  entry, including a script run under its interpreter, and the daemon picks up
+  an edit without a restart. A running agent's pane menu has "Set Current Launch
+  Args as Default", which writes the flags it was started with — minus the
+  session it resumed and any prompt — into `agent_launch`. A remote workspace
+  cannot be asked for its `PATH`, so there the list is the agents already seen
+  running in that workspace.
+
+- **Tabs can be put to sleep, and woken where they were** (#762). Right-click a
+  tab → Hibernate, or "Hibernate Tab" in the command palette, stops every
+  process in the tab to give its memory back while the tab keeps its place in
+  the sidebar, faded and marked with a moon. Selecting it wakes it — or
+  right-click → Wake to warm it up without switching. Waking is the restore a
+  reboot already runs: each pane comes back in its old directory and shell,
+  opens on the screen it left, and a supported agent with a captured session
+  is resumed. A sleeping tab stays asleep across app and daemon restarts; the
+  tab on screen is always awake, so the last awake tab cannot be put to sleep.
+  `tty7 pane ls` shows a sleeping tab's panes as `asleep`, and `tab ls`/`pane
+  ls --json` carry a `hibernated` flag. Offered only where the machine's server
+  can do it (this build or newer).
+
+- **A port forward can be switched off without losing its rule** (#439). A
+  forward could only be removed, so pointing one local port at a different
+  remote target meant deleting the rule and typing the other one in again. Each
+  forward in the Ports section now has a switch: off releases the listener and
+  keeps the rule in the list, on binds it again from the rule it was made from.
+  Switching one on while another switched-on forward holds its port is refused
+  with a notice naming that forward, rather than failing at bind time. A switch
+  flipped in the panel on a rule that came from a saved host is written back to
+  that host, so the next connection opens the same set; a rule saved switched
+  off is listed but not opened. Profiles saved before this load with every rule
+  on.
+
+- **Windows file paths are links** (#965). `C:\Users\me\a.png`,
+  `c:/Users/me/a.png` and `\\server\share\a.png` underline and open like any
+  other file path, with a `:10:2`, `(10,2)` or `#L10` location kept. The path
+  is found when Chinese prose is glued straight onto it
+  (`图片已保存到：c:/Users/me/a.png`) and inside a Markdown link
+  (`![chart](c:/out/chart.png)`), and is handed on with backslashes so
+  Explorer opens and reveals it — a forward-slashed path used to open
+  Documents instead. In a WSL pane a drive path is looked up under
+  `/mnt/<drive>`. A letter and a colon alone (`a:b`, `C:`, `C:notes.txt`) is
+  never read as a drive.
+
+- **A quoted path may contain spaces** (#965). `"C:\Program Files\app\app.exe"`,
+  `'/Users/me/My Docs/a.txt'` and the same in backticks are one link, with a
+  `:10:2` or `(10,2)` location read inside the quotes or just after the
+  closing one. Only quotes do this: an unquoted space still ends a path, and
+  quoted prose that is not written like a path — no separator, a space at
+  either end, over 260 characters — is left alone.
+
+- **"Open with Default App" in a file link's right-click menu** (#965). It
+  hands the file to whatever the OS has it associated with, whatever
+  `link_file_open` makes "Open" do. Shown for files on this machine only, and
+  not when "Open" already uses the system opener.
+
+- **The code editor talks to language servers** (#1002). Opening a local file
+  starts the server for its language — rust-analyzer,
+  typescript-language-server, pyright (or pylsp), gopls or clangd, whichever
+  is on `PATH` — one per project root, shared by every buffer under it.
+  Diagnostics are underlined with their message on hover and counted in the
+  status bar, and a Problems list (⌘⇧M, Ctrl+Shift+M elsewhere) gathers the
+  errors and warnings of every open file. Completion, hover, signature help,
+  go to definition (F12 or ⌘-click), Find All References (⇧F12), code actions
+  (⌘.), Format Document (⇧⌥F) and Rename Symbol (F2) work across files; the
+  keys are bound inside the editor only, so terminal programs keep F2 and F12.
+  A server missing from `PATH` costs only its language, with a one-line hint
+  in the status bar; a server whose last file closed shuts down after a grace
+  period, and one that crashes is restarted a few times. Files on a remote
+  workspace get no server. `editor_lsp` turns it all off.
+
+- **Multiple cursors, git change markers, symbols and a split in the code
+  editor** (#1002). ⌘D, ⌘⇧L and ⌘⌥↑ / ⌘⌥↓ add cursors, and the status bar
+  counts the selections. The gutter marks lines added, modified or deleted
+  against the file's staged version, on remote workspaces too; ⌥F5 / ⇧⌥F5 step
+  through the changes, ⌥F3 or a click on a marker peeks one, and Revert Change
+  undoes it as one step (`editor_git_gutter` turns the markers off). Go to
+  Symbol (⌘⇧O) lists the file's outline, previewing each symbol as it is
+  arrowed through, and once a query is typed adds the language server's
+  matches from across the project; a breadcrumb row over the text shows the
+  path and the symbols around the caret. Back and forward (Ctrl+− / Ctrl+⇧+−
+  on macOS, Alt+← / Alt+→ elsewhere) walk a per-tab history of jumps. ⌘\
+  (Ctrl+\ elsewhere, bound only in the editor so the terminal keeps SIGQUIT)
+  opens the file in a second group on the right, saved with the tab. The
+  right-click menu gains Toggle Comment, Move, Duplicate and Delete Line and
+  Go to Matching Bracket, and case transforms, Trim Trailing Whitespace and
+  Join Lines are bindable commands. **Settings → General → Editor** holds the
+  change markers, language servers, soft wrap and rendered Markdown.
+
+- **Quick open, Go to Line, New File and Save As in the code editor** (#984).
+  Go to File (⌘O on macOS, unbound elsewhere) finds any file in the active
+  tab's project by fuzzy name — on local, SSH and WSL workspaces alike,
+  skipping what the Files tree hides — and `name:line[:col]` jumps to that
+  spot. Go to Line is Ctrl+G. Save As uses the native panel locally and a
+  path bar on a remote workspace, and the files each tab has open are
+  remembered across restarts. Loading and saving keep a file's encoding
+  (UTF-8, GB18030, Windows-1252), byte-order mark and CRLF line endings as
+  they were, indentation is detected, `.editorconfig` is honoured, and the
+  status bar shows indentation, encoding and line ending.
+
+- **A local file pasted or dropped into a remote pane is uploaded there**
+  (#1004). Copying a file in Finder and pasting it into an SSH pane, or
+  dropping it on one, pasted this machine's path, which the remote program
+  cannot open; only clipboard images were uploaded. Every local path handed to
+  a pane now takes one route: on an SSH host it is uploaded into a directory
+  of its own under `~/.cache/tty7/clipboard`, so it keeps its real name, and
+  the remote path is pasted; in a WSL pane it is rewritten to `/mnt/<drive>/…`;
+  locally it is pasted as before. Folders upload recursively, a large file
+  appears at its path only once complete, a transfer is given up only after
+  it stops making progress, and staged pastes older than a week are pruned.
+  Rows dragged from a remote Files tree are no longer taken for local files.
+
+- **The GitHub tab shows a pull request's checks, reviews and merge state**
+  (#1000). The detail leads with the check runs and commit statuses on the
+  head commit, failures first, with durations and links to their logs; then
+  one row per reviewer; and a line under the branches such as "Waiting on 1
+  check", "Merge conflicts" or "Ready to merge". While a check is running the
+  checks are re-read every 20 seconds when signed in. The list pins the pull
+  request of the pane's branch under the repository row, found through the
+  branch's upstream so a fork's branch resolves under the fork's owner. Long
+  comment threads, descriptions, reviewer lists and file lists fold behind a
+  "show all" row.
+
+- **The GitHub tab tries every signed-in `gh` account** (#987). Only gh's
+  active account was used, so a private repository owned by an organisation
+  that another signed-in account belongs to read as a 404. On a 404, 401 or
+  403 the tab now retries with gh's other `github.com` accounts and remembers,
+  per owner, the one that got through. A token from `GH_TOKEN` or
+  `GITHUB_TOKEN` is still used on its own.
+
+- **A link a table wrapped inside its cell opens whole** (#1001). Markdown
+  tables — Claude Code's among them — wrap a long cell by hand, one bordered
+  row per line, so hovering or clicking a wrapped URL only ever got the
+  fragment on one row. A link now carries on from a row into the next when its
+  text reaches the cell's right border and resumes at the left one, with the
+  borders lined up; only `│`, `┃` and `║` count as borders, never a bare `|`.
+  The hover underline covers just the cell's text on each row.
+
+- **Qoder CN CLI support** (by @ArnoChenFx in #988). The mainland-China build
+  of Qoder (`qodercn`, `qoderclicn`, `qoder-cn`) is recognised, reports its
+  status through hooks and has its past sessions listed, honouring
+  `QODERCN_CONFIG_DIR`.
+
+- **Prime Agent and Empryo are recognised, and Antigravity reports its
+  status** (by @kalpakprod in #975). Prime Agent (`prime-agent`) resumes and
+  forks its sessions and reports status through the same extension bridge as
+  Pi. Empryo (`empryo`) is detected and resumed with `--session`; it gets no
+  status hooks yet, because it strips tty7's variables from hook processes.
+  Antigravity CLI (`agy`) gets a `tty7` hook set in
+  `~/.gemini/config/hooks.json`, beside the user's own, so its tab shows
+  working and done.
+
+- **A working agent's status dot blinks.** It alternates every 600 ms between
+  its colour and a paler blend of it, so a column of tabs shows at a glance
+  which agents are still going. The repaints stop once no agent is working.
+
+### Changed
+
+- **Every pick-one setting is a dropdown.** Settings drew a single choice two
+  ways — a row of segmented buttons for most, a dropdown for the language, the
+  window backdrop and the rest — with nothing to say which got which, and the
+  segmented rows ran to whatever width their labels made, so the right-hand
+  column never lined up. All of them are dropdowns now, one width. A value set
+  by hand off the presets (scrollback, the notification threshold) shows as a
+  checked "Custom (N)" at the foot of the menu, as the extra segment did.
+
+- **The mouse wheel no longer zooms the font by default.** ⌘ (Ctrl elsewhere)
+  plus the wheel used to resize the font, and ⌘ is held for so much else that
+  the text jumped size mid-scroll. `mouse_zoom_modifier` now defaults to
+  `none`; pick a modifier in Settings to have the wheel zoom again. ⌘+ / ⌘−
+  are unchanged.
+
+- **The command palette is now Search Everywhere, with tabs.** <kbd>⌘ P</kbd>
+  (<kbd>Ctrl ⇧ P</kbd> elsewhere) opens one search over **All**, **Terminals**,
+  **Sessions**, **Hosts** and **Commands**, walked with <kbd>⇥</kbd> / <kbd>⇧
+  ⇥</kbd>, keeping what is typed. **Terminals** lists every open tab of every
+  workspace, this window's most recently used first, and jumps to it wherever it
+  lives; the shells and agents it can open follow. **Hosts** holds the saved SSH
+  hosts and whatever address or `ssh …` command line is typed, which replaces
+  the separate input *SSH: Add Connection…* used to open. **All** shows the best
+  few rows of each, the tab with the best match first, and folds the rest into a
+  row that opens its tab; before anything is typed it leads each section with
+  its recent rows and tops it up to five from the rest, so a fresh window is not
+  empty. With nothing typed, <kbd>⌘ P</kbd> <kbd>⏎</kbd> goes back to the tab
+  you were just in. The keybinding action is still `TogglePalette`, so a custom
+  binding keeps working.
+- **Resume a past agent session from Search Everywhere.** Its **Sessions** tab
+  lists past sessions of Claude Code, Codex, Gemini CLI, Qwen Code, Qoder,
+  CodeBuddy, Pi, Oh My Pi, Kimi Code, Copilot CLI, Droid, Cursor CLI and
+  OpenCode — those that ran in the focused tab's directory first — by the title
+  the agent gave them, with directory, branch and age, and <kbd>⏎</kbd>
+  resumes one in a new tab in the directory it ran in, with the agent's
+  configured launch flags. In a remote workspace the list is that machine's
+  sessions, and they resume there. <kbd>⌘ E</kbd> (<kbd>Ctrl E</kbd>
+  elsewhere) on a session opens what else can be done with it: fork it, for
+  the agents that can, copy its id, or *Remove from List*, which only hides it
+  from the tab (`hidden_agent_sessions` in `config.json`) and leaves the
+  agent's history alone. Only the ends of each transcript are read, in the
+  background, and remembered until the file changes; OpenCode's and Cursor's
+  SQLite stores are opened read-only. The control dialect moves to v12, so
+  each remote host needs one Update Server, which ends the sessions on it.
+
+- **The command-line ghost suggests what you ran last, not what you ran
+  most.** It was the top prefix match by frecency, where run count and the
+  current-directory bonus outweighed recency, so after `git commit -m x`
+  typing `git c` still offered `git checkout main` because that had run 20
+  times here. The ghost is now the newest entry that extends the line,
+  preferring one run in the current directory and falling back to the newest
+  anywhere, and it skips commands whose last run exited non-zero, so it names
+  what ↑ recalls. Ctrl+R still ranks by frecency. Re-running a command now
+  moves it to the newest history entry instead of adding a second copy
+  (before, only an immediate repeat was collapsed), so ↑ steps onto each
+  command once, the same as after a restart.
+
+- **The sidebar groups tabs by repo automatically; pin what you want to keep**
+  (#955). Groups now come in two halves. Below, every tab you have not pinned is
+  filed under its git repository, and an SSH tab under the host it is on rather
+  than its remote path — `/home/ubuntu` on two machines used to share a header.
+  Above sit the groups you keep, each marked with a pin beside its name, in the
+  order you drag them into, until you delete them. A pinned group can keep a
+  folder: a tab whose working directory enters it joins it (the deepest folder
+  wins when they nest, and a worktree of a pinned repo counts), while a tab you
+  drag out stays out until it leaves the folder and comes back. Pin an auto
+  group with the pin on its header or by dragging the header up among the pinned
+  ones; pin a folder by dropping it from Finder, with **Pin as Group** in the
+  Files panel, or with **Open Folder as Group…** in the palette. **New Group**
+  in the palette, on a tab's right-click or on a right-click in the empty
+  sidebar below the tabs makes a label group. Deleting a group closes nothing —
+  its tabs go back to auto grouping — and dragging a tab below the pinned groups
+  does the same for one tab. Groups, their order and which are folded are stored
+  with the workspace, so every window onto it agrees. **Settings → General →
+  Auto grouping** replaces the three-way *Sidebar grouping* choice; off,
+  unpinned tabs sit in one flat list under the pinned groups. Scratch is now
+  **Ungrouped**.
+
+- **The New Tab menu names three shells, not every one the machine has.** A
+  stock macOS box reports nine, so the `+` menu opened on a column of `csh`,
+  `tcsh` and `ksh` that almost nobody runs, above the SSH hosts people came for.
+  The Local section now lists the default shell, always first, and then only
+  shells that have actually been opened, by frecency — three rows at most, the
+  way the SSH section already caps its hosts. The rest sit behind an "Other
+  Shells…" row that opens the command palette filtered to them: every shell is
+  now a palette command, "Shell: {name}", and running one does what its menu
+  row does, splitting instead when ⌥ (Alt) is held. The row is left out when
+  the menu already names the whole list.
+
+- **Saved SSH hosts live in `servers.json`, beside `config.json`** (#911), so
+  `config.json` can be synced between machines for its colours and keys
+  without carrying a list of servers. `ssh_profiles` and
+  `ssh_profile_frecency` move across by themselves the first time a new build
+  reads an older `config.json`: `servers.json` is written first (mode `0600`),
+  and only once it has landed are the two keys taken out of `config.json` —
+  nothing else in that file is touched, including keys this build does not
+  know. When both files hold hosts, `servers.json` wins and the stale copy in
+  `config.json` is dropped at its next save. A `servers.json` that cannot be
+  parsed is kept aside as `servers.json.corrupt` and saving is refused until it
+  is repaired, the same rule `config.json` has. Hand edits to `servers.json`
+  hot-reload. Passwords and passphrases stay in the OS keychain.
+
+- **`tty7 exec` runs a command in a pane that already exists and hands back its
+  result** (#839). `run` makes a new pane and `send` does not wait, so every
+  script that wanted a command's exit code from a shell it already had ended up
+  as `send`, a sleep, a `capture` and a guess, or an `echo $? > /tmp/rc` side
+  channel. `tty7 exec %3 -- cargo test` types the line at the pane's prompt,
+  follows the shell integration's marks to the command's end, prints what it
+  printed — as text, the way `capture --plain` reads it, or escapes intact with
+  `--raw` — and exits with its exit code. `--timeout` gives up with 124 and
+  leaves the command running; a pane with no prompt marks, or one that is not
+  at a prompt, is refused before anything is typed instead of waited on.
+
+- **`tty7 send` takes its text from stdin or a file, and can paste it**
+  (#838). A token passed as `send %1 "$TOKEN"` sits in the CLI's command line,
+  where any local user reads it in `ps`, and in the caller's shell history;
+  `--stdin` and `--from-file` send the bytes exactly as read and never echo
+  them in `--json`. `--paste` sends the text the way a paste into the window
+  does — in bracketed paste when the pane has switched it on, so a multi-line
+  text arrives as text instead of running line by line, with any ESC stripped
+  so the text cannot close the paste itself. A pane without the mode gets the
+  same unframed paste the GUI would send it, and `--json` says which one went.
+  The server now reports each pane's bracketed-paste mode in `tty7 procs`.
+
+- **The source control panel's changed files can be filtered and shown as a
+  tree** (#473). A filter field sits above the list: every word typed has to
+  appear somewhere in a file's path, in any order and any case, and the group
+  headers' counts and their stage/unstage/discard-all buttons follow what the
+  filter leaves on screen. The tile at its end switches the list to a
+  directory tree — directories before files, a chain of directories that hold
+  nothing but the next one compacted into a single row (`crates/core/src`),
+  each directory row foldable and counting the files beneath it. A filter
+  opens every folded directory while it is set. The choice between list and
+  tree is remembered in the config. Both are built from the status the host
+  already sends, so a remote repository gets them unchanged. Searching the
+  diff text itself is not part of this.
+- **The cursor at the shell prompt can have its own shape** (#958). A new
+  `prompt_cursor_style` setting (Settings → Appearance → Cursor) takes
+  `follow`, `block`, `bar` or `underline`. `follow`, the default, keeps
+  `cursor_style` everywhere, exactly as before. Any other value is used at the
+  prompt, drawn by tty7's inline editor or by the shell's own line editor, and
+  leaves `cursor_style` to the programs the shell runs — so `bar` with
+  `cursor_style: "block"` gives kitty and ghostty's bar-at-the-prompt, block in
+  a TUI that never sets a shape itself, such as Claude Code. A shell prompt in
+  vi mode keeps its own insert/normal shapes.
+
+- **Agent status catches interrupts, stale turns and permission prompts**
+  (#1003). Claude Code's `Stop` hook skips user interrupts, so after Esc or
+  Ctrl+C a pane stayed on working until the next prompt. Now an Esc or Ctrl+C
+  on a pane whose agent is mid-turn, with no hook event in the second after
+  it, ends the turn; and a turn that has been working for 30 minutes without
+  a hook event goes idle. These guessed states raise no notification or
+  unread badge, and the agent's next real event overrides them. Claude Code
+  and Codex now report a permission prompt or a question the moment it opens
+  rather than seconds later (Codex never did), and Codex leaves waiting once
+  the approved tool has run. The "finished" notification waits 1.5 seconds
+  and is dropped if the next turn starts first. Existing hook installs are
+  refreshed at launch.
+
+- **Settings open in a window of their own, rebuilt.** Settings used to cover
+  the workspace, hiding the terminal a setting was being tried on. It is a
+  separate window now; opening it again raises it, and closing it with
+  unsaved forms or a theme draft still asks first. The page is rebuilt with a
+  searchable sidebar, per-page modified counts and a *Modified only* switch,
+  and an inline Reset on each changed row. Theme menus have a live preview,
+  search and swatches, and font menus draw each family in itself. Recording a
+  shortcut that another action already has asks Replace or Cancel instead of
+  taking it over silently. SSH hosts are one column of recent hosts, with
+  *Show all* by source and a search, and open in place. Integrations gets an
+  agent search and a menu per agent (Reinstall, Reveal hook file, Uninstall).
+  General gains startup and restore; updates and the server move to About.
+  (#973)
+
+- **The window is redesigned.** The side rails share the window's fill,
+  divided by a hairline; the current tab is a neutral selected step with a
+  semibold title instead of a blue wash, and tab titles are spelled out in
+  full wherever they fit. The right panel's tabs are words — Info, Files,
+  Changes, GitHub. The workspace switcher, Search Everywhere, the Changes tab,
+  the diff overlay, dialogs, menus, the SFTP browser and the home page follow
+  the same design: neutral selection instead of accent washes (the
+  switcher's hard-coded blue row is gone), an inverted neutral primary
+  button, lighter scrims and headings no longer in capitals. The default
+  Light theme takes a new ink and accent. (#973, #993)
+
+- **Search sits in the middle of the title bar** (#990). The centred path
+  repeated what the sidebar already says; it is now a field-shaped
+  **Search…** button, with its shortcut, that opens Search Everywhere —
+  centred over the terminal column on Windows and Linux. The trailing `…`
+  menu, which held only Search Everywhere and Settings, is gone: both keep
+  their shortcuts and the macOS menu bar entries.
+
+- **Every confirmation is tty7's own dialog, and failures say what failed**
+  (#985). Closing a busy tab fell through to a system alert (NSAlert on
+  macOS, TaskDialog on Windows) while every other question was one of tty7's
+  cards; all confirmations are that card now, on every platform, with Return
+  and Escape keeping their meaning and a destructive answer painted red.
+  About twenty failure notices were one plain line such as `push: fatal: …`;
+  they are error toasts now, titled with what failed ("git push failed") and
+  the reason beneath. The delete confirmation says the file is removed for
+  good rather than moved to the Trash.
+
+- **The code editor's header, menus and find bar match the rest of the
+  window** (#1005, #992). The file strip keeps only the files most recently
+  brought forward (three docked, seven filled, fewer with side panels open) in
+  a stable order; a `+N` button lists every open file with a filter, keyboard
+  navigation, *Close saved* and *Close others*. A Dock / Fill switch replaces
+  the header's right-click menu, and a filled editor leads with a pill naming
+  the terminal it covers that docks it back. The text's right-click menu,
+  which was the OS's own menu, is drawn like tty7's other menus and offers
+  Attach to Agent (the selected lines ride along as `#L3-9`), Find, Go to Line
+  and the file's own items; file tabs get Close, Close Others and Close to the
+  Right. The find bar is one filled pill with the match count and a clear
+  current-match colour, and ⌘⌥F / ⌘R (Ctrl+H elsewhere) opens it with the
+  replace row.
+
+### Removed
+
+- **The Window & Tabs settings page.** Its three tab settings — New tab
+  position, Tab bar position and Auto grouping — are a **Tabs** group on
+  **Settings → General** now, below Startup & restore.
+
+- **The *Open diff preview from sidebar counts* setting**
+  (`sidebar_diff_preview`). A tab's `+N −M` in the sidebar, and the Info
+  panel's `changes` row, always open the diff overlay; the stalls on large
+  working trees that the switch was a way around were fixed alongside it. The
+  key is ignored if a `config.json` still has it.
+
+- **The *By repo or folder* grouping mode, "Group Automatically", and groups
+  stored by name.** A folder you want grouped is pinned instead, and dragging a
+  tab below the divider is the way back to automatic grouping. Hand-made groups
+  and folds from earlier versions are not carried over. The control dialect
+  moves to v11, so each remote host needs one Update Server, which ends the
+  sessions on it.
+
+- **Editing a saved host's authentication, proxy, port forwarding and
+  advanced options in Settings.** The rebuilt SSH page edits Alias,
+  HostName, User, Port, IdentityFile and ProxyJump; values already saved for
+  the rest are kept and still used. (#973)
+
+### Fixed
+
+- **The tab-number badges follow the chord the tabs are actually on.** Holding
+  the modifier that switches tabs draws the numbers 1…9 on the tab strip and
+  the sidebar, but the modifier was assumed: the platform's secondary, ⌘ on
+  macOS and Ctrl everywhere else, whatever `ActivateTab1`…`ActivateTab9` were
+  bound to. Off macOS — where the nine ship on Alt — holding Alt raised
+  nothing while Ctrl, which switches no tab there, lit every number up, and a
+  tab row rebound onto Alt still had to be held with Ctrl to see the hint; on
+  macOS a rebind onto Alt failed the same way the other way round. The hold is
+  now read from `ActivateTab1`, so it moves with the binding (Alt, ⌘, or the
+  Ctrl+Alt a config asked for) and is held exactly: an action with no chord, a
+  chord with no modifier, a key that is not the number the badge draws, or the
+  tmux preset's `prefix 1` raise no badges at all, rather than promising
+  numbers no key answers.
+
+- **Quick launch found only the agents in the GUI's own bare `PATH`.** The app
+  starts with the launchd environment (`/usr/bin:/bin:/usr/sbin:/sbin`) and
+  fills it in by running the login shell, but only as a *login* shell — which
+  reads `.zprofile` / `.bash_profile` and never `.zshrc` / `.bashrc`, where
+  most people export their `PATH`. Anything installed under
+  `$HOME/.../env/node/bin`, `~/.local/bin` or an `rc`-only directory was
+  invisible: `Agent:` rows for it disappeared from Search Everywhere and the
+  `NEW Agent Tab` menu, and a matching `agent_launch` entry did not help,
+  because the override's own program is looked up on the same `PATH`. The probe
+  now runs interactively (`-i -l`, fish unchanged — it reads its config in
+  every mode), reads the PATH between markers so an `rc` that prints cannot be
+  mistaken for it, and gives up after 5 seconds so a stuck `rc` cannot keep
+  the app from opening.
+
+- **Chinese UI copy reads like Chinese** (#980). Half-width `?` and `,` in the
+  hard-reset confirmation, the passphrase, Finder and server naming used two
+  words each, and three quote/dash styles were mixed; these are now one each,
+  and the most literal translations (file errors, update and version-mismatch
+  dialogs, SSH prompts) are rewritten. The fork error that pointed to
+  "Settings → Agents" — a page that is called Integrations — now names it
+  correctly in every language and in the `tty7` CLI.
+- **Return runs the top row after a search that found nothing.** Backspacing
+  from a query with no results to one with some — or opening the search already
+  filtered, as the New Tab menu's *Other Shells…* row does — left no row
+  selected, so Return did nothing until an arrow key was pressed.
+- **A typed `ssh -p 2222 me@box` is no longer offered as an address.** The
+  address parser read everything before the `@` as the user name and offered
+  to connect as `ssh -p 2222 me`; a line with spaces is now always taken as an
+  `ssh` command line.
+
+- **The character under the cursor no longer disappears in vim and Neovim**
+  (#966). An input-method composition with nothing visible in it — Windows
+  IMEs can leave one behind — was still painted at the cursor, as a cell of
+  the theme's background with an underline under it, covering both the
+  character and the block cursor on every cell the cursor moved to. A
+  composition that has nothing to draw is no longer painted, so the cell keeps
+  its character and the block cursor draws it in reverse video as usual.
+- **Nerd Font icons from a fallback font come out at the text's size** (#866).
+  With a Nerd Font icon face such as Symbols Nerd Font Mono behind a primary
+  that lacks the icons, an icon followed by a space on the same background —
+  every icon in a coloured Powerline or p10k segment — was held to one cell
+  and shrunk to about two thirds of the text's height. Icons with a plain
+  space after them were already drawn full size, so one prompt had icons in
+  two sizes. A lone Private Use Area glyph supplied by a fallback face is now
+  fitted, aspect ratio kept, to its cells and one em of height, taking the
+  blank after it when that blank paints no background or the icon's own and
+  when doing so makes it bigger, and centred in the row; a face whose icons
+  ink less than a cell grows (at most 2×). The Powerline separators, CJK,
+  emoji, other text and the primary font's own icons are drawn as before.
+  Not on Linux, where the text system reports a glyph's advance box rather
+  than its ink.
+
+- **A host with `Compression yes` prints again** (reported by @RedwindA in
+  #997). It negotiated `zlib@openssh.com`, and the SSH library tty7 used cut
+  every packet that inflated past twice its compressed size, so the zlib
+  stream desynced right after authentication: the session showed as
+  connected and never printed a byte. The library is now pinned to a build
+  with the upstream fixes. Re-importing an ssh config now also updates the
+  algorithms of hosts that already exist.
+
+- **The OpenCode plugin loads on OpenCode 2.x** (reported by @ArnoChenFx in
+  #999). 2.x only loads a plugin's default export shaped `{ id, setup }` and
+  rejected tty7's with a load error. The generated plugin now serves 1.x and
+  2.x, follows 2.x's event API, and starts its helper without `sh`, which
+  Windows does not have.
+
+- **The code editor no longer loses edits** (#984). A save truncated the file
+  in place, so a crash or a full disk mid-save destroyed it; local saves now
+  go through a temporary file renamed over the target, falling back to an
+  in-place write only where a rename would change something visible. The
+  same file open in two tabs is one buffer, not two diverging copies.
+  Closing a tab, its last pane or the window, or quitting, asks about
+  unsaved files (Save / Cancel / Discard) instead of dropping them. Renaming
+  or deleting a file in the Files tree follows the open buffer, so a save no
+  longer recreates the old path, and a save asks before overwriting a change
+  made elsewhere. Undoing back to the saved text clears the unsaved mark, and
+  a reload keeps undo.
+
+- **Typing Chinese through an input method no longer crashes the code
+  editor** (#993). When a re-parse ran past its time budget, stale
+  highlighting could put a style boundary inside the committed character and
+  panic the app.
+
+- **Selecting text in rendered Markdown no longer blanks it out** (#991). The
+  selection was painted over the glyphs, so a multi-line selection in, say, a
+  pull request's description became a solid grey block.
+
+- **The Processes and Ports sections see the pane's shell on a busy Mac**
+  (reported by @zcyc in #731). The macOS process list read the pid count as a
+  byte count, so on a machine with about 700 processes only the newest 60 or
+  so were seen; a pane whose shell started earlier showed no processes and no
+  ports, with nothing flagged.
+
+- **A Files tree on a WSL distro stays in step with it** (reported by
+  @zt449569708 in #942). Copying a downloaded file onto the distro's share
+  no longer brings a `name:Zone.Identifier` file with it; a file removed from
+  the shell inside the distro leaves the tree (the share accepts a change
+  watch and never reports a change, so it is now polled every 2 seconds); and
+  right-clicking a row selects it.
+
+- **The quit confirmation on Linux is no longer cut off mid-sentence**
+  (reported by @XuJinNet in #920). Linux has no native dialog, and the
+  fallback set the message and detail as single unbreakable lines in a
+  fixed-width box. Its text wraps now.
+
+- **Fork no longer picks up the previous agent's session id** (by
+  @CodeHourra in #957). When the foreground agent in a pane changed, or
+  another agent's hook wrote to the same terminal, the old session id stayed
+  with the new agent.
+
+- **Windows no longer freeze for a round trip when a remote watch closes.**
+  Closing a watch on a remote workspace waited for the server's answer, often
+  on the UI thread, so every window stalled for a round trip — up to five
+  seconds on a quiet link. The request is now sent without waiting.
+
+- **A burst of pane output no longer holds up the UI.** The reader parsed each
+  batch, and a reconnect's whole replay of up to 8 MB, in one hold of the
+  grid lock that every UI handler touching the grid waits on. It now lets go
+  every 64 KB.
+
+- **A command named in the search leads over a session that mentions it**
+  (#985). Typing `worktree` and Return resumed a past agent session instead of
+  opening New Worktree Tab: the fuzzy matcher spent the first letter on its
+  leftmost occurrence and scored a title containing the whole word as a poor
+  match, and session titles often open with a command's name. The matcher now
+  keeps the best alignment, and on the All tab sessions yield to an equally
+  good command.
+
+- **Menu items bound to Return or Tab show the right shortcut on macOS.** A
+  menu item bound to ⌘↵, such as Toggle Fullscreen, read as ⌘E. (#973)
+
 ## [26.9.3] - 2026-09-23
 
 ### Added

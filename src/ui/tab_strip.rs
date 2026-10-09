@@ -1,30 +1,33 @@
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Axis, Bounds, Context, FontWeight, MouseButton,
     Pixels, SharedString, Window, canvas, deferred, div, ease_out_quint, linear_color_stop,
-    linear_gradient, prelude::*, px, relative,
+    linear_gradient, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_component::input::Input;
 use gpui_component::kbd::Kbd;
 use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::tooltip::Tooltip;
-use gpui_component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
+use gpui_component::{
+    ActiveTheme as _, Icon, IconName, Selectable as _, Side, Sizable as _, h_flex,
+};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::core::actions::{
     CloseActiveTab, CloseOtherTabs, CloseTabsToTheRight, CopyAgentSessionId, CopyWorkingDirectory,
-    ForkAgentSession, MarkTabUnread, NewWorktreeTab, OpenSettings, RenameTab, SelectWorkspace1,
+    ForkAgentSession, HibernateTab, MarkTabUnread, NewWorktreeTab, RenameTab, SelectWorkspace1,
     SelectWorkspace2, SelectWorkspace3, SelectWorkspace4, SelectWorkspace5, SelectWorkspace6,
-    SelectWorkspace7, SelectWorkspace8, SelectWorkspace9, SplitDown, SplitRight, TogglePalette,
+    SelectWorkspace7, SelectWorkspace8, SelectWorkspace9, SplitDown, SplitRight,
 };
-use crate::core::config::{Config, RightPanelTab, SidebarGrouping};
-use crate::core::group_key::GroupKey;
+use crate::core::cli_agent::CLIAgent;
+use crate::core::config::{Config, RightPanelTab};
 use crate::core::shells::DetectedShell;
 use crate::daemon::protocol::ShellSpec;
 use crate::ui::app::{SpawnWhere, TILE_GLYPH, TILE_SIZE, Tab, Tty7App, tile_trailing_inset};
 use crate::ui::hints::tab_badge_label;
 use crate::ui::i18n::{L10nKey, t, t_fmt};
 use crate::ui::reorder::{self, Reorder, Surface};
+use crate::ui::search::SearchTab;
 
 /// One duration and one curve for every transition the app runs, so a fade and
 /// a slide read as the same hand. Long enough to be seen as movement, short
@@ -517,15 +520,54 @@ pub(crate) fn elide_label(
     }
 }
 
-/// Keeps the longest tail of `text` that fits after a bare ellipsis. Shared
-/// by the path and token elisions as their last resort.
-fn elide_tail_clusters(
+/// Keeps the longest head of `text` that fits before a trailing ellipsis —
+/// the plain cut a reader expects, for a string read left to right like a
+/// branch name.
+pub(crate) fn elide_end_clusters(
     text_system: &gpui::WindowTextSystem,
     font: &gpui::Font,
     size: f32,
     text: &str,
     max_width: f32,
 ) -> SharedString {
+    if measure_text(text_system, font, size, text) <= max_width {
+        return SharedString::from(text.to_string());
+    }
+    let budget = max_width - measure_text(text_system, font, size, "…");
+    if budget <= 0. {
+        return SharedString::from("…");
+    }
+    let cells = clusters(text);
+    let (mut lo, mut hi) = (0usize, cells.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if measure_text(text_system, font, size, &cells[..mid].concat()) <= budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut out = cells[..lo].concat();
+    out.push('…');
+    SharedString::from(out)
+}
+
+/// Keeps the longest tail of `text` that fits after a bare ellipsis. Shared
+/// by the path and token elisions as their last resort.
+pub(crate) fn elide_tail_clusters(
+    text_system: &gpui::WindowTextSystem,
+    font: &gpui::Font,
+    size: f32,
+    text: &str,
+    max_width: f32,
+) -> SharedString {
+    // Nothing to cut. The search below is bounded by the budget *after* the
+    // ellipsis, so without this a branch that fit came back as "…" plus the
+    // whole of itself — the rail's group header printed `…feat/v4-redesign`
+    // with room to spare.
+    if measure_text(text_system, font, size, text) <= max_width {
+        return SharedString::from(text.to_string());
+    }
     let budget = max_width - measure_text(text_system, font, size, "…");
     if budget <= 0. {
         return SharedString::from("…");
@@ -613,6 +655,18 @@ pub(crate) fn chrome_tile_variant_for(selected: bool, cx: &gpui::App) -> ButtonC
 
 pub(crate) const BUTTON_ICON_SCALE: f32 = 0.75;
 
+/// Compact tiles for document headers and overlays: 26px boxes with a 6px
+/// corner and a glyph a notch under the toolbar's. Sidebar navigation uses
+/// the full title-bar size so opening a panel does not resize its controls.
+pub(crate) const RAIL_TILE: f32 = 26.;
+
+/// A sidebar row's trailing status dot, and the box it is centred in (wide
+/// enough for the unread pill that replaces it).
+pub(crate) const ROW_STATUS_DOT: f32 = 5.;
+pub(crate) const ROW_STATUS_SLOT: f32 = 14.;
+pub(crate) const RAIL_TILE_GLYPH: f32 = 14.;
+pub(crate) const RAIL_TILE_RADIUS: f32 = 6.;
+
 /// WCAG 2.2 SC 2.5.8 puts the desktop floor for a pointer target at 24×24, and
 /// gpui-component renders an icon-only `.xsmall()` button as a 20×20 box (18×18
 /// where the chrome overrode it). Grow only the box: the glyph keeps its size,
@@ -647,14 +701,20 @@ pub(crate) fn chrome_tile(button: Button, selected: bool, cx: &gpui::App) -> But
     chrome_tile_sized(button, TILE_SIZE, TILE_GLYPH, selected, cx)
 }
 
-const RIGHT_PANEL_TABS: [(RightPanelTab, L10nKey); 3] = [
+/// The right panel's tabs, left to right, by name. Info leads as the default
+/// and the pane's overview; then the project's files, and its version
+/// control, local to remote (Changes, GitHub). GitHub is last so that hiding
+/// it for a repository without a GitHub remote moves nothing. Search is not
+/// among them: the Files tab searches names and contents in one field.
+const RIGHT_PANEL_TABS: [(RightPanelTab, L10nKey); 4] = [
     (RightPanelTab::Info, L10nKey::PanelInfoTitle),
-    (RightPanelTab::Scm, L10nKey::PanelChangesTitle),
     (RightPanelTab::Files, L10nKey::PanelFilesTitle),
+    (RightPanelTab::Scm, L10nKey::PanelChangesTitle),
+    (RightPanelTab::GitHub, L10nKey::PanelGitHubTitle),
 ];
 
 fn right_panel_tab_size(window: &Window) -> f32 {
-    window.rem_size().as_f32() * crate::ui::right_panel::META
+    window.rem_size().as_f32() * crate::ui::right_panel::TAB_TEXT
 }
 
 fn right_panel_tab_font(cx: &gpui::App) -> gpui::Font {
@@ -662,14 +722,14 @@ fn right_panel_tab_font(cx: &gpui::App) -> gpui::Font {
         family: cx.theme().font_family.clone(),
         features: Default::default(),
         fallbacks: None,
-        weight: FontWeight::SEMIBOLD,
+        // The current tab's weight, which is the widest any label is drawn at.
+        weight: FontWeight::MEDIUM,
         style: Default::default(),
     }
 }
 
-/// What the three bare tab labels take, padding included, at the live
-/// interface size and language. The panel's floor is built on it, so a larger
-/// UI font widens the panel instead of pushing its chrome tiles off the edge.
+/// What the bare tab labels take, padding included. The panel's floor is
+/// built on it, so the chrome tiles beside them always fit.
 pub(crate) fn right_panel_tab_labels_w(window: &Window, cx: &gpui::App) -> f32 {
     let size = right_panel_tab_size(window);
     let font = right_panel_tab_font(cx);
@@ -682,21 +742,21 @@ pub(crate) fn right_panel_tab_labels_w(window: &Window, cx: &gpui::App) -> f32 {
         .sum()
 }
 
-/// Right panel tab geometry: the gap between two tabs' hover pills, the pill's
-/// own inset around its label, and the gap before the Changes count.
-const TAB_OUTER_PAD: f32 = 2.;
-const TAB_INNER_PAD: f32 = 8.;
-const TAB_COUNT_GAP: f32 = 5.;
+/// Right panel tab geometry: each tab's click target reaches this far past
+/// its pill, so neighbouring pills sit twice this apart.
+pub(crate) const TAB_OUTER_PAD: f32 = 2.;
+/// A label's hover target reaches this far past its word.
+const TAB_INNER_PAD: f32 = 4.;
 
-/// How wide the two chrome tiles at the trailing end of the title bar are, with
-/// the padding around them.
+/// The panel toggle and its trailing inset. The open panel uses this same
+/// reservation so the title bar never budgets for a second, absent control.
 pub(crate) fn trailing_chrome_tiles_w() -> f32 {
     let trailing_pad = if cfg!(target_os = "macos") {
         tile_trailing_inset()
     } else {
         4.
     };
-    trailing_pad + crate::ui::app::TILE_SIZE + 2. + crate::ui::app::TILE_SIZE
+    trailing_pad + crate::ui::app::TILE_SIZE
 }
 
 /// The whole trailing cluster: those tiles and the OS window buttons beyond
@@ -728,40 +788,158 @@ pub(crate) fn chrome_tile_sized(
 ///
 /// Sorted by frecency, so the ones actually used are the ones that fit. A menu
 /// is not a search field — past a handful the list stops being scannable, and
-/// the command palette already lists every host and can filter. The row that
+/// the search's Hosts tab already lists every host and can filter. The row that
 /// closes the section is where the rest are.
 const MENU_HOSTS: usize = 6;
+
+/// How many shells the New Tab menu names, the default among them.
+///
+/// The same reasoning as [`MENU_HOSTS`], at a smaller number: a stock macOS box
+/// reports nine shells and almost nobody opens more than one or two of them.
+/// The default always leads — it is the answer to "what do I get if I just
+/// click" — and the rest of the rows go to whatever has actually been opened,
+/// by frecency. Everything else is one row away, in the search.
+const MENU_SHELLS: usize = 3;
+
+/// How many agents the New Tab menu names.
+///
+/// The same cap as [`MENU_SHELLS`], and for the same reason: the agents
+/// someone actually runs are two or three, and a menu is not a search field.
+/// Only agents that have been run are named — there is no "default agent" to
+/// lead the way shells' default does. Everything else is one row away.
+const MENU_AGENTS: usize = 3;
+
+/// The Search Everywhere button in the middle of the title bar: the width of
+/// a field that reads as one, and the 28px of the rail's own search.
+const TITLEBAR_SEARCH_W: f32 = 360.;
+const TITLEBAR_SEARCH_H: f32 = 28.;
+
+/// Air between the search box and the nearest chrome tile when the bar is too
+/// narrow for the box to sit at its full width.
+const TITLEBAR_SEARCH_CLEAR_GAP: f32 = 8.;
+
+/// Where the title-bar search box is centred, as offsets from the tab strip it
+/// is drawn inside.
+///
+/// The strip does not start at the terminal column's left edge. The title bar
+/// leaves a lead before it — 80pt on macOS for the traffic lights, whether or
+/// not the rail is standing in front of them, plus the bar's own inset in
+/// fullscreen; 12 elsewhere — and a box centred on the strip was centred that
+/// much too far right by half: 40pt on macOS, which is plainly visible with
+/// the rail collapsed and the box standing alone in an empty bar (#1033).
+/// So the band reaches back over the lead, and its left edge is the column's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SearchBand {
+    /// `left` for the band, against the strip's left edge: the lead, negated.
+    pub(crate) left: f32,
+    /// `right` for the band, against the strip's right edge.
+    pub(crate) right: f32,
+    /// How much of *each* end of the band the box keeps clear of, so that in
+    /// a narrow bar it shrinks rather than slides under the chrome tiles. The
+    /// same at both ends, because a box clear of only one is no longer
+    /// centred.
+    pub(crate) clear: f32,
+}
+
+/// [`SearchBand`] for a strip that starts `lead` in from the terminal column's
+/// left edge.
+///
+/// `docked_right` is what is docked to the right of the terminal — the detail
+/// panel and a document column. Off macOS the bar spans those too, so the band
+/// stops at the terminal column: the strip already stops short of the window
+/// controls, so they come off the columns' share. On macOS the bar is inside
+/// the terminal column already and the strip runs to its end.
+///
+/// `leading_w` is the collapsed rail's group at the strip's left end, measured
+/// from the strip's left edge; `trailing_w` the chrome tiles at the band's
+/// right end, when they are there rather than off over a docked column.
+pub(crate) fn search_band(
+    macos: bool,
+    lead: f32,
+    docked_right: f32,
+    controls_w: f32,
+    leading_w: Option<f32>,
+    trailing_w: Option<f32>,
+) -> SearchBand {
+    let right = match !macos && docked_right > 0. {
+        true => (docked_right - controls_w).max(0.),
+        false => 0.,
+    };
+    let leading = leading_w.map_or(0., |w| lead + w + TITLEBAR_SEARCH_CLEAR_GAP);
+    let trailing = trailing_w.map_or(0., |w| w + TITLEBAR_SEARCH_CLEAR_GAP);
+    SearchBand {
+        left: -lead,
+        right,
+        clear: leading.max(trailing),
+    }
+}
+
+/// How far the title bar's lead reaches before the tab strip starts: the room
+/// `TitleBar` leaves for the traffic lights on macOS, and the bar's own inset
+/// that gpui-component adds to it in fullscreen, where the lights are gone but
+/// the room is not; `TITLE_BAR_LEAD` elsewhere, in both of the rows the strip
+/// can sit in.
+fn title_bar_strip_lead(fullscreen: bool, rem: f32) -> f32 {
+    match cfg!(target_os = "macos") && fullscreen {
+        // `pl_3` on the bar inside `TitleBar`.
+        true => crate::ui::app::TITLE_BAR_LEAD + 0.75 * rem,
+        false => crate::ui::app::TITLE_BAR_LEAD,
+    }
+}
+
+/// How wide the collapsed rail's group at the start of the strip is: the
+/// window mark where there is one, then New Tab and Show Sidebar. Mirrors the
+/// `left_group` built in `tab_strip`, `ml` included.
+fn collapsed_rail_group_w() -> f32 {
+    use crate::ui::app::{CONTENT_INSET, TILE_SIZE, WINDOW_MARK_SIZE, tile_trailing_inset};
+    let mark = match cfg!(target_os = "macos") {
+        true => 0.,
+        false => (CONTENT_INSET - tile_trailing_inset()) + WINDOW_MARK_SIZE + 4. + 2.,
+    };
+    crate::ui::app::title_bar_hug_offset() + mark + TILE_SIZE + 2. + TILE_SIZE
+}
 
 /// How wide the New Tab menu is allowed to get.
 const MENU_W: Pixels = px(360.);
 
 /// How tall, before it starts scrolling.
 ///
-/// Enough for the menu's own full hand — the nine shells a stock macOS box
-/// reports, both headings, [`MENU_HOSTS`] hosts and the two rows that close the
-/// list, at the 26px a row occupies — so the shape everyone actually sees
-/// arrives whole. Past that (a pile of custom shells) it scrolls, and it is
-/// capped again against the window in [`NewTabMenu::build`], since a menu taller
-/// than what it hangs off is worse than one that scrolls.
-const MENU_H: Pixels = px(560.);
+/// The lists are capped — [`MENU_SHELLS`] shells, [`MENU_AGENTS`] agents and
+/// [`MENU_HOSTS`] hosts — so the menu's full hand is a fixed number of rows:
+/// those, the three headings, the row closing each section, the separators and
+/// the modifier hint, at the 26px a row occupies. The Agents section is absent
+/// when nothing is offered, and this still leaves room above the full hand for
+/// a seam row or two more, so it always arrives whole and never scrolls on its
+/// own. It is capped again against the window in [`NewTabMenu::build`], since
+/// a menu taller than what it hangs off is worse than one that scrolls.
+const MENU_H: Pixels = px(720.);
 
-/// What the row closing the SSH section types into the palette for you.
-///
-/// Every saved host is a palette command titled `SSH: {name}`
-/// ([`L10nKey::AppCmdSshProfileTitle`], and the same in every language we
-/// ship), so this one word is the whole list, frecency-ordered, with the
-/// cursor left where the next keystroke narrows it further.
+/// What the row closing the Local section types into the search's Terminals
+/// tab for you.
 ///
 /// This is where filtering lives, and the reason the menu does not do any.
 /// A search field inside a [`PopupMenu`] is not possible — the menu holds the
 /// keyboard for its own navigation — and the branch that tried it had to
 /// become a popover carrying the palette's own list, which read as far too
 /// heavy hanging off a button in the chrome. The menu names the few worth
-/// naming; the palette, which already filters better than a menu could, holds
-/// the rest. This row is the seam between the two, and it only works if it
-/// lands in the palette *already filtered*: a row that says "all SSH hosts"
-/// and opens the unfiltered command list has made the reader ask twice.
-const PALETTE_SSH_QUERY: &str = "ssh";
+/// naming; the search, which already filters better than a menu could, holds
+/// the rest. The rows closing each section are the seam between the two, and
+/// they only work if they land *already filtered*: a row that says "other
+/// shells" and opens every terminal has made the reader ask twice.
+///
+/// The Terminals tab holds open tabs as well as ways to open one, so the
+/// shells are narrowed to by word: every one is titled `Shell: {label}`
+/// ([`L10nKey::AppCmdShellTitle`], the same word in every language we ship),
+/// so this lands on exactly the shells, default first and then by frecency.
+const SEARCH_SHELL_QUERY: &str = "shell";
+
+/// What the row closing the Agents section types into the search's Terminals
+/// tab.
+///
+/// The same seam as [`SEARCH_SHELL_QUERY`]. Every quick-launch row is titled
+/// `Agent: {name}` ([`L10nKey::AppCmdAgentLaunchTitle`], the same word in every
+/// language), so this lands on exactly the agents.
+const SEARCH_AGENT_QUERY: &str = "agent";
 
 /// How this platform spells the key that turns a New Tab row into a split.
 fn split_modifier() -> &'static str {
@@ -781,11 +959,22 @@ fn split_modifier() -> &'static str {
 /// the window sat still is in the list the next time the `+` is pressed.
 struct NewTabMenu {
     app: gpui::WeakEntity<Tty7App>,
-    shells: Vec<(SharedString, ShellSpec)>,
+    /// The shells the menu names, by label — at most [`MENU_SHELLS`].
+    shells: Vec<SharedString>,
     default_shell: SharedString,
+    /// The inventory holds shells the menu does not name, so the section
+    /// closes with a row into the palette.
+    more_shells: bool,
     /// Saved host, its display name, and the `user@host:port` beside it —
     /// empty when the name already says it.
     hosts: Vec<(uuid::Uuid, SharedString, SharedString)>,
+    /// Agents the menu names — at most [`MENU_AGENTS`], and only ones that
+    /// have actually been run.
+    agents: Vec<CLIAgent>,
+    /// The window can offer agents the menu does not name, so the section
+    /// closes with a row into the palette. Also the reason the section exists
+    /// when nothing has been run yet: the installed agents are all in there.
+    more_agents: bool,
 }
 
 impl NewTabMenu {
@@ -808,21 +997,17 @@ impl NewTabMenu {
             // host with a descriptive name and a long `user@host` drags every
             // other row out with it and the menu stops looking like chrome.
             .max_w(MENU_W)
-            // Shells are whatever this machine has plus whatever the user
-            // added by hand, so the row count has no ceiling. Past the height
+            // Both lists are capped, but a short window is not. Past the height
             // of the window an un-scrollable menu simply loses its last rows —
             // and the last rows here are the SSH section.
             .scrollable(true)
-            // Only the overflow case should scroll, and the default ceiling is
-            // too low to tell the two apart: a stock macOS box has nine shells,
-            // which with both headings, the hosts and the two closing rows
-            // already runs past `PopupMenu`'s built-in 450px. The menu would
-            // arrive scrolled on every machine, with `Local` cut off above.
+            // Our own ceiling rather than `PopupMenu`'s built-in 450px, so the
+            // one that applies is the one [`MENU_H`] reasons about.
             .max_h(ceiling)
             .item(PopupMenuItem::label(t(L10nKey::TabMenuLocalShells)));
-        for (label, spec) in &self.shells {
-            let spec = spec.clone();
+        for label in &self.shells {
             let app = self.app.clone();
+            let open = label.clone();
             let row = if *label == self.default_shell {
                 let label = label.clone();
                 PopupMenuItem::element(move |_window, cx| {
@@ -834,9 +1019,7 @@ impl NewTabMenu {
             menu = menu.item(row.on_click(move |_, window, cx| {
                 let at = SpawnWhere::from_modifiers(window.modifiers());
                 if let Some(app) = app.upgrade() {
-                    app.update(cx, |this, cx| {
-                        this.open_shell(Some(spec.clone()), at, window, cx)
-                    });
+                    app.update(cx, |this, cx| this.open_listed_shell(&open, at, window, cx));
                 }
             }));
         }
@@ -849,6 +1032,22 @@ impl NewTabMenu {
                     let at = SpawnWhere::from_modifiers(window.modifiers());
                     if let Some(app) = app.upgrade() {
                         app.update(cx, |this, cx| this.open_shell(None, at, window, cx));
+                    }
+                },
+            ));
+        }
+        // The rest of the inventory is in the search, already filtered to
+        // it — the same seam the SSH section closes with. Absent when the
+        // rows above are the whole inventory: a row into a list of nothing
+        // new would be one more thing to read for no gain.
+        if self.more_shells {
+            let app = self.app.clone();
+            menu = menu.item(PopupMenuItem::new(t(L10nKey::TabMenuOtherShells)).on_click(
+                move |_, window, cx| {
+                    if let Some(app) = app.upgrade() {
+                        app.update(cx, |this, cx| {
+                            this.open_search(SearchTab::Terminals, SEARCH_SHELL_QUERY, window, cx)
+                        });
                     }
                 },
             ));
@@ -893,11 +1092,49 @@ impl NewTabMenu {
                     if empty {
                         this.open_new_ssh_host(window, cx);
                     } else {
-                        this.open_palette(PALETTE_SSH_QUERY, window, cx);
+                        this.open_search(SearchTab::Hosts, "", window, cx);
                     }
                 });
             }
         }));
+
+        // A peer of Local and SSH, and absent when this machine has no agent
+        // to offer — an empty heading would be a section about nothing. The
+        // rows are the ones actually run; the seam holds the rest, already
+        // filtered, the way Other Shells does.
+        if !self.agents.is_empty() || self.more_agents {
+            menu = menu
+                .item(PopupMenuItem::separator())
+                .item(PopupMenuItem::label(t(L10nKey::CmdGroupAgents)));
+            for agent in self.agents.iter().copied() {
+                let app = self.app.clone();
+                menu = menu.item(PopupMenuItem::new(agent.display_name()).on_click(
+                    move |_, window, cx| {
+                        let at = SpawnWhere::from_modifiers(window.modifiers());
+                        if let Some(app) = app.upgrade() {
+                            app.update(cx, |this, cx| this.launch_agent(agent, at, window, cx));
+                        }
+                    },
+                ));
+            }
+            if self.more_agents {
+                let app = self.app.clone();
+                menu = menu.item(PopupMenuItem::new(t(L10nKey::TabMenuOtherAgents)).on_click(
+                    move |_, window, cx| {
+                        if let Some(app) = app.upgrade() {
+                            app.update(cx, |this, cx| {
+                                this.open_search(
+                                    SearchTab::Terminals,
+                                    SEARCH_AGENT_QUERY,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        }
+                    },
+                ));
+            }
+        }
 
         // The one place ⌥ is spelled out. Nothing else in the app teaches it,
         // and a modifier nobody is told about is a feature nobody has. No rule
@@ -908,6 +1145,76 @@ impl NewTabMenu {
             &[("key", split_modifier())],
         )))
     }
+}
+
+/// Every shell in the inventory, most likely first: the default, then whatever
+/// has been opened often and recently, then the rest in the inventory's own
+/// order. Shared by the palette and the New Tab menu so the same shell leads
+/// both lists.
+pub(crate) fn shells_by_frecency<'a>(
+    shells: &'a [DetectedShell],
+    default: &str,
+    usage: &std::collections::HashMap<String, crate::core::config::ProfileUsage>,
+    now: u64,
+) -> Vec<&'a DetectedShell> {
+    let score = |s: &DetectedShell| usage.get(&s.label).map_or(0.0, |u| u.score(now));
+    let mut sorted: Vec<&DetectedShell> = shells.iter().collect();
+    // Stable, so shells nobody has opened keep the order the inventory chose.
+    sorted.sort_by(|a, b| {
+        (b.label == default)
+            .cmp(&(a.label == default))
+            .then_with(|| {
+                score(b)
+                    .partial_cmp(&score(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    sorted
+}
+
+/// The shells the menu names, off the front of [`shells_by_frecency`]'s list:
+/// its head — the default, whenever the inventory has it — and then only
+/// shells that have actually been opened, [`MENU_SHELLS`] rows in all.
+///
+/// A shell nobody has opened is not named just because there is room: a menu
+/// that filled its spare rows with `csh` and `tcsh` would be the nine-row list
+/// again, only shorter.
+fn menu_shells<'a>(
+    sorted: &[&'a DetectedShell],
+    default: &str,
+    usage: &std::collections::HashMap<String, crate::core::config::ProfileUsage>,
+    now: u64,
+) -> Vec<&'a DetectedShell> {
+    sorted
+        .iter()
+        .take(MENU_SHELLS)
+        .enumerate()
+        .filter(|(i, s)| {
+            *i == 0 || s.label == default || usage.get(&s.label).is_some_and(|u| u.score(now) > 0.0)
+        })
+        .map(|(_, s)| *s)
+        .collect()
+}
+
+/// The agents the menu names, off the front of the frecency-ordered list
+/// quick launch already built: only those that have actually been run, at
+/// most [`MENU_AGENTS`].
+///
+/// An agent nobody has run is not named just because it is installed and
+/// there is room. A zero count is not a use either — launching stamps
+/// recency before the pane reports the agent, and the count is what says it
+/// really ran. `offered` is already most-used-first; this does not reorder.
+fn menu_agents(
+    offered: &[CLIAgent],
+    usage: &std::collections::HashMap<String, crate::core::config::ProfileUsage>,
+    now: u64,
+) -> Vec<CLIAgent> {
+    offered
+        .iter()
+        .copied()
+        .filter(|agent| usage.get(agent.slug()).is_some_and(|u| u.score(now) > 0.0))
+        .take(MENU_AGENTS)
+        .collect()
 }
 
 /// The hosts the menu names, in the order they were handed over — frecency,
@@ -945,10 +1252,19 @@ fn menu_hosts(
 /// Both halves are cut rather than allowed to push: the panel stops at
 /// [`MENU_W`], and a descriptive host name next to a long `user@host:port`
 /// asks for more than that. Which half gives way is the whole point — the name
-/// is what the reader is picking by, so the endpoint is capped at half the row
-/// and elides first, and the name takes everything left over. Sized the other
-/// way round (name growing from nothing, endpoint at its natural width) a long
-/// address squeezes the name down to `..` and the row names nothing at all.
+/// is what the reader is picking by, so it keeps its width up to
+/// [`MENU_NAME_W`], and the endpoint takes whatever is left and elides first.
+/// Sized the other way round (name growing from nothing, endpoint at its
+/// natural width) a long address squeezes the name down to `..` and the row
+/// names nothing at all.
+///
+/// Both caps are fixed lengths, never a share of the row. The panel is sized
+/// to fit its content, so while the text is laid out no row has a width yet:
+/// anything capped by `relative(..)` or by flex shrinking measures at full
+/// length, is squeezed afterwards, and is clipped mid-glyph at the panel edge
+/// (`git@ssh.github.con`) instead of ending in an ellipsis. A pixel cap is
+/// known up front, so the text elides against it. The two caps and the row's
+/// insets add up to [`MENU_W`].
 ///
 /// An empty note drops the right half entirely rather than leaving a zero-width
 /// child to hold the `gap_3` open — the name is then free to use the full row,
@@ -960,18 +1276,42 @@ fn menu_row(label: SharedString, note: SharedString, cx: &gpui::App) -> impl Int
         .items_center()
         .justify_between()
         .gap_3()
-        .child(div().flex_1().min_w_0().truncate().child(label))
+        .child(
+            div()
+                .flex_shrink_0()
+                .max_w(match note.is_empty() {
+                    true => MENU_W - MENU_ROW_INSET,
+                    false => MENU_NAME_W,
+                })
+                .truncate()
+                .child(label),
+        )
         .when(!note.is_empty(), |this| {
+            // Pushed right by the cell, not by `text_right`: a line set
+            // with `truncate` ignores its alignment and hugs the name.
             this.child(
-                div()
-                    .flex_shrink_0()
-                    .max_w(relative(0.5))
-                    .truncate()
-                    .text_color(muted)
-                    .child(note),
+                h_flex().flex_1().justify_end().child(
+                    div()
+                        .max_w(MENU_NOTE_W)
+                        .truncate()
+                        .text_color(muted)
+                        .child(note),
+                ),
             )
         })
 }
+
+/// The most of a [`menu_row`] its name keeps before it elides — the larger
+/// share, since the name is what the row is picked by.
+const MENU_NAME_W: Pixels = px(172.);
+
+/// The most the endpoint beside a name gets: room for `user@host:port` on a
+/// typical host, and the gap and the insets take the rest of [`MENU_W`].
+const MENU_NOTE_W: Pixels = px(150.);
+
+/// What the panel spends on either side of a row's content: its own 5px
+/// inset and the row's 8px padding, twice.
+const MENU_ROW_INSET: Pixels = px(26.);
 
 /// The words behind the status dot's colour.
 pub(crate) fn agent_status_label(
@@ -1047,7 +1387,7 @@ pub(crate) fn select_workspace_action(index: usize) -> Option<Box<dyn gpui::Acti
 }
 
 impl Tty7App {
-    pub(crate) const AVATAR_PX: f32 = 20.0;
+    pub(crate) const AVATAR_PX: f32 = 18.0;
 
     pub(crate) fn workspace_head(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         if let Some(rename) = self.workspace_rename.as_ref() {
@@ -1141,7 +1481,12 @@ impl Tty7App {
                     .xsmall()
                     .w_full()
                     .h(px(28.))
-                    .rounded_md()
+                    .rounded(px(7.))
+                    // Button pins the arrow for every non-link variant; the
+                    // switcher's own rows point, so the tile that opens them
+                    // does too.
+                    .cursor_pointer()
+                    .accessible_label(t(L10nKey::HomeSwitchWorkspace))
                     .tooltip_element(chord_tooltip(
                         t(L10nKey::HomeSwitchWorkspace),
                         "ToggleSwitcher",
@@ -1154,59 +1499,38 @@ impl Tty7App {
             .into_any_element()
     }
 
-    pub(crate) fn app_menu_tile(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let action_ctx = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.pane.focused_or_first(window, cx))
-            .map(|leaf| leaf.read(cx).focus_handle.clone())
-            .unwrap_or_else(|| self.home_focus.clone());
-        div().occlude().flex_shrink_0().child(
-            chrome_tile(
-                Button::new("titlebar-app-menu").icon(IconName::Ellipsis),
-                false,
-                cx,
-            )
-            .rounded_lg()
-            .tooltip(t(L10nKey::TabTooltipMore))
-            .dropdown_menu_with_anchor(
-                gpui::Anchor::TopRight,
-                move |menu, _window, _cx| {
-                    menu.min_w(px(200.))
-                        .action_context(action_ctx.clone())
-                        .menu(t(L10nKey::AppMenuCommandPalette), Box::new(TogglePalette))
-                        .menu(t(L10nKey::AppMenuSettings), Box::new(OpenSettings))
-                },
-            ),
-        )
-    }
-
     /// Persistent window controls, including when either sidebar is collapsed.
-    pub(crate) fn window_chrome(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    pub(crate) fn window_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let trailing = match cfg!(target_os = "macos") {
+            true => tile_trailing_inset(),
+            false => 4.,
+        };
+        // Opening the panel moves this control to the panel's header on
+        // macOS. Reuse the same tile and inset there: a different hit target
+        // moves the centred glyph even when the icon itself keeps its size.
         let panel_open = self.right_panel_open(cx);
         h_flex()
             .flex_shrink_0()
             .items_center()
-            .gap(px(2.))
-            .pr(px(tile_trailing_inset()))
-            .when(!cfg!(target_os = "macos"), |this| this.pr_1())
+            .pr(px(trailing))
             .child(
                 div().occlude().flex_shrink_0().child(
                     chrome_tile(
                         Button::new("titlebar-right-panel")
-                            .icon(Icon::empty().path("icons/panel-right.svg")),
+                            // Keep the outline fixed; only the panel region's
+                            // fill changes to show whether the panel is visible.
+                            .icon(Icon::empty().path(match panel_open {
+                                true => "icons/panel-right.svg",
+                                false => "icons/panel-right-collapsed.svg",
+                            })),
                         false,
                         cx,
                     )
                     .rounded_lg()
+                    .accessible_label(match panel_open {
+                        true => t(L10nKey::TabTooltipHideDetailPanel),
+                        false => t(L10nKey::TabTooltipShowDetailPanel),
+                    })
                     .tooltip_element(chord_tooltip(
                         match panel_open {
                             true => t(L10nKey::TabTooltipHideDetailPanel),
@@ -1220,7 +1544,7 @@ impl Tty7App {
                     // destroys the element holding the focus — and a keymap
                     // scoped to a focused thing goes quiet with it, leaving the
                     // ⌘J that would undo this doing nothing. Hand the terminal
-                    // back what it lost, the same way the tab tiles below do.
+                    // back what it lost.
                     .on_click(cx.listener(|this, _, window, cx| {
                         let closing = this.right_panel_open(cx);
                         this.toggle_right_panel(cx);
@@ -1230,127 +1554,58 @@ impl Tty7App {
                     })),
                 ),
             )
-            .child(self.app_menu_tile(window, cx))
     }
 
-    /// The right panel's word tabs, laid out in `avail` px.
-    ///
-    /// A label is never elided — "C…" is not a tab anyone can read — so when
-    /// the row runs short the Changes count is what gives way: it repeats what
-    /// the panel body says, the label does not. `right_panel::MIN_WIDTH` is
-    /// what guarantees the three bare labels always fit.
-    pub(crate) fn right_panel_tabs(
-        &self,
-        avail: f32,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
+    /// The right panel's tabs: words, the current one in body ink and medium
+    /// weight on a pill (ink and weight alone read as no selection at all).
+    /// Four names fit the panel's resting width once Search folded into Files.
+    pub(crate) fn right_panel_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let active_tab = self.right_panel_tab;
-        // The count the source control tile carries. It reads the same status
-        // the panel draws, so the badge and the group headers can never
-        // disagree — and it counts entries, not files, because a path that is
-        // both staged and modified is two things to do, which is what the
-        // groups show.
-        let changed = self
-            .scm
-            .active_repo()
-            .and_then(|repo| crate::terminal::git_data::status_of(cx, repo.host, &repo.root))
-            .map(|status| status.entries.len())
-            .filter(|n| *n > 0);
-        let hover = gpui::rgb(cx.global::<crate::ui::presets::Surfaces>().sidebar.hover);
-        let size = right_panel_tab_size(window);
-        let font = right_panel_tab_font(cx);
-        let ts = window.text_system();
-        let labels_w = right_panel_tab_labels_w(window, cx);
-        let changed = changed.filter(|n| {
-            let regular = gpui::Font {
-                weight: FontWeight::NORMAL,
-                ..font.clone()
-            };
-            labels_w + TAB_COUNT_GAP + measure_text(ts, &regular, size, &n.to_string()) <= avail
-        });
+        let body_ink = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
         RIGHT_PANEL_TABS
             .into_iter()
             .map(|(tab, label_key)| {
                 let current = active_tab == tab;
-                // Words, not glyphs: three tabs is few enough to name, and a name
-                // is what a new user has to guess at when the tab is an icon. The
-                // current one is told apart by ink and the bar under it, both
-                // neutral — this is secondary navigation, not an action.
                 let ink = match current {
-                    true => cx.theme().foreground,
-                    false => cx.theme().muted_foreground,
-                };
-                let count = match tab {
-                    RightPanelTab::Scm => changed,
-                    _ => None,
+                    true => body_ink,
+                    false => muted,
                 };
                 div()
                     .id(("right-panel-tab", tab as usize))
+                    .role(gpui::Role::Tab)
+                    .aria_label(t(label_key))
+                    .aria_selected(current)
                     // The press must not start a window drag from the title bar
                     // the tabs sit in.
                     .occlude()
                     .flex_shrink_0()
-                    // Full height and `relative` so the bar below can be pinned to
-                    // the row's own bottom edge, where it lands on the hairline
-                    // that closes the row rather than floating under the label.
                     .h_full()
-                    .relative()
                     .flex()
                     .items_center()
                     .px(px(TAB_OUTER_PAD))
                     .cursor_pointer()
                     .child(
-                        h_flex()
-                            .flex_shrink_0()
-                            .h(px(crate::ui::app::TILE_SIZE_SM + 2.))
-                            .px(px(TAB_INNER_PAD))
-                            .gap(px(TAB_COUNT_GAP))
-                            .items_center()
-                            .rounded_full()
-                            .hover(|s| s.bg(hover))
-                            .text_size(gpui::rems(crate::ui::right_panel::META))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(ink)
-                            .child(div().flex_shrink_0().child(t(label_key)))
-                            .when_some(count, |row, n| {
-                                row.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .font_weight(FontWeight::NORMAL)
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(n.to_string()),
-                                )
-                            }),
-                    )
-                    .child(
                         div()
-                            .absolute()
-                            .bottom(px(-1.))
-                            .left(px(TAB_OUTER_PAD + TAB_INNER_PAD))
-                            .right(px(TAB_OUTER_PAD + TAB_INNER_PAD))
-                            .h(px(2.))
-                            .rounded_full()
-                            .when(current, |bar| bar.bg(cx.theme().foreground)),
+                            .flex_shrink_0()
+                            .px(px(TAB_INNER_PAD))
+                            .py_0p5()
+                            .rounded_md()
+                            .when(current, |s| s.bg(cx.theme().secondary))
+                            .text_size(gpui::rems(crate::ui::right_panel::TAB_TEXT))
+                            .font_weight(match current {
+                                true => FontWeight::MEDIUM,
+                                false => FontWeight::NORMAL,
+                            })
+                            .text_color(ink)
+                            .hover(move |s| s.text_color(body_ink))
+                            .child(t(label_key)),
                     )
-                    // Another tab switches to it; the current one puts the panel
-                    // away, the way an activity bar behaves everywhere else.
-                    // (These only exist while the panel is open, so
-                    // `ToggleRightPanel` and the chrome tile beside them are still
-                    // what brings it back.)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        match this.right_panel_open(cx) && this.right_panel_tab == tab {
-                            true => {
-                                this.toggle_right_panel(cx);
-                                // These tabs live inside the panel, so closing
-                                // from one destroys the element that holds the
-                                // focus and leaves it nowhere — and a keymap whose
-                                // bindings are scoped to a focused thing goes
-                                // quiet with it. Hand the terminal back what it
-                                // lost.
-                                this.focus_active(window, cx);
-                            }
-                            false => this.set_right_panel_tab(tab, cx),
+                    // The current one does nothing: only ⌘J and the title-bar
+                    // panel tile put the panel away.
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.right_panel_tab != tab {
+                            this.set_right_panel_tab(tab, cx);
                         }
                     }))
                     .into_any_element()
@@ -1426,98 +1681,110 @@ impl Tty7App {
         size: f32,
         cx: &App,
     ) -> gpui::AnyElement {
-        // The wrapper positions; the disc below carries the radius.
-        // `status_dot` hangs itself off the edge with negative offsets — that
-        // overhang is what makes it a badge on the avatar rather than a notch
-        // in it — and as a child of the rounded element the overhang was
-        // clipped along the arc, leaving a crescent.
-        let base = div().id(id).flex_shrink_0().relative().size(px(size));
-        // Fill, hairline and mark all live here, so the radius only ever clips
-        // the disc's own paint.
-        let disc = || {
-            div()
-                .size(px(size))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_full()
+        self.tab_avatar_badged(id, agent, status, unread, attention, ssh, size, true, cx)
+    }
+
+    /// The avatar without the agent's status badge, for a row that says the
+    /// status at its trailing end instead (see [`row_status_dot`]). The
+    /// tooltip still names the state; the SSH dot on a shell stays, since it
+    /// describes the connection rather than an agent's run.
+    ///
+    /// [`row_status_dot`]: Self::row_status_dot
+    pub(crate) fn tab_avatar_plain(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        agent: Option<crate::core::cli_agent::CLIAgent>,
+        status: Option<crate::core::cli_agent::AgentStatus>,
+        _unread: usize,
+        attention: bool,
+        ssh: Option<u32>,
+        size: f32,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        self.tab_avatar_badged(id, agent, status, 0, attention, ssh, size, false, cx)
+    }
+
+    /// A row's trailing status mark: a 5px dot in the state's colour, hollow
+    /// while the agent waits on the user, blinking while it works — or the
+    /// unread count in a small pill once there is something to read. `None`
+    /// for a row with nothing to report.
+    pub(crate) fn row_status_dot(
+        &self,
+        status: Option<crate::core::cli_agent::AgentStatus>,
+        unread: usize,
+        surface: gpui::Hsla,
+    ) -> Option<gpui::AnyElement> {
+        let rgb = status.and_then(|s| s.dot_rgb())?;
+        let hollow = status == Some(crate::core::cli_agent::AgentStatus::Waiting);
+        let faded =
+            status == Some(crate::core::cli_agent::AgentStatus::Working) && !self.working_dot_on;
+        let ink: gpui::Hsla = gpui::rgb(rgb).into();
+        let fill = match faded {
+            true => surface.blend(ink.opacity(0.4)),
+            false => ink,
         };
-        match agent {
-            Some(agent) => {
-                use crate::core::cli_agent::AgentStatus;
-                let needs_attention = attention || status == Some(AgentStatus::Waiting);
-                let dot_status = if needs_attention {
-                    Some(AgentStatus::Waiting)
-                } else {
-                    status
-                };
-                let dot = dot_status.and_then(|s| s.dot_rgb()).map(|rgb| {
-                    // Attention keeps the solid orange dot; only Working blinks.
-                    let faded = dot_status == Some(AgentStatus::Working) && !self.working_dot_on;
-                    Self::status_dot(
-                        rgb,
-                        if needs_attention { 0 } else { unread },
-                        size,
-                        cx.theme().background,
-                        faded,
-                    )
-                });
-                // Which agent this is, and what it wants, were carried entirely
-                // by a brand hue and a nine-pixel dot. Say it in words too.
-                let mut tip = match agent_status_label(status) {
-                    Some(state) => format!("{} — {state}", agent.display_name()),
-                    None => agent.display_name().to_string(),
-                };
-                if attention && status != Some(AgentStatus::Waiting) {
-                    tip.push_str(&format!(" · {}", t(L10nKey::AgentStatusAttention)));
-                }
-                // The disc is a solid fill of the agent's brand on every
-                // row, lit or not: a tint reads as a disabled tab, and the
-                // colour is how the eye tells one agent from another down a
-                // column of twenty.
-                let accent = agent.accent_rgb();
-                let surface = cx.theme().background;
-                base.child(
-                    disc()
-                        .bg(gpui::rgb(accent))
-                        // Codex and Grok are both pure black, which is the
-                        // window fill on a dark theme — the disc dissolves and
-                        // leaves the glyph floating. A hairline keeps it a disc
-                        // in any theme.
-                        .when(crate::ui::presets::needs_edge(accent, surface), |d| {
-                            d.border_1().border_color(cx.theme().border)
-                        })
-                        .child(
-                            gpui::svg()
-                                .path(agent.icon_path())
-                                .size(px(size * 0.54))
-                                // SVG assets render as a single-colour mask, so
-                                // the mark's colour comes from the agent rather
-                                // than from the file. The tray icon reads the
-                                // same answer.
-                                .text_color(gpui::rgb(agent.icon_rgb())),
-                        ),
-                )
-                .when_some(dot, |b, dot| b.child(dot))
-                .tooltip(move |window, cx| {
-                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                })
-                .into_any_element()
+        let slot = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .min_w(px(ROW_STATUS_SLOT));
+        Some(
+            match unread > 0 {
+                true => slot.child(
+                    div()
+                        .h(px(14.))
+                        .min_w(px(14.))
+                        .px(px(3.))
+                        .rounded_full()
+                        .bg(fill)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(9.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(gpui::white())
+                        .child(unread.min(9).to_string()),
+                ),
+                false => slot.child(
+                    div()
+                        .size(px(ROW_STATUS_DOT))
+                        .rounded_full()
+                        .when(!hollow, |d| d.bg(fill))
+                        .when(hollow, |d| d.border_1().border_color(fill)),
+                ),
             }
-            None => base
-                .child(
-                    disc().bg(cx.theme().muted).child(
-                        gpui::svg()
-                            .path("icons/terminal.svg")
-                            .size(px(size * 0.56))
-                            .text_color(cx.theme().foreground.opacity(0.65)),
-                    ),
-                )
-                .when_some(ssh, |b, rgb| {
-                    b.child(Self::status_dot(rgb, 0, size, cx.theme().background, false))
-                })
-                .into_any_element(),
-        }
+            .into_any_element(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tab_avatar_badged(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        agent: Option<crate::core::cli_agent::CLIAgent>,
+        status: Option<crate::core::cli_agent::AgentStatus>,
+        unread: usize,
+        attention: bool,
+        ssh: Option<u32>,
+        size: f32,
+        badge: bool,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        avatar_disc(
+            id,
+            crate::ui::search::Avatar {
+                agent,
+                status,
+                unread,
+                attention,
+                ssh,
+            },
+            size,
+            self.working_dot_on,
+            badge,
+            cx,
+        )
     }
 
     /// The mark a tab wears while one of its panes is zoomed over the others
@@ -1527,6 +1794,24 @@ impl Tty7App {
     /// Drawn in the tab entry rather than on the pane so it reads from either
     /// tab surface, and so it says something about the tabs you are *not*
     /// looking at — the zoom outlives a switch away from them.
+    /// The mark a sleeping tab carries (#762), in the slot the zoom mark uses:
+    /// leading, beside the other state marks, where the pointer that comes to
+    /// read it does not cover it.
+    pub(crate) fn sleep_mark(&self, id: impl Into<gpui::ElementId>, cx: &App) -> gpui::AnyElement {
+        let tip = SharedString::from(t(L10nKey::TabTooltipAsleep));
+        div()
+            .id(id)
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(16.))
+            .text_color(cx.theme().muted_foreground)
+            .child(Icon::new(IconName::Moon).size(px(11.)))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .into_any_element()
+    }
+
     pub(crate) fn zoom_mark(&self, id: impl Into<gpui::ElementId>, cx: &App) -> gpui::AnyElement {
         let tip = chord_tooltip(t(L10nKey::TabTooltipZoomed), "ToggleMaximizePane", cx);
         div()
@@ -1592,6 +1877,37 @@ impl Tty7App {
         )
     }
 
+    /// The same ladder as [`tab_label`](Self::tab_label), left whole: a path
+    /// is only abbreviated under the home and stripped of its `user@host:`,
+    /// never cut down to its last segments. For the surfaces with room to
+    /// spare — the rail's rows and the centred title — where only the width
+    /// they have may decide what gets elided, not a segment count picked for
+    /// the chips. `None` when there is nothing to say and the caller should
+    /// fall back to its own placeholder.
+    pub(crate) fn full_tab_label(
+        &self,
+        tab: &Tab,
+        window: Option<&Window>,
+        cx: &App,
+    ) -> Option<String> {
+        use crate::ui::machine_mirror::TabLabel;
+
+        if let Some(name) = tab.name.as_ref().filter(|n| !n.trim().is_empty()) {
+            return Some(name.trim().to_string());
+        }
+        let (view, home) = tab.label_view(window, cx);
+        let raw = match view.label() {
+            TabLabel::Osc(title) | TabLabel::Cwd(title) => {
+                abbreviate_home(strip_host_prefix(title.trim()), home.as_deref()).into_owned()
+            }
+            TabLabel::Agent(agent) => agent.display_name().to_string(),
+            TabLabel::Named(name) => name.to_string(),
+            TabLabel::Process(title) => title.to_string(),
+            TabLabel::Unknown => String::new(),
+        };
+        (!raw.trim().is_empty()).then_some(raw)
+    }
+
     /// The New Tab control: one `+` that drops the list of everything it could
     /// open — the installed shells, and the saved SSH hosts.
     ///
@@ -1610,41 +1926,98 @@ impl Tty7App {
         id: &'static str,
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
+        self.new_tab_button_sized(id, crate::ui::app::TILE_SIZE, cx)
+    }
+
+    /// [`new_tab_button`](Self::new_tab_button) at another tile size — the
+    /// document header can use a smaller tile without changing the title bar.
+    pub(crate) fn new_tab_button_sized(
+        &self,
+        id: &'static str,
+        tile: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement + use<> {
         let app = cx.entity().downgrade();
-        chrome_tile(Button::new(id).icon(Icon::new(IconName::Plus)), false, cx)
-            .rounded_lg()
-            // Every other tile in this row names itself on hover — Switch
-            // Workspace, More, Hide Sidebar. The three New Tab buttons that
-            // come through here were the ones left silent. The chord is worth
-            // more here than anywhere else in the row: it is the way back to
-            // opening a tab without reading a menu first.
-            .tooltip_element(chord_tooltip(t(L10nKey::AppMenuNewTab), "NewTab", cx))
-            // Built when the menu opens, not when the strip draws: this
-            // closure runs once per press, and again after each dismissal.
-            .dropdown_menu(move |menu, window, cx| {
-                let Some(this) = app.upgrade() else {
-                    return menu;
-                };
-                this.read(cx)
-                    .new_tab_menu_rows(app.clone(), cx)
-                    .build(menu, window)
-            })
+        let glyph = match tile < crate::ui::app::TILE_SIZE {
+            true => RAIL_TILE_GLYPH,
+            false => TILE_GLYPH,
+        };
+        chrome_tile_sized(
+            Button::new(id).icon(Icon::new(IconName::Plus)),
+            tile,
+            glyph,
+            false,
+            cx,
+        )
+        .rounded(px(RAIL_TILE_RADIUS))
+        // Every other tile in this row names itself on hover — Switch
+        // Workspace, More, Hide Sidebar. The three New Tab buttons that
+        // come through here were the ones left silent. The chord is worth
+        // more here than anywhere else in the row: it is the way back to
+        // opening a tab without reading a menu first.
+        .accessible_label(t(L10nKey::AppMenuNewTab))
+        .tooltip_element(chord_tooltip(t(L10nKey::AppMenuNewTab), "NewTab", cx))
+        // Built when the menu opens, not when the strip draws: this
+        // closure runs once per press, and again after each dismissal.
+        .dropdown_menu(move |menu, window, cx| {
+            let Some(this) = app.upgrade() else {
+                return menu;
+            };
+            this.read(cx)
+                .new_tab_menu_rows(app.clone(), cx)
+                .build(menu, window)
+        })
     }
 
     /// What the menu offers, read off the app as the menu opens — the builder
     /// runs on the popup's own entity, so the rows carry a weak handle back.
     fn new_tab_menu_rows(&self, app: gpui::WeakEntity<Self>, cx: &App) -> NewTabMenu {
+        let default_shell = self.default_shell_label(cx);
+        let usage = &cx.global::<Config>().shell_frecency;
+        let now = crate::core::config::unix_now();
+        let sorted = shells_by_frecency(&self.shells.shells, &default_shell, usage, now);
+        let shells = menu_shells(&sorted, &default_shell, usage, now);
+        let offered = self.offered_agents(cx);
+        let agents = menu_agents(&offered, &cx.global::<Config>().agent_frecency, now);
         NewTabMenu {
             app,
-            shells: self
-                .shells
-                .shells
-                .iter()
-                .map(|s| (SharedString::from(s.label.clone()), shell_spec(s)))
+            more_shells: shells.len() < sorted.len(),
+            shells: shells
+                .into_iter()
+                .map(|s| SharedString::from(s.label.clone()))
                 .collect(),
-            default_shell: SharedString::from(self.default_shell_label(cx)),
+            default_shell: SharedString::from(default_shell),
             hosts: menu_hosts(crate::ui::ssh_connect::ssh_profiles_by_frecency(cx)),
+            more_agents: agents.len() < offered.len(),
+            agents,
         }
+    }
+
+    /// Open the inventory's shell by the label it is listed under, wherever
+    /// `at` says — the New Tab menu's rows and the palette's `Shell:` commands
+    /// both land here, so both count toward the frecency that orders them.
+    pub(crate) fn open_listed_shell(
+        &mut self,
+        label: &str,
+        at: SpawnWhere,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(spec) = self
+            .shells
+            .shells
+            .iter()
+            .find(|s| s.label == label)
+            .map(shell_spec)
+        else {
+            return;
+        };
+        self.update_config(cx, |cfg| {
+            let entry = cfg.shell_frecency.entry(label.to_string()).or_default();
+            entry.count = entry.count.saturating_add(1);
+            entry.last_used = crate::core::config::unix_now();
+        });
+        self.open_shell(Some(spec), at, window, cx);
     }
 
     pub(crate) fn tab_context_menu(
@@ -1652,13 +2025,25 @@ impl Tty7App {
         index: usize,
         below_wording: bool,
         app: &gpui::WeakEntity<Self>,
-        window: &Window,
-        cx: &App,
+        window: &mut Window,
+        cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
         let Some(entity) = app.upgrade() else {
             return menu;
         };
         let this = entity.read(cx);
+        // Taken before `this` is let go for the Move to Group submenu below.
+        let sidebar =
+            cx.global::<Config>().tab_bar_position == crate::core::config::TabBarPosition::Left;
+        let move_targets = sidebar.then(|| {
+            let keys = this.sidebar_group_keys(cx);
+            crate::ui::tab_sidebar::move_targets(&keys, &this.sidebar_groups, index)
+        });
+        let in_kept_group = this
+            .tabs
+            .get(index)
+            .and_then(|t| t.group.get())
+            .is_some_and(|g| this.sidebar_groups.contains(g));
         let tab_count = this.tabs.len();
         let cwd = this.tab_cwd_text(index, window, cx);
         let has_cwd = cwd.is_some();
@@ -1698,60 +2083,103 @@ impl Tty7App {
             );
         }
 
-        // Where this tab sits, and where it could be put instead.
-        //
-        // Laid out flat rather than behind a "Move to Group ▸" submenu: there
-        // are never many custom groups — they are maintained by hand — so a
-        // submenu would cost a second click to show two or three items, and
-        // `PopupMenu::submenu` wants a `&mut Context` this function does not
-        // have. The label above them says what the block is.
-        //
-        // Hidden entirely when grouping is off. The sidebar draws no headers
-        // then, so "move to group" would name something the user cannot see.
-        if cx.global::<Config>().sidebar_grouping != SidebarGrouping::None {
-            let stated = this
-                .tabs
-                .get(index)
-                .and_then(|t| t.sidebar_group.borrow().clone());
-            let here = match &stated {
-                Some(GroupKey::Custom(name)) => Some(name.clone()),
-                _ => None,
-            };
-            menu = menu
-                .separator()
-                .item(PopupMenuItem::label(t(L10nKey::SidebarMoveToGroup)));
-            for name in this.custom_group_names() {
-                menu = menu.item(
-                    PopupMenuItem::new(name.clone())
-                        .checked(here.as_deref() == Some(name.as_str()))
-                        .on_click({
-                            let app = app.clone();
-                            let name = name.clone();
-                            move |_, _window, cx| {
-                                let key = GroupKey::custom(&name);
-                                let _ =
-                                    app.update(cx, |this, cx| this.set_tab_group(index, key, cx));
-                            }
-                        }),
-                );
-            }
-            menu = menu.item(PopupMenuItem::new(t(L10nKey::SidebarNewGroup)).on_click({
+        // Sleep and wake (#762). Waking is also what selecting the tab does;
+        // the item is here for waking one without leaving the tab on screen.
+        // Hibernate is offered only where the machine can do it, and greyed
+        // out for a tab it cannot be done to right now — the last one awake,
+        // or one still connecting — rather than vanishing from under the
+        // pointer that came looking for it.
+        if tab.is_some_and(|t| t.is_asleep()) {
+            menu = menu.item(PopupMenuItem::new(t(L10nKey::TabContextWake)).on_click({
                 let app = app.clone();
                 move |_, window, cx| {
-                    let _ = app.update(cx, |this, cx| this.new_tab_group(index, window, cx));
+                    let _ = app.update(cx, |this, cx| this.wake_tab(index, window, cx));
                 }
             }));
-            // Only worth offering once there is something to undo. A tab that
-            // never left its derived group is already grouped automatically.
-            if here.is_some() {
-                menu = menu.item(PopupMenuItem::new(t(L10nKey::SidebarAutoGroup)).on_click({
-                    let app = app.clone();
-                    move |_, _window, cx| {
-                        let _ = app.update(cx, |this, cx| this.set_tab_group(index, None, cx));
-                    }
-                }));
-            }
+        } else if crate::ui::tree_sync::can_hibernate_on(cx, this.workspace) {
+            menu = menu.item(
+                PopupMenuItem::new(t(L10nKey::TabContextHibernate))
+                    .action(Box::new(HibernateTab))
+                    .disabled(!this.can_hibernate_tab(index, cx))
+                    .on_click({
+                        let app = app.clone();
+                        move |_, window, cx| {
+                            let _ =
+                                app.update(cx, |this, cx| this.hibernate_tab(index, window, cx));
+                        }
+                    }),
+            );
         }
+
+        // Where this tab sits, and where it could be put instead: every group
+        // the sidebar draws, auto ones included, behind a submenu — a sidebar
+        // grouping by repo can hold dozens, far too many to lay out flat.
+        //
+        // An auto group's membership is its tabs' cwds, so a tab can only be
+        // put in one by keeping the group: picking it pins the group (as its
+        // header's pin does) and the tab with it. Remove from Group, offered
+        // only for a tab kept in a group, hands it back to auto grouping.
+        //
+        // Offered only with the tabs in the sidebar — a group is something the
+        // sidebar draws, and "move to group" from the top tab bar would name
+        // something the user cannot see.
+        if let Some(targets) = move_targets {
+            let app = app.clone();
+            menu = menu.separator().submenu(
+                t(L10nKey::SidebarMoveToGroup),
+                window,
+                cx,
+                move |sub, _window, _cx| {
+                    // A left check makes every row of the menu reserve a
+                    // check column, so the whole submenu sat one icon's
+                    // width right of the tab menu beside it. On the right,
+                    // its labels line up with the parent's.
+                    let mut sub = sub.check_side(Side::Right);
+                    for (i, target) in targets.iter().enumerate() {
+                        // Pinned groups, then the auto ones, as the divider
+                        // splits them in the sidebar.
+                        if i > 0 && targets[i - 1].key.is_pinned() && !target.key.is_pinned() {
+                            sub = sub.separator();
+                        }
+                        let mut item =
+                            PopupMenuItem::new(target.name.clone()).checked(target.checked);
+                        if !target.checked {
+                            let app = app.clone();
+                            let key = target.key.clone();
+                            item = item.on_click(move |_, _window, cx| {
+                                let _ = app.update(cx, |this, cx| {
+                                    this.move_tab_to(index, key.clone(), cx)
+                                });
+                            });
+                        }
+                        sub = sub.item(item);
+                    }
+                    if !targets.is_empty() {
+                        sub = sub.separator();
+                    }
+                    let remove = app.clone();
+                    let new = app.clone();
+                    sub.item(
+                        PopupMenuItem::new(t(L10nKey::SidebarRemoveFromGroup))
+                            .disabled(!in_kept_group)
+                            .on_click(move |_, _window, cx| {
+                                let _ = remove
+                                    .update(cx, |this, cx| this.set_tab_group(index, None, cx));
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(t(L10nKey::SidebarNewGroup)).on_click(
+                            move |_, window, cx| {
+                                let _ = new
+                                    .update(cx, |this, cx| this.new_tab_group(index, window, cx));
+                            },
+                        ),
+                    )
+                },
+            );
+        }
+        // Read again: the submenu above needed `cx` mutably.
+        let this = entity.read(cx);
 
         let in_repo = this.tab_is_in_repo(index, window, cx);
         if in_repo {
@@ -2009,7 +2437,8 @@ impl Tty7App {
             let label = self.tab_label(tab, i, Some(window), cx);
             let full_title = self.tab_title_tooltip(tab, i, Some(window), cx);
             let ssh_dot = self.tab_ssh_dot(tab, cx);
-            let agent = tab.agent(cx);
+            let asleep = tab.is_asleep();
+            let agent = tab.agent(cx).or_else(|| tab.asleep_agent());
             let agent_status = tab.agent_status(cx);
             let agent_unread = tab.agent_unread_count(cx);
             let agent_attention = tab.agent_attention_unread(cx);
@@ -2031,7 +2460,10 @@ impl Tty7App {
                     // the field would reach the chip behind it and switch away
                     // from the name being typed, taking the focus with it.
                     .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(Input::new(&input).appearance(false))
+                    // No inset of its own: the label it replaces starts
+                    // flush, and the field's 12px padding jumped the name
+                    // sideways the moment rename began.
+                    .child(Input::new(&input).appearance(false).px_0())
                     .into_any_element(),
                 None => div()
                     .id(("tab-label", i))
@@ -2090,6 +2522,9 @@ impl Tty7App {
                     s.text_color(cx.theme().muted_foreground)
                         .hover(|s| s.bg(cx.theme().muted))
                 })
+                // Faded as well as marked: a row of chips is read at a glance,
+                // and the tabs holding nothing should be the quiet ones.
+                .when(asleep, |s| s.opacity(0.6))
                 .when(dragged, |s| s.opacity(0.75))
                 .child(
                     canvas(
@@ -2148,6 +2583,9 @@ impl Tty7App {
                 // pointer that came to read it.
                 .when(zoomed, |chip| {
                     chip.child(self.zoom_mark(("tab-zoom", i), cx))
+                })
+                .when(asleep, |chip| {
+                    chip.child(self.sleep_mark(("tab-asleep", i), cx))
                 })
                 .child(label_region)
                 .when(show_badges && i < 9, |chip| {
@@ -2244,6 +2682,13 @@ impl Tty7App {
             .flex_shrink_0()
             .child(self.new_tab_button("tab-add", cx));
 
+        // Same bargain the rail's own tiles keep when the Appearance switch is
+        // on: present in the layout, painted only while the pointer is on the
+        // bar. The New Tab button that trails the chips is left alone — it is
+        // part of the row of tabs, not of the window's chrome.
+        let auto_hide_chrome = cx.global::<Config>().auto_hide_titlebar_buttons;
+        let strip_chrome_shown =
+            crate::ui::app::titlebar_chrome_shown(auto_hide_chrome, self.strip_chrome_hover.get());
         let rail_collapsed = !show_chips && !self.left_panel_open(cx);
         let left_group = rail_collapsed.then(|| {
             h_flex()
@@ -2265,20 +2710,26 @@ impl Tty7App {
                 // control, and a window that loses its identity when nobody is
                 // pointing at it reads as a different window.
                 .child(
-                    div()
-                        .occlude()
-                        .flex_shrink_0()
-                        .child(self.new_tab_button("titlebar-add-collapsed", cx)),
+                    crate::ui::app::resting_chrome(
+                        div().occlude().flex_shrink_0(),
+                        strip_chrome_shown,
+                    )
+                    .child(self.new_tab_button("titlebar-add-collapsed", cx)),
                 )
                 .child(
-                    div().occlude().flex_shrink_0().child(
+                    crate::ui::app::resting_chrome(
+                        div().occlude().flex_shrink_0(),
+                        strip_chrome_shown,
+                    )
+                    .child(
                         chrome_tile(
                             Button::new("titlebar-expand-sidebar")
-                                .icon(Icon::empty().path("icons/panel-left.svg")),
+                                .icon(Icon::empty().path("icons/panel-left-collapsed.svg")),
                             false,
                             cx,
                         )
                         .rounded_lg()
+                        .accessible_label(t(L10nKey::TabTooltipShowSidebar))
                         .tooltip_element(chord_tooltip(
                             t(L10nKey::TabTooltipShowSidebar),
                             "ToggleLeftPanel",
@@ -2291,7 +2742,105 @@ impl Tty7App {
 
         // macOS places these controls in the open panel's own title bar, and
         // drops them while a docked document holds the right edge.
-        let right_chrome = strip_chrome.then(|| self.window_chrome(window, cx));
+        //
+        // Elsewhere, with the panel open, they stand in the band above it,
+        // beside the panel's own tab row — which is painted whenever the panel
+        // is, so a band that grew a button on hover read as a glitch next to
+        // it. Once the panel is open they belong to its chrome, and stay.
+        let right_chrome_shown = strip_chrome_shown || self.right_panel_open(cx);
+        let right_chrome = strip_chrome.then(|| {
+            crate::ui::app::resting_chrome(div().flex_shrink_0(), right_chrome_shown)
+                .child(self.window_chrome(cx))
+        });
+
+        // With the tabs in the rail, the middle of the bar over the terminal
+        // is the way into Search Everywhere: a field-shaped button, centred,
+        // that opens the search where it stands. The rail beside it already
+        // names every tab, so the bar has no title of its own to repeat. The
+        // box alone takes the pointer; the rest of the bar still drags.
+        //
+        // Centred over the terminal column, not the bar: see `search_band`.
+        // Off macOS the bar spans the workspace while a document or the detail
+        // panel is docked, and centred on all of it the box landed under the
+        // document's hoisted header, which has no fill to hide it.
+        let docked_right = document_w
+            + match self.right_panel_open(cx) {
+                true => self.right_panel_px(window, cx),
+                false => 0.,
+            };
+        let band = search_band(
+            cfg!(target_os = "macos"),
+            title_bar_strip_lead(window.is_fullscreen(), window.rem_size().as_f32()),
+            docked_right,
+            controls_w,
+            rail_collapsed.then(collapsed_rail_group_w),
+            (strip_chrome && docked_right <= 0.).then(trailing_chrome_tiles_w),
+        );
+        let centre_search = (!show_chips).then(|| {
+            // The chord as text, not caps: a cap's fill is this box's own
+            // grey, so on it a cap is only a gap between two letters.
+            let chord = crate::ui::keymap::effective_key("TogglePalette", cx)
+                .map(|spec| crate::ui::keymap::key_tokens(&spec).join(""));
+            // Two equal springs either side keep the box centred; each stops
+            // at the band's `clear`, and past that it is the box that gives.
+            let spring = || div().flex_1().min_w(px(band.clear));
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(band.left))
+                .right(px(band.right))
+                .flex()
+                .items_center()
+                .child(spring())
+                .child(
+                    h_flex()
+                        .id("titlebar-search")
+                        .occlude()
+                        .w(px(TITLEBAR_SEARCH_W))
+                        .min_w_0()
+                        // Enough of the bar that the label and its chord still
+                        // fit with a document docked beside the terminal; at a
+                        // half it read `Search Everywhe…` in exactly the
+                        // layout people search from most.
+                        .max_w(gpui::relative(0.6))
+                        .h(px(TITLEBAR_SEARCH_H))
+                        .items_center()
+                        .gap(px(7.))
+                        .pl(px(10.))
+                        .pr(px(10.))
+                        .rounded(px(7.))
+                        // The left rail's fill (`Surfaces::rail`, #f5f5f3 /
+                        // #1e1e20 on the default pair) — not `sidebar`, which
+                        // is the window's own fill and vanished into the bar.
+                        .bg(gpui::rgb(
+                            cx.global::<crate::ui::presets::Surfaces>().rail.base,
+                        ))
+                        .cursor_pointer()
+                        .text_size(window.rem_size() * 0.8125)
+                        .text_color(cx.theme().muted_foreground)
+                        .hover(|s| s.text_color(cx.theme().foreground))
+                        .child(Icon::new(IconName::Search).size(px(12.)).flex_shrink_0())
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(t(L10nKey::AppMenuSearchEverywhere)),
+                        )
+                        .when_some(chord, |row, chord| {
+                            row.child(div().flex_shrink_0().child(chord))
+                        })
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| match this.search.is_some() {
+                                true => this.close_search(window, cx),
+                                false => this.open_search(SearchTab::All, "", window, cx),
+                            }),
+                        ),
+                )
+                .child(spring())
+        });
 
         h_flex()
             .id("tab-strip")
@@ -2302,6 +2851,7 @@ impl Tty7App {
             .when(!show_chips, |this| this.w_full())
             .pl_0()
             .min_w_0()
+            .when_some(centre_search, |this, search| this.child(search))
             .when_some(left_group, |this, g| this.child(g))
             .child(chips)
             .when(show_chips, move |this| this.child(add_button))
@@ -2317,6 +2867,12 @@ impl Tty7App {
                 ),
                 None => this.child(chrome),
             })
+            .when(auto_hide_chrome, |this| {
+                this.child(crate::ui::app::hover_sheet(
+                    "strip-chrome-hover",
+                    &self.strip_chrome_hover,
+                ))
+            })
     }
 }
 
@@ -2328,6 +2884,135 @@ impl Tty7App {
 ///
 /// Ungated: `test_window::harness` and `quiet_test_pane` both run on Windows,
 /// and a `unix` gate here would skip the one platform this was written on.
+/// A tab's avatar — agent disc and status dot, or the terminal glyph — for
+/// surfaces that draw a tab without owning the strip. It does not blink: a
+/// working agent's dot holds steady outside the strip's own clock.
+pub(crate) fn avatar(
+    id: impl Into<gpui::ElementId>,
+    avatar: crate::ui::search::Avatar,
+    size: f32,
+    cx: &App,
+) -> gpui::AnyElement {
+    avatar_disc(id, avatar, size, true, true, cx)
+}
+
+fn avatar_disc(
+    id: impl Into<gpui::ElementId>,
+    crate::ui::search::Avatar {
+        agent,
+        status,
+        unread,
+        attention,
+        ssh,
+    }: crate::ui::search::Avatar,
+    size: f32,
+    blink_on: bool,
+    badge: bool,
+    cx: &App,
+) -> gpui::AnyElement {
+    // The wrapper positions; the disc below carries the radius.
+    // `status_dot` hangs itself off the edge with negative offsets — that
+    // overhang is what makes it a badge on the avatar rather than a notch
+    // in it — and as a child of the rounded element the overhang was
+    // clipped along the arc, leaving a crescent.
+    let base = div().id(id).flex_shrink_0().relative().size(px(size));
+    // Fill, hairline and mark all live here, so the radius only ever clips
+    // the disc's own paint.
+    let disc = || {
+        div()
+            .size(px(size))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+    };
+    match agent {
+        Some(agent) => {
+            let pending = attention || status == Some(crate::core::cli_agent::AgentStatus::Waiting);
+            let dot = if pending {
+                Some(crate::core::cli_agent::AgentStatus::Waiting)
+            } else {
+                status.filter(|_| badge)
+            }
+            .and_then(|s| s.dot_rgb())
+            .map(|rgb| {
+                // A working agent's dot blinks, so a column of tabs
+                // says at a glance which ones are still going.
+                let faded = !pending
+                    && status == Some(crate::core::cli_agent::AgentStatus::Working)
+                    && !blink_on;
+                Tty7App::status_dot(
+                    rgb,
+                    if pending { 0 } else { unread },
+                    size,
+                    cx.theme().background,
+                    faded,
+                )
+            });
+            // Which agent this is, and what it wants, were carried entirely
+            // by a brand hue and a nine-pixel dot. Say it in words too.
+            let mut tip = match agent_status_label(status) {
+                Some(state) => format!("{} — {state}", agent.display_name()),
+                None => agent.display_name().to_string(),
+            };
+            if attention && status != Some(crate::core::cli_agent::AgentStatus::Waiting) {
+                tip.push_str(&format!(" · {}", t(L10nKey::AgentStatusAttention)));
+            }
+            // The disc is a solid fill of the agent's brand on every
+            // row, lit or not: a tint reads as a disabled tab, and the
+            // colour is how the eye tells one agent from another down a
+            // column of twenty.
+            let accent = agent.accent_rgb();
+            let surface = cx.theme().background;
+            base.child(
+                disc()
+                    .bg(gpui::rgb(accent))
+                    // Codex and Grok are both pure black, which is the
+                    // window fill on a dark theme — the disc dissolves and
+                    // leaves the glyph floating. A hairline keeps it a disc
+                    // in any theme.
+                    .when(crate::ui::presets::needs_edge(accent, surface), |d| {
+                        d.border_1().border_color(cx.theme().border)
+                    })
+                    .child(
+                        gpui::svg()
+                            .path(agent.icon_path())
+                            .size(px(size * 0.54))
+                            // SVG assets render as a single-colour mask, so
+                            // the mark's colour comes from the agent rather
+                            // than from the file. The tray icon reads the
+                            // same answer.
+                            .text_color(gpui::rgb(agent.icon_rgb())),
+                    ),
+            )
+            .when_some(dot, |b, dot| b.child(dot))
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            })
+            .into_any_element()
+        }
+        None => base
+            .child(
+                disc().bg(cx.theme().muted).child(
+                    gpui::svg()
+                        .path("icons/terminal.svg")
+                        .size(px(size * 0.56))
+                        .text_color(cx.theme().foreground.opacity(0.65)),
+                ),
+            )
+            .when_some(ssh, |b, rgb| {
+                b.child(Tty7App::status_dot(
+                    rgb,
+                    0,
+                    size,
+                    cx.theme().background,
+                    false,
+                ))
+            })
+            .into_any_element(),
+    }
+}
+
 #[cfg(test)]
 mod ssh_host_row_tests {
     use crate::core::config::Config;
@@ -2495,6 +3180,75 @@ mod tests {
     use gpui::TestAppContext;
     use std::path::Path;
     use unicode_segmentation::UnicodeSegmentation;
+
+    /// Where a band lands in the terminal column, for a strip that starts
+    /// `lead` in and ends `strip_end` from the column's left edge.
+    fn band_in_column(band: SearchBand, lead: f32, strip_end: f32) -> (f32, f32) {
+        (lead + band.left, strip_end - band.right)
+    }
+
+    /// #1033, with the reporter's window: 1946pt wide, the rail collapsed.
+    /// The strip starts 80pt in, after the traffic lights, and centred on it
+    /// the box sat at 1013 — 40pt right of the window's middle at 973.
+    #[test]
+    fn with_the_rail_collapsed_on_macos_the_search_box_centres_on_the_window() {
+        let (w, lead) = (1946., 80.);
+        let band = search_band(true, lead, 0., 0., Some(58.), Some(49.));
+        let (l, r) = band_in_column(band, lead, w);
+        assert_eq!((l, r), (0., w));
+        assert_eq!((l + r) / 2., 973.);
+        // Clear of the traffic lights and the two tiles after them, at both
+        // ends so that clearing them does not pull the box off centre.
+        assert_eq!(band.clear, lead + 58. + TITLEBAR_SEARCH_CLEAR_GAP);
+    }
+
+    /// With the rail open, the title bar sits in the terminal column but
+    /// still leaves the traffic lights' 80pt before the strip, over nothing
+    /// — the lights are over the rail. The band reaches back over that too,
+    /// and centres on the column.
+    #[test]
+    fn with_the_rail_open_on_macos_the_search_box_centres_on_the_terminal_column() {
+        let (column, lead) = (1200., 80.);
+        let band = search_band(true, lead, 0., 0., None, Some(49.));
+        assert_eq!(band_in_column(band, lead, column), (0., column));
+        assert_eq!(band.clear, 49. + TITLEBAR_SEARCH_CLEAR_GAP);
+
+        // A docked panel on macOS is beside the column, not under its bar:
+        // nothing to subtract from the strip's end.
+        let docked = search_band(true, lead, 360., 0., None, None);
+        assert_eq!(band_in_column(docked, lead, column), (0., column));
+        assert_eq!(docked.clear, 0.);
+    }
+
+    /// Fullscreen keeps `TitleBar`'s 80pt and adds the bar's own inset.
+    #[test]
+    fn fullscreen_on_macos_reaches_back_over_the_bars_extra_inset_as_well() {
+        let lead = 80. + 12.;
+        let band = search_band(true, lead, 0., 0., Some(58.), Some(49.));
+        assert_eq!(band_in_column(band, lead, 1440.), (0., 1440.));
+    }
+
+    /// Off macOS the bar spans the docked columns and stops short of the
+    /// window buttons; the band ends where the terminal column does, as it
+    /// always has, and now starts where it does too.
+    #[test]
+    fn off_macos_the_band_is_the_terminal_column_beside_a_docked_panel() {
+        let (w, lead, controls, panel) = (1600., 12., 102., 360.);
+        let strip_end = w - controls;
+        let band = search_band(false, lead, panel, controls, None, None);
+        assert_eq!(band.right, panel - controls);
+        assert_eq!(band_in_column(band, lead, strip_end), (0., w - panel));
+
+        // Nothing docked: the band runs to the end of the strip, short of
+        // the window buttons, and keeps clear of the tiles standing there.
+        let bare = search_band(false, lead, 0., controls, None, Some(38.));
+        assert_eq!(band_in_column(bare, lead, strip_end), (0., strip_end));
+        assert_eq!(bare.clear, 38. + TITLEBAR_SEARCH_CLEAR_GAP);
+
+        // A panel narrower than the buttons leaves no room to take off.
+        let thin = search_band(false, lead, 80., controls, None, None);
+        assert_eq!(thin.right, 0.);
+    }
 
     /// Most of these tests are about where a title is *cut*, not about what
     /// `~` means: the paths they pass either already start with `~` or are
@@ -2783,6 +3537,19 @@ mod tests {
         assert!(out.contains('…'));
         assert!(measure_text(&ts, &font, size, &out) <= max);
         assert!(out.chars().count() < branch.chars().count());
+    }
+
+    #[gpui::test]
+    fn elide_end_keeps_the_head_of_a_branch(cx: &mut TestAppContext) {
+        let (ts, font, size) = elide_setup(cx);
+        let branch = "fix/rpc-proxy-and-error-classification";
+        let max = 140.;
+        let out = elide_end_clusters(&ts, &font, size, branch, max);
+        assert!(out.starts_with("fix/rpc-"), "head survives: {out}");
+        assert!(out.ends_with('…') && out.matches('…').count() == 1, "{out}");
+        assert!(measure_text(&ts, &font, size, &out) <= max);
+        let fits = measure_text(&ts, &font, size, branch);
+        assert_eq!(elide_end_clusters(&ts, &font, size, branch, fits), branch);
     }
 
     #[gpui::test]
@@ -3477,5 +4244,178 @@ mod tests {
         for full_path in [false, true] {
             assert_eq!(label_of(&shell, 0, None, full_path), "build status");
         }
+    }
+
+    fn inventory(labels: &[&str]) -> Vec<DetectedShell> {
+        labels
+            .iter()
+            .map(|l| DetectedShell {
+                label: l.to_string(),
+                program: format!("/bin/{l}"),
+                args: Vec::new(),
+                args_are_tty7_defaults: true,
+                user_authored: false,
+            })
+            .collect()
+    }
+
+    fn used(
+        entries: &[(&str, u32, u64)],
+    ) -> std::collections::HashMap<String, crate::core::config::ProfileUsage> {
+        entries
+            .iter()
+            .map(|(l, count, last_used)| {
+                (
+                    l.to_string(),
+                    crate::core::config::ProfileUsage {
+                        count: *count,
+                        last_used: *last_used,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn labels(shells: &[&DetectedShell]) -> Vec<String> {
+        shells.iter().map(|s| s.label.clone()).collect()
+    }
+
+    const STOCK_MAC: &[&str] = &["zsh", "bash", "sh", "csh", "tcsh", "ksh", "dash"];
+
+    #[test]
+    fn the_new_tab_menu_names_the_default_and_what_has_been_opened_by_frecency() {
+        let now = 100_000_000u64;
+        let day = 86_400u64;
+        let shells = inventory(STOCK_MAC);
+        // `bash` used often and lately; `dash` used more but a year ago;
+        // `ksh` once, two months back; and the default opened too.
+        let usage = used(&[
+            ("zsh", 50, now),
+            ("ksh", 1, now - 60 * day),
+            ("bash", 9, now - day),
+            ("dash", 20, now - 365 * day),
+        ]);
+        let sorted = shells_by_frecency(&shells, "zsh", &usage, now);
+        assert_eq!(
+            labels(&sorted),
+            ["zsh", "bash", "dash", "ksh", "sh", "csh", "tcsh"],
+            "default first, then by frecency, then the inventory's own order"
+        );
+        let menu = menu_shells(&sorted, "zsh", &usage, now);
+        assert_eq!(menu.len(), MENU_SHELLS);
+        assert_eq!(labels(&menu), ["zsh", "bash", "dash"]);
+    }
+
+    #[test]
+    fn the_default_shell_leads_the_menu_even_when_it_has_never_been_opened() {
+        let now = 100_000_000u64;
+        let shells = inventory(STOCK_MAC);
+        let usage = used(&[("tcsh", 3, now), ("sh", 7, now), ("ksh", 5, now)]);
+        let sorted = shells_by_frecency(&shells, "bash", &usage, now);
+        let menu = menu_shells(&sorted, "bash", &usage, now);
+        assert_eq!(labels(&menu), ["bash", "sh", "ksh"]);
+    }
+
+    #[test]
+    fn a_shell_nobody_has_opened_is_not_named_just_because_there_is_room() {
+        // A fresh install: nothing has been opened, so the menu names the
+        // default alone and leaves the rest to the palette.
+        let now = 100_000_000u64;
+        let shells = inventory(STOCK_MAC);
+        let none = used(&[]);
+        let sorted = shells_by_frecency(&shells, "zsh", &none, now);
+        assert_eq!(labels(&menu_shells(&sorted, "zsh", &none, now)), ["zsh"]);
+
+        // A usage record at zero counts as never opened.
+        let zeroed = used(&[("bash", 0, now)]);
+        let sorted = shells_by_frecency(&shells, "zsh", &zeroed, now);
+        assert_eq!(labels(&menu_shells(&sorted, "zsh", &zeroed, now)), ["zsh"]);
+
+        // An inventory that does not list the default still offers its head,
+        // which is the shell a new tab opens with.
+        let sorted = shells_by_frecency(&shells, "fish", &none, now);
+        assert_eq!(labels(&menu_shells(&sorted, "fish", &none, now)), ["zsh"]);
+    }
+
+    #[test]
+    fn other_shells_is_offered_only_when_the_inventory_holds_more_than_the_menu_names() {
+        let now = 100_000_000u64;
+        let more = |inv: &[&str], usage: &[(&str, u32, u64)]| {
+            let shells = inventory(inv);
+            let usage = used(usage);
+            let default = inv.first().copied().unwrap_or("");
+            let sorted = shells_by_frecency(&shells, default, &usage, now);
+            menu_shells(&sorted, default, &usage, now).len() < sorted.len()
+        };
+        assert!(more(STOCK_MAC, &[]), "a stock box names one of seven");
+        assert!(
+            !more(&["pwsh"], &[]),
+            "the default alone is the whole inventory"
+        );
+        assert!(
+            !more(&["zsh", "bash"], &[("bash", 1, now)]),
+            "every shell is already a row"
+        );
+        assert!(
+            !more(
+                &["zsh", "bash", "fish"],
+                &[("bash", 1, now), ("fish", 2, now)]
+            ),
+            "three shells, all named"
+        );
+        assert!(
+            more(&["zsh", "bash", "fish"], &[("bash", 1, now)]),
+            "`fish` has never been opened, so it is left to the palette"
+        );
+        assert!(
+            !more(&[], &[]),
+            "no inventory: the fallback row, nothing more"
+        );
+    }
+
+    #[test]
+    fn the_new_tab_menu_names_agents_that_have_actually_been_run() {
+        use crate::core::cli_agent::CLIAgent;
+        let now = 100_000_000u64;
+        let day = 86_400u64;
+        // Already most-used-first, the way `offered_agents` hands them over,
+        // except Amp has never been run and sits between two that have — the
+        // filter has to skip it rather than stop.
+        let offered = [
+            CLIAgent::Claude,
+            CLIAgent::Amp,
+            CLIAgent::Codex,
+            CLIAgent::Gemini,
+            CLIAgent::Aider,
+        ];
+        let usage = used(&[
+            ("claude", 12, now - 2 * day),
+            ("codex", 3, now - day),
+            ("gemini", 1, now - 30 * day),
+            ("aider", 0, now),
+        ]);
+        let named = menu_agents(&offered, &usage, now);
+        assert_eq!(
+            named,
+            vec![CLIAgent::Claude, CLIAgent::Codex, CLIAgent::Gemini],
+            "three that have run fill the cap; a zero count is not a use, and a gap is skipped"
+        );
+        assert!(named.len() < offered.len(), "the rest are the seam row's");
+
+        let none = used(&[]);
+        let named = menu_agents(&offered, &none, now);
+        assert!(named.is_empty(), "installed but never run is not named");
+        assert!(
+            named.len() < offered.len(),
+            "so the section is only the seam"
+        );
+        assert!(menu_agents(&[], &usage, now).is_empty());
+
+        // Every offered agent has been run and they fit: no seam row.
+        let few = [CLIAgent::Claude, CLIAgent::Codex];
+        let two = used(&[("claude", 4, now), ("codex", 1, now)]);
+        let named = menu_agents(&few, &two, now);
+        assert_eq!(named, vec![CLIAgent::Claude, CLIAgent::Codex]);
+        assert_eq!(named.len(), few.len());
     }
 }

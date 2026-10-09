@@ -4,9 +4,8 @@ use gpui::{
     Animation, AnimationExt as _, App, Context, KeyDownEvent, Keystroke, MouseButton, div,
     prelude::*, px,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::kbd::Kbd;
-use gpui_component::{ActiveTheme as _, IconName, Sizable as _, h_flex, v_flex};
+use gpui_component::{ActiveTheme as _, IconName, h_flex, v_flex};
 
 use crate::core::actions::{NewTab, OpenSettings, ReopenClosedTab, TogglePalette, ToggleSwitcher};
 use crate::core::session::{SessionPane, SessionTab};
@@ -34,6 +33,16 @@ const HOME_SHORTCUTS: [&str; 5] = [
     "TogglePalette",
     "OpenSettings",
 ];
+
+/// The shortcut list under the logo. Rows are the sidebar's 28px step rather
+/// than the old 42px buttons: five of them stacked at that height read as a
+/// wall of controls on a page whose only job is to say "press ⌘T".
+const HOME_LIST_W: f32 = 340.;
+const HOME_ROW_H: f32 = 28.;
+
+/// A row's text inset: its hover fill bleeds this far past the label and the
+/// cap on either side.
+const HOME_ROW_PAD: f32 = 10.;
 
 const CLOSED_LABEL_MAX: usize = 20;
 
@@ -108,6 +117,7 @@ pub(crate) fn relative_time(now: u64, then: u64) -> String {
 /// about those (#580). `None` shows the path in full.
 pub(crate) fn display_path(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
     let text = path.to_string_lossy();
+    let text = crate::ui::path_display::readable_path(&text);
     // Same home-abbreviation the Info panel and tab strip use: separators
     // normalized, case folded (#544).
     let shortened = crate::ui::path_display::abbreviate_home(&text, home).into_owned();
@@ -153,6 +163,13 @@ pub(crate) fn key_stroke(action: &str, cx: &App) -> Option<Keystroke> {
     Keystroke::parse(first).ok()
 }
 
+/// The first stroke of `action`'s binding, one token per key.
+fn key_tokens(action: &str, cx: &App) -> Option<Vec<String>> {
+    let spec = crate::ui::keymap::effective_key(action, cx)?;
+    let first = spec.split_whitespace().next()?;
+    Some(crate::ui::keymap::key_tokens(first))
+}
+
 pub(crate) fn key_hint(action: &str, cx: &App) -> Option<String> {
     Some(Kbd::format(&key_stroke(action, cx)?))
 }
@@ -162,7 +179,7 @@ fn home_shortcut_label(action: &str, closed: Option<&str>) -> String {
         "NewTab" => crate::ui::i18n::t(crate::ui::i18n::L10nKey::HomeNewTab),
         "ReopenClosedTab" => crate::ui::i18n::t(crate::ui::i18n::L10nKey::HomeReopenClosedTab),
         "ToggleSwitcher" => crate::ui::i18n::t(crate::ui::i18n::L10nKey::HomeSwitchWorkspace),
-        "TogglePalette" => crate::ui::i18n::t(crate::ui::i18n::L10nKey::HomeCommandPalette),
+        "TogglePalette" => crate::ui::i18n::t(crate::ui::i18n::L10nKey::HomeSearchEverywhere),
         "SplitRight" => crate::ui::i18n::t(crate::ui::i18n::L10nKey::HomeSplitRight),
         "SplitDown" => crate::ui::i18n::t(crate::ui::i18n::L10nKey::HomeSplitDown),
         "OpenSettings" => crate::ui::i18n::t(crate::ui::i18n::L10nKey::HomeSettings),
@@ -202,9 +219,20 @@ impl Tty7App {
             ),
         );
 
-        let closed_hint = self.closed.last().and_then(closed_tab_label);
-        let nothing_to_reopen = self.closed.is_empty();
-        let mut list = v_flex().gap_2().w(px(340.)).text_sm().text_color(muted);
+        // In the order ⌘⇧T takes them: the machine's list first, where it
+        // keeps one, then whatever this window kept itself.
+        let next_closed = crate::ui::tree_sync::newest_remembered_close(cx, self.workspace)
+            .or_else(|| self.closed.last().cloned());
+        let closed_hint = next_closed.as_ref().and_then(closed_tab_label);
+        let nothing_to_reopen = next_closed.is_none();
+        // Rows on the sidebar's shape: no fill at rest, the window's hover
+        // rung under the pointer, the chord in a faint cap at the far end.
+        let hover = gpui::rgb(cx.global::<crate::ui::presets::Surfaces>().window.hover);
+        let mut list = v_flex()
+            .gap(px(2.))
+            .w(px(HOME_LIST_W))
+            .text_size(gpui::rems(crate::ui::right_panel::TEXT))
+            .text_color(muted);
         for action in HOME_SHORTCUTS {
             if action == "ReopenClosedTab" && nothing_to_reopen {
                 continue;
@@ -212,23 +240,22 @@ impl Tty7App {
             let emphasized = closed_hint.is_some() && action == "ReopenClosedTab";
             let label = home_shortcut_label(action, closed_hint.as_deref());
             list = list.child(
-                Button::new(action)
-                    .ghost()
+                h_flex()
+                    .id(action)
                     .w_full()
-                    .min_h(gpui::rems(2.625))
-                    .rounded(crate::ui::rounding::CARD_RADIUS)
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .text_color(muted)
-                            .when(emphasized || action == "NewTab", |row| {
-                                row.text_color(foreground)
-                            })
-                            .child(label)
-                            .children(key_stroke(action, cx).map(Kbd::new)),
-                    )
+                    .h(px(HOME_ROW_H))
+                    .px(px(HOME_ROW_PAD))
+                    .gap(px(12.))
+                    .items_center()
+                    .justify_between()
+                    .rounded(crate::ui::rounding::ROW_RADIUS)
+                    .cursor_pointer()
+                    .hover(move |row| row.bg(hover))
+                    .when(emphasized || action == "NewTab", |row| {
+                        row.text_color(foreground)
+                    })
+                    .child(div().min_w_0().truncate().child(label))
+                    .children(key_tokens(action, cx).map(|keys| crate::ui::dialog::chord(keys, cx)))
                     .on_click(move |_, window, cx| {
                         let command: Box<dyn gpui::Action> = match action {
                             "NewTab" => Box::new(NewTab),
@@ -310,17 +337,18 @@ impl Tty7App {
                         .child(crate::ui::remote_workspace::status_message(message))
                         .when_some(action, |this, (label, action)| {
                             this.child(
-                                Button::new("home-remote-status-action")
-                                    .flex_shrink_0()
-                                    .label(label)
-                                    .ghost()
-                                    .small()
-                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                crate::ui::dialog::button(
+                                    "home-remote-status-action",
+                                    label,
+                                    crate::ui::dialog::Tone::Secondary,
+                                    true,
+                                    crate::ui::dialog::popover_rungs(cx),
+                                    cx,
+                                    cx.listener(move |this, _, window, cx| {
                                         this.run_strip_action(action.clone(), window, cx);
-                                    }))
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation()
                                     }),
+                                )
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
                             )
                         }),
                 )
@@ -494,7 +522,10 @@ mod tests {
         let tab = SessionTab {
             name: Some("build".into()),
             tree_id: None,
-            sidebar_group: None,
+            group: None,
+            last_auto: None,
+            hibernated: false,
+            asleep_view: None,
             pane: leaf(Some("/work/getty")),
         };
         assert_eq!(closed_tab_label(&tab).as_deref(), Some("build"));
@@ -505,7 +536,10 @@ mod tests {
         let tab = SessionTab {
             name: None,
             tree_id: None,
-            sidebar_group: None,
+            group: None,
+            last_auto: None,
+            hibernated: false,
+            asleep_view: None,
             pane: leaf(Some("/work/getty")),
         };
         assert_eq!(closed_tab_label(&tab).as_deref(), Some("getty"));
@@ -513,7 +547,10 @@ mod tests {
         let tab = SessionTab {
             name: Some("   ".into()),
             tree_id: None,
-            sidebar_group: None,
+            group: None,
+            last_auto: None,
+            hibernated: false,
+            asleep_view: None,
             pane: leaf(Some("/work/getty")),
         };
         assert_eq!(closed_tab_label(&tab).as_deref(), Some("getty"));
@@ -524,7 +561,10 @@ mod tests {
         let tab = SessionTab {
             name: None,
             tree_id: None,
-            sidebar_group: None,
+            group: None,
+            last_auto: None,
+            hibernated: false,
+            asleep_view: None,
             pane: SessionPane::Split {
                 axis: crate::core::session::SessionAxis::Horizontal,
                 ratio: 0.5,
@@ -540,14 +580,20 @@ mod tests {
         let unnamed = SessionTab {
             name: None,
             tree_id: None,
-            sidebar_group: None,
+            group: None,
+            last_auto: None,
+            hibernated: false,
+            asleep_view: None,
             pane: leaf(None),
         };
         assert_eq!(closed_tab_label(&unnamed), None);
         let root = SessionTab {
             name: None,
             tree_id: None,
-            sidebar_group: None,
+            group: None,
+            last_auto: None,
+            hibernated: false,
+            asleep_view: None,
             pane: leaf(Some("/")),
         };
         assert_eq!(closed_tab_label(&root), None);
@@ -558,7 +604,10 @@ mod tests {
         let tab = SessionTab {
             name: Some("a".repeat(40)),
             tree_id: None,
-            sidebar_group: None,
+            group: None,
+            last_auto: None,
+            hibernated: false,
+            asleep_view: None,
             pane: leaf(None),
         };
         let label = closed_tab_label(&tab).unwrap();

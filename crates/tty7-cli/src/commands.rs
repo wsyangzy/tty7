@@ -11,9 +11,10 @@ use tty7_core::daemon::protocol::PROTOCOL_VERSION;
 use crate::address::{self, Context, WorkspaceAddress};
 use crate::backend::{Backend, RunSpec};
 use crate::cli::{
-    CaptureArgs, Cli, Command, MachineCmd, PaneCmd, RunArgs, SendArgs, ServerCmd, SplitArgs,
-    TabCmd, WaitArgs, WaitState, WsCmd,
+    CaptureArgs, Cli, Command, ExecArgs, MachineCmd, PaneCmd, RunArgs, SendArgs, ServerCmd,
+    SplitArgs, TabCmd, WaitArgs, WaitState, WorktreeCmd, WsCmd,
 };
+use crate::exec::ExecEnd;
 use crate::output;
 use crate::resolve;
 use crate::screen;
@@ -78,6 +79,7 @@ pub fn execute(cli: Cli, ctx: &Context, backend: &mut dyn Backend) -> Result<Out
             pane_split(args, ctx, backend)
         }
         Some(Command::Send(args)) => send(args, ctx, backend),
+        Some(Command::Exec(args)) => exec(args, ctx, backend),
         Some(Command::Capture(args)) => capture(args, ctx, backend),
         Some(Command::Procs { target }) => procs(target.as_deref(), ctx, backend),
         Some(Command::Tab(TabCmd::Ls { ws })) => tab_ls(ws.as_deref(), ctx, backend),
@@ -90,6 +92,46 @@ pub fn execute(cli: Cli, ctx: &Context, backend: &mut dyn Backend) -> Result<Out
         Some(Command::Pane(PaneCmd::Ls { ws, all })) => pane_ls(ws.as_deref(), all, backend),
         Some(Command::Pane(PaneCmd::Close { targets, orphans })) => {
             pane_close(&targets, orphans, ctx, backend)
+        }
+        Some(Command::Worktree(cmd)) => {
+            if let Some(machine) = machine.as_deref() {
+                bail!(
+                    "`tty7 worktree` works on this machine's repositories only — -m {machine} \
+                     would have run git here, not there"
+                );
+            }
+            match cmd {
+                WorktreeCmd::New {
+                    name,
+                    branch,
+                    from,
+                    agent,
+                    task,
+                    no_setup,
+                    ws,
+                    repo,
+                } => worktree_new(
+                    WorktreeNew {
+                        name,
+                        branch,
+                        from,
+                        agent,
+                        task,
+                        no_setup,
+                        ws,
+                        repo,
+                    },
+                    ctx,
+                    backend,
+                ),
+                WorktreeCmd::Ls { repo } => worktree_ls(repo, backend),
+                WorktreeCmd::Rm {
+                    target,
+                    force,
+                    close_panes,
+                    repo,
+                } => worktree_rm(&target, force, close_panes, repo, backend),
+            }
         }
         Some(Command::Events) => events(json_mode, backend),
         Some(Command::Agents) => agents(backend),
@@ -486,8 +528,6 @@ fn pane_split(args: SplitArgs, ctx: &Context, backend: &mut dyn Backend) -> Resu
 }
 
 fn send(args: SendArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
-    const KEY_GAP: Duration = Duration::from_millis(200);
-
     // `--enter` is the same thing as `--key enter`, and predates it. Keeping it
     // as sugar rather than deprecating it: it reads better for the overwhelming
     // case, which is typing one command and running it. Going through the same
@@ -498,6 +538,43 @@ fn send(args: SendArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outc
     let mut pressed = args.keys.clone();
     if args.enter {
         pressed.push(crate::keys::parse("enter").expect("enter is in the vocabulary"));
+    }
+
+    // Text from stdin or a file has no positional of its own, so the one
+    // positional there is can only be an address — and a word that is not one
+    // is a mistake, not text to type into the caller's own pane.
+    if args.stdin || args.from_file.is_some() {
+        let source = if args.stdin { "--stdin" } else { "--from-file" };
+        if let Some(first) = &args.first {
+            address::parse_pane(first).with_context(|| {
+                format!(
+                    "with {source} the text comes from there, so '{first}' has to be the \
+                     pane to send it to"
+                )
+            })?;
+        }
+        let pane = address::pane_or_context(args.first.as_deref(), ctx)?;
+        let payload = match &args.from_file {
+            Some(path) => {
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?
+            }
+            None => {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
+                    .context("reading stdin")?;
+                bytes
+            }
+        };
+        return deliver(
+            pane,
+            Payload::Piped {
+                source: if args.stdin { "stdin" } else { "file" },
+                bytes: payload,
+            },
+            &args,
+            pressed,
+            backend,
+        );
     }
 
     // Three shapes reach here, and only the address is ever ambiguous:
@@ -555,9 +632,75 @@ fn send(args: SendArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outc
     };
 
     let pane = address::pane_or_context(target, ctx)?;
+    let payload = match text {
+        Some(text) => Payload::Typed(text.to_string()),
+        None => Payload::None,
+    };
+    deliver(pane, payload, &args, pressed, backend)
+}
+
+/// What `send` has to put in front of the keys.
+enum Payload {
+    None,
+    /// From the command line — echoed back in `--json`, as it always was.
+    Typed(String),
+    /// From stdin or a file. Never echoed: the reason to use these is to keep
+    /// the bytes out of places other people can read, and a JSON line in a
+    /// log is one of them.
+    Piped {
+        source: &'static str,
+        bytes: Vec<u8>,
+    },
+}
+
+fn deliver(
+    pane: u64,
+    payload: Payload,
+    args: &SendArgs,
+    pressed: Vec<crate::keys::Key>,
+    backend: &mut dyn Backend,
+) -> Result<Outcome> {
+    const KEY_GAP: Duration = Duration::from_millis(200);
+
+    let (source, bytes) = match &payload {
+        Payload::None => ("none", &[][..]),
+        Payload::Typed(text) => ("argument", text.as_bytes()),
+        Payload::Piped { source, bytes } => (*source, &bytes[..]),
+    };
+    if args.paste && bytes.is_empty() {
+        bail!("--paste needs text to paste — TEXT, --stdin or --from-file");
+    }
+    // `--paste` frames the way the GUI's paste does, which is to ask the pane
+    // first: brackets for a pane that switched mode 2004 on, and for one that
+    // did not, the line breaks a keyboard would send. Forcing the brackets on
+    // a pane that never asked for them would put `ESC[200~` in front of a
+    // program that reads it as keystrokes. `None` is a server that cannot say.
+    let mode = if args.paste {
+        backend.procs(pane)?.context.and_then(|c| c.bracketed_paste)
+    } else {
+        None
+    };
+    let bracketed = mode == Some(true);
+    if args.paste && !bracketed {
+        eprintln!(
+            "tty7: pane %{pane} {} bracketed paste, so the text went unframed — each line \
+             break was sent as Enter",
+            if mode.is_none() {
+                "is on a server too old to say whether it has"
+            } else {
+                "has not switched on"
+            }
+        );
+    }
+    let wire = if args.paste {
+        tty7_core::core::paste::paste_bytes(bytes, bracketed)
+    } else {
+        bytes.to_vec()
+    };
+
     let mut already_wrote = false;
-    if let Some(text) = text {
-        backend.send_input(pane, text.as_bytes().to_vec())?;
+    if !wire.is_empty() {
+        backend.send_input(pane, wire)?;
         already_wrote = true;
     }
     for key in &pressed {
@@ -576,7 +719,18 @@ fn send(args: SendArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outc
         "",
         json!({
             "pane": pane,
-            "sent": text.unwrap_or_default(),
+            "sent": match &payload {
+                Payload::Typed(text) => Some(text.as_str()),
+                Payload::None => Some(""),
+                Payload::Piped { .. } => None,
+            },
+            "source": source,
+            "bytes": bytes.len(),
+            "paste": args.paste,
+            // Whether the paste went framed, and what the pane said about the
+            // mode — `null` when nothing was asked or the server cannot say.
+            "bracketed": bracketed,
+            "bracketed_paste_mode": mode,
             "enter": args.enter,
             "keys": pressed.iter().map(|k| k.name.as_str()).collect::<Vec<_>>(),
         }),
@@ -592,6 +746,132 @@ fn tried_to_write_an_address(s: &str) -> bool {
     s.strip_prefix('%')
         .and_then(|rest| rest.chars().next())
         .is_some_and(|c| c.is_ascii_digit())
+}
+
+fn exec(args: ExecArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
+    let pane = address::pane_or_context(args.target.as_deref(), ctx)?;
+    let line = args.cmd.join(" ");
+    if line.trim().is_empty() {
+        bail!("exec needs a command after `--`");
+    }
+    // The line is typed, so every byte of it goes through the shell's line
+    // editor: a newline would submit half of it and a Tab would complete. One
+    // line of printable text is the only thing that runs as written — the same
+    // test the GUI applies before it types a line rather than pasting it.
+    if line.chars().any(char::is_control) {
+        bail!(
+            "exec types one line at the shell's prompt, and this one holds a control \
+             character (a newline, a tab, an escape) the line editor would act on — join \
+             the commands with `;` or `&&`, or put them in a script and exec that"
+        );
+    }
+    let mut wire = line.clone().into_bytes();
+    wire.push(b'\r');
+    let started = std::time::Instant::now();
+    let run = backend.exec(pane, wire, args.timeout.map(Duration::from_secs))?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    // The caller's own pane is the one pane that can never be at a prompt
+    // while this runs: its shell is busy running `tty7 exec`.
+    let own = ctx
+        .pane
+        .as_deref()
+        .and_then(|p| address::parse_pane(p).ok())
+        == Some(pane);
+    match run.end {
+        ExecEnd::NoIntegration => bail!(
+            "pane %{pane} has sent no shell-integration prompt marks, so nothing would say \
+             when a command there ends — exec needs tty7's shell integration loaded in the \
+             pane's shell (`tty7 doctor`); without it, `send … --enter` and \
+             `wait --until free` are the way"
+        ),
+        ExecEnd::Busy if own => bail!(
+            "pane %{pane} is this shell, and it is busy running this very command — exec \
+             into another pane"
+        ),
+        ExecEnd::Busy => bail!(
+            "pane %{pane} is not at a shell prompt — something is already running there. \
+             `tty7 wait %{pane} --until free` waits for it"
+        ),
+        _ => {}
+    }
+
+    let text = if args.raw {
+        String::from_utf8_lossy(&run.output).into_owned()
+    } else {
+        screen::render(&[crate::backend::CaptureSegment {
+            size: run.size,
+            bytes: run.output.clone(),
+        }])
+    };
+    if run.dropped > 0 {
+        eprintln!(
+            "tty7: exec %{pane}: the first {} bytes of output were dropped to keep the rest \
+             in memory — the pane's own scrollback may still hold them",
+            run.dropped
+        );
+    }
+    let (code, known, timed_out) = match run.end {
+        ExecEnd::Finished {
+            exit: Some(code),
+            ran: true,
+        } => (code, true, false),
+        ExecEnd::Finished {
+            exit: None,
+            ran: true,
+        } => {
+            eprintln!("tty7: {EXIT_CODE_UNKNOWN}");
+            (1, false, false)
+        }
+        ExecEnd::Finished { ran: false, .. } => {
+            eprintln!(
+                "tty7: pane %{pane}: the shell came back to its prompt without running the \
+                 line — a syntax error, most likely; what it printed is the output"
+            );
+            (1, false, false)
+        }
+        ExecEnd::TimedOut { started: true } => {
+            eprintln!(
+                "tty7: pane %{pane}: still running after {}s — timed out, and left running \
+                 (`tty7 send %{pane} --key C-c` interrupts it)",
+                args.timeout.unwrap_or_default()
+            );
+            (124, false, true)
+        }
+        ExecEnd::TimedOut { started: false } => {
+            eprintln!(
+                "tty7: pane %{pane}: timed out after {}s, and the shell never started the \
+                 line — it is most likely waiting on a continuation prompt (an unclosed \
+                 quote or bracket); `tty7 send %{pane} --key C-c` abandons it",
+                args.timeout.unwrap_or_default()
+            );
+            (124, false, true)
+        }
+        ExecEnd::PaneExited(_) => {
+            eprintln!("tty7: pane %{pane} exited before its shell came back to a prompt");
+            (1, false, false)
+        }
+        ExecEnd::NoIntegration | ExecEnd::Busy => unreachable!("refused above"),
+    };
+    // `-q` keeps the exit code and drops the output, which is what the global
+    // flag already does to any report.
+    Ok(Outcome::Exit(
+        code,
+        Report {
+            human: text.clone(),
+            json: json!({
+                "pane": pane,
+                "command": line,
+                "exit": code,
+                "exit_code_known": known,
+                "timed_out": timed_out,
+                "pane_exited": matches!(run.end, ExecEnd::PaneExited(_)),
+                "output": text,
+                "bytes": run.output.len(),
+                "elapsed_ms": elapsed_ms,
+            }),
+        },
+    ))
 }
 
 fn capture(args: CaptureArgs, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
@@ -678,12 +958,11 @@ fn tab_ls(explicit: Option<&str>, ctx: &Context, backend: &mut dyn Backend) -> R
             vec![
                 format!("@{}", resolve::ordinal_of(&machine, tab.id).unwrap_or(0)),
                 output::tab_label(view),
-                // The GUI files tabs under a directory and shows its last
-                // segment as the heading; the full path would be the widest
-                // column in the table for no gain.
-                tab.sidebar_group
-                    .as_deref()
-                    .map(|g| output::path_leaf(g).to_string())
+                // Only a pinned group is the workspace's to report: an auto
+                // group is worked out by the GUI from a probe of the tab's
+                // cwd, which the tree does not hold.
+                pinned_group_of(ws, tab)
+                    .map(output::pinned_group_label)
                     .unwrap_or_else(|| "-".to_string()),
                 tab.root.pane_ids().len().to_string(),
             ]
@@ -702,8 +981,13 @@ fn tab_ls(explicit: Option<&str>, ctx: &Context, backend: &mut dyn Backend) -> R
                 "name": tab.name,
                 "label": output::tab_label(view),
                 "agent": view.agent.map(|a| a.display_name()),
-                "group": tab.sidebar_group,
+                "group": pinned_group_of(ws, tab).map(|g| json!({
+                    "id": g.id.to_string(),
+                    "name": g.given_name(),
+                    "folder": g.folder,
+                })),
                 "panes": tab.root.pane_ids(),
+                "hibernated": tab.hibernated,
             })
         })
         .collect();
@@ -711,6 +995,16 @@ fn tab_ls(explicit: Option<&str>, ctx: &Context, backend: &mut dyn Backend) -> R
         output::table(&["TAB", "NAME", "GROUP", "PANES"], &rows),
         json!({ "workspace": id.to_string(), "tabs": tabs }),
     )
+}
+
+/// The pinned group `tab` is filed under, when it names one the workspace
+/// still has. A tab naming a deleted group is an auto tab, the same way the
+/// sidebar draws it.
+fn pinned_group_of<'a>(
+    ws: &'a tty7_core::core::machine::Workspace,
+    tab: &tty7_core::core::machine::Tab,
+) -> Option<&'a tty7_core::core::group_key::PinnedGroup> {
+    ws.groups.get(tab.group?)
 }
 
 fn tab_new(
@@ -860,6 +1154,243 @@ fn hang_up_removed_panes(request: &str, reply: ReplyOk, backend: &mut dyn Backen
     Ok(())
 }
 
+struct WorktreeNew {
+    name: Option<String>,
+    branch: Option<String>,
+    from: Option<String>,
+    agent: Option<String>,
+    task: Option<String>,
+    no_setup: bool,
+    ws: Option<String>,
+    repo: Option<std::path::PathBuf>,
+}
+
+fn repo_or_here(repo: Option<std::path::PathBuf>) -> Result<std::path::PathBuf> {
+    match repo {
+        Some(repo) => Ok(repo),
+        None => std::env::current_dir().context("cannot read the current directory"),
+    }
+}
+
+/// The same worktree the GUI's New Worktree dialog makes, with the same first
+/// line typed into its tab. Setup runs unless `--no-setup`: whoever can run
+/// this can already run the script by hand, so the GUI's approval step would
+/// guard nothing here.
+fn worktree_new(args: WorktreeNew, ctx: &Context, backend: &mut dyn Backend) -> Result<Outcome> {
+    use tty7_core::core::cli_agent::CLIAgent;
+    use tty7_core::core::worktree::{self, WorktreeRequest, setup};
+
+    let host = tty7_core::host::local::LocalHost::new();
+    let repo = repo_or_here(args.repo)?;
+    let agent = args
+        .agent
+        .as_deref()
+        .map(|slug| {
+            CLIAgent::from_slug(slug).ok_or_else(|| anyhow::anyhow!("no agent called \"{slug}\""))
+        })
+        .transpose()?;
+    // The workspace is settled before anything is created, so a bad --ws
+    // leaves no worktree behind.
+    let machine = fetch_machine(backend)?;
+    let ws = resolve_ws(args.ws.as_deref(), ctx, &machine)?;
+    let defaults = worktree::defaults(&*host, &repo).map_err(anyhow::Error::msg)?;
+    let name = args.name.unwrap_or(defaults.name);
+    let req = WorktreeRequest {
+        branch: args.branch.unwrap_or_else(|| name.clone()),
+        name,
+        base: args.from.unwrap_or(defaults.base),
+    };
+    let wt = worktree::create(&*host, &repo, &req).map_err(anyhow::Error::msg)?;
+
+    let setup = (!args.no_setup && cfg!(unix))
+        .then(|| setup::find(&*host, &wt.path))
+        .flatten()
+        .zip(setup::env(&*host, &wt.main_root, &wt.path));
+    let overrides = tty7_core::core::config::Config::load().agent_launch;
+    let agent_line =
+        agent.map(|a| setup::agent_line(a, args.task.as_deref().unwrap_or(""), &overrides));
+    let line = setup::launch_line(
+        &wt.path,
+        setup
+            .as_ref()
+            .map(|(s, env)| (s.script.as_path(), env.as_slice())),
+        agent_line,
+    );
+
+    let cwd = wt.path.to_string_lossy().into_owned();
+    let pane = backend.spawn_shell(ws, Some(cwd.clone()))?;
+    let tab = match backend.control(ControlRequest::TabCreate {
+        workspace: ws,
+        at: None,
+        pane: PaneSeed {
+            pane,
+            cwd: Some(cwd.clone()),
+            ssh_spec: None,
+            agent: None,
+            shell: None,
+        },
+        tab: None,
+    })? {
+        ReplyOk::TabTree(tab) => *tab,
+        other => bail!("the server answered TabCreate with {other:?}"),
+    };
+    backend.control(ControlRequest::TabRename {
+        workspace: ws,
+        tab: tab.id,
+        name: Some(wt.branch.clone()),
+    })?;
+    if let Some(line) = &line {
+        backend.send_input(pane, format!("{line}\r").into_bytes())?;
+    }
+
+    let mut notes = vec![format!("branch {} from {}", wt.branch, req.base)];
+    if !wt.carried.copied.is_empty() {
+        notes.push(format!("copied {}", wt.carried.copied.join(", ")));
+    }
+    for (path, why) in &wt.carried.skipped {
+        notes.push(format!("not copied {path}: {why}"));
+    }
+    notes.push(format!("pane %{pane}"));
+    if setup.is_some() {
+        notes.push("running .tty7/setup".into());
+    }
+    report(
+        format!("{cwd}\n  {}", notes.join(" · ")),
+        json!({
+            "path": cwd,
+            "branch": wt.branch,
+            "base": req.base,
+            "tab": tab.id.to_string(),
+            "pane": pane,
+            "setup": setup.is_some(),
+            "port": setup::port_base(&wt.path),
+            "copied": wt.carried.copied,
+            "skipped": wt.carried.skipped.iter().map(|(p, why)| json!({ "path": p, "reason": why })).collect::<Vec<_>>(),
+            "command": line,
+        }),
+    )
+}
+
+fn worktree_ls(repo: Option<std::path::PathBuf>, backend: &mut dyn Backend) -> Result<Outcome> {
+    let host = tty7_core::host::local::LocalHost::new();
+    let repo = repo_or_here(repo)?;
+    let listed = tty7_core::core::worktree::list(&*host, &repo).map_err(anyhow::Error::msg)?;
+    // Each live pane belongs to the deepest checkout its cwd is in: the main
+    // checkout contains `.tty7/worktrees/*`, and a pane in one of those is
+    // not also working in main.
+    let mut owner: Vec<Vec<u64>> = vec![Vec::new(); listed.len()];
+    for pane in backend.list_panes().unwrap_or_default() {
+        let Some(cwd) = pane.cwd.as_deref().filter(|_| pane.alive) else {
+            continue;
+        };
+        let deepest = listed
+            .iter()
+            .enumerate()
+            .filter(|(_, wt)| cwd.starts_with(&wt.path))
+            .max_by_key(|(_, wt)| wt.path.components().count());
+        if let Some((i, _)) = deepest {
+            owner[i].push(pane.pane_id);
+        }
+    }
+    let mut human = Vec::new();
+    let mut rows = Vec::new();
+    for (wt, inside) in listed.iter().zip(owner) {
+        let kind = match (wt.main, wt.managed) {
+            (true, _) => "main",
+            (false, true) => "tty7",
+            (false, false) => "",
+        };
+        let panes_text = inside
+            .iter()
+            .map(|p| format!("%{p}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        human.push(format!(
+            "{:<5} {:<28} {:<12} {}",
+            kind,
+            wt.branch.as_deref().unwrap_or("(detached)"),
+            panes_text,
+            wt.path.display()
+        ));
+        rows.push(json!({
+            "path": wt.path,
+            "branch": wt.branch,
+            "main": wt.main,
+            "managed": wt.managed,
+            "panes": inside,
+        }));
+    }
+    report(human.join("\n"), json!({ "worktrees": rows }))
+}
+
+fn worktree_rm(
+    target: &str,
+    force: bool,
+    close_panes: bool,
+    repo: Option<std::path::PathBuf>,
+    backend: &mut dyn Backend,
+) -> Result<Outcome> {
+    use tty7_core::core::worktree;
+
+    let host = tty7_core::host::local::LocalHost::new();
+    let repo = repo_or_here(repo)?;
+    let wt = worktree::find(&*host, &repo, target).map_err(anyhow::Error::msg)?;
+    let occupying: Vec<u64> = backend
+        .list_panes()?
+        .into_iter()
+        .filter(|p| p.alive && p.cwd.as_deref().is_some_and(|c| c.starts_with(&wt.path)))
+        .map(|p| p.pane_id)
+        .collect();
+    if !occupying.is_empty() {
+        let list = occupying
+            .iter()
+            .map(|p| format!("%{p}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !close_panes {
+            bail!(
+                "{list} still working in {} — close them, or pass --close-panes",
+                wt.path.display()
+            );
+        }
+        // A dirty checkout is refused before anything is closed, so a
+        // missing --force does not cost the panes.
+        if wt.dirty && !force {
+            bail!(
+                "{} has uncommitted changes — pass --force to remove it anyway (they are snapshotted first)",
+                wt.path.display()
+            );
+        }
+        for pane in &occupying {
+            backend.kill_pane(*pane)?;
+        }
+    }
+    let removed = worktree::remove(&*host, &wt, force).map_err(|e| {
+        anyhow::anyhow!(if wt.dirty && !force {
+            format!("{e} — pass --force to remove it anyway (they are snapshotted first)")
+        } else {
+            e
+        })
+    })?;
+    let mut notes = vec![format!("removed {}", wt.path.display())];
+    if let Some(snapshot) = &removed.snapshot {
+        notes.push(format!("last state in {snapshot}"));
+    }
+    if removed.branch_kept {
+        notes.push(format!("kept branch {} (unmerged commits)", wt.branch));
+    }
+    report(
+        notes.join(" · "),
+        json!({
+            "path": wt.path,
+            "branch": wt.branch,
+            "snapshot": removed.snapshot,
+            "branch_kept": removed.branch_kept,
+            "closed_panes": occupying,
+        }),
+    )
+}
+
 fn tab_rename(tab: &str, name: String, backend: &mut dyn Backend) -> Result<Outcome> {
     let addr = address::parse_tab(tab)?;
     let machine = fetch_machine(backend)?;
@@ -907,6 +1438,7 @@ fn pane_ls(explicit: Option<&str>, all: bool, backend: &mut dyn Backend) -> Resu
                     "tab": tab.id.to_string(),
                     "cwd": record.and_then(|r| r.cwd.clone()),
                     "live": record.map(|r| r.live),
+                    "hibernated": tab.hibernated,
                 }));
             }
         }
@@ -1644,7 +2176,7 @@ fn agents_human(
     for diagnostic in diagnostics {
         let state = diagnostic.gap.describe();
         human.push_str(&format!(
-            "{} is running, but its tty7 agent-status hooks are {state}. Open Settings → Agents to {} the hooks, then start a new {} session.\n",
+            "{} is running, but its tty7 agent-status hooks are {state}. Open Settings → Integrations to {} the hooks, then start a new {} session.\n",
             diagnostic.agent.display_name(),
             diagnostic.gap.action(),
             diagnostic.agent.display_name(),
@@ -1816,7 +2348,7 @@ fn hooks_summary(hooks: &[(HookAgent, HooksState)]) -> String {
         summary.push_str(&format!("; {missing} not installed"));
     }
     if installed.is_empty() || !outdated.is_empty() {
-        summary.push_str(" (Settings → Agents)");
+        summary.push_str(" (Settings → Integrations)");
     }
     summary
 }
@@ -2229,10 +2761,22 @@ mod tests {
         );
     }
 
+    /// File tab @2 under a pinned folder group, the way the GUI would.
+    fn pin_second_tab(backend: &mut MockBackend, name: Option<&str>) -> String {
+        use tty7_core::core::group_key::PinnedGroup;
+        let mut group = PinnedGroup::folder(std::path::Path::new("C:\\proj\\sub"));
+        group.name = name.map(str::to_string);
+        let id = group.id;
+        let ws = &mut backend.machine.workspaces[0];
+        ws.groups.pinned.push(group);
+        ws.tabs[1].group = Some(id);
+        id.to_string()
+    }
+
     #[test]
     fn tab_ls_names_an_unnamed_tab_and_shows_the_leaf_of_its_group() {
         let mut backend = mock();
-        backend.machine.workspaces[0].tabs[1].sidebar_group = Some("C:\\proj\\sub".into());
+        pin_second_tab(&mut backend, None);
 
         let out = run_cli(
             &["tty7", "tab", "ls", "api"],
@@ -2241,7 +2785,8 @@ mod tests {
         );
 
         // @1 was named; @2 was not, so it borrows the leaf of its cwd. The
-        // GROUP column is the heading's last segment, not the whole path.
+        // GROUP column is what the header reads — the folder's last segment
+        // for a group nobody renamed, not the whole path.
         assert_eq!(
             human(out),
             "TAB  NAME   GROUP  PANES\n@1   build  -      1\n@2   proj   sub    2\n"
@@ -2249,9 +2794,46 @@ mod tests {
     }
 
     #[test]
+    fn tab_ls_shows_a_renamed_group_by_its_name() {
+        let mut backend = mock();
+        pin_second_tab(&mut backend, Some("work"));
+
+        let out = run_cli(
+            &["tty7", "tab", "ls", "api"],
+            &Context::default(),
+            &mut backend,
+        );
+
+        assert_eq!(
+            human(out),
+            "TAB  NAME   GROUP  PANES\n@1   build  -      1\n@2   proj   work   2\n"
+        );
+    }
+
+    /// A tab naming a group the workspace no longer has is an auto tab, as
+    /// the sidebar draws it.
+    #[test]
+    fn tab_ls_shows_no_group_for_a_tab_naming_a_deleted_one() {
+        let mut backend = mock();
+        pin_second_tab(&mut backend, None);
+        backend.machine.workspaces[0].groups.pinned.clear();
+
+        let out = run_cli(
+            &["tty7", "tab", "ls", "api"],
+            &Context::default(),
+            &mut backend,
+        );
+
+        assert_eq!(
+            human(out),
+            "TAB  NAME   GROUP  PANES\n@1   build  -      1\n@2   proj   -      2\n"
+        );
+    }
+
+    #[test]
     fn tab_ls_json_keeps_the_literal_name_beside_the_label() {
         let mut backend = mock();
-        backend.machine.workspaces[0].tabs[1].sidebar_group = Some("C:\\proj\\sub".into());
+        let id = pin_second_tab(&mut backend, None);
 
         let out = run_cli(
             &["tty7", "tab", "ls", "api"],
@@ -2266,9 +2848,11 @@ mod tests {
         assert_eq!(tabs[1]["name"], Value::Null, "nobody named this tab");
         assert_eq!(tabs[1]["label"], "proj", "the table's stand-in travels too");
         assert_eq!(
-            tabs[1]["group"], "C:\\proj\\sub",
-            "the JSON keeps the whole heading the table abbreviates"
+            tabs[1]["group"],
+            json!({ "id": id, "name": null, "folder": "C:\\proj\\sub" }),
+            "the JSON keeps the whole folder the table abbreviates"
         );
+        assert_eq!(tabs[0]["group"], Value::Null, "an auto tab names no group");
     }
 
     #[test]
@@ -3446,6 +4030,7 @@ mod tests {
             local_pty: true,
             at_prompt,
             remote_prompt_seen: false,
+            bracketed_paste: None,
         }
     }
 
@@ -3472,6 +4057,7 @@ mod tests {
                 local_pty: true,
                 at_prompt,
                 remote_prompt_seen,
+                bracketed_paste: None,
             }),
         }
     }
@@ -3493,6 +4079,7 @@ mod tests {
                 local_pty: false,
                 at_prompt,
                 remote_prompt_seen: at_prompt == Some(true),
+                bracketed_paste: None,
             }),
         }
     }
@@ -3508,6 +4095,7 @@ mod tests {
             name: name.into(),
             depth,
             foreground,
+            ..Default::default()
         }
     }
 
@@ -4424,7 +5012,7 @@ mod tests {
             r.human
         );
         assert!(
-            r.human.contains("Settings → Agents"),
+            r.human.contains("Settings → Integrations"),
             "say where the fix is: {}",
             r.human
         );
@@ -4471,5 +5059,376 @@ mod tests {
             "{:?}",
             backend.control_calls
         );
+    }
+
+    #[test]
+    fn tab_ls_and_pane_ls_say_which_tabs_are_asleep() {
+        let mut backend = mock();
+        backend.machine.workspaces[0].tabs[1].hibernated = true;
+
+        let Outcome::Report(tabs) = run_cli(
+            &["tty7", "tab", "ls", "api"],
+            &Context::default(),
+            &mut backend,
+        ) else {
+            panic!("tab ls must report");
+        };
+        let tabs = tabs.json["tabs"].as_array().expect("tabs").clone();
+        assert_eq!(tabs[0]["hibernated"], false);
+        assert_eq!(tabs[1]["hibernated"], true);
+
+        let Outcome::Report(panes) = run_cli(
+            &["tty7", "pane", "ls", "api"],
+            &Context::default(),
+            &mut backend,
+        ) else {
+            panic!("pane ls must report");
+        };
+        let panes = panes.json["panes"].as_array().expect("panes").clone();
+        let asleep: Vec<u64> = panes
+            .iter()
+            .filter(|p| p["hibernated"] == true)
+            .map(|p| p["pane"].as_u64().unwrap())
+            .collect();
+        assert_eq!(asleep, vec![2, 3]);
+    }
+
+    fn exec_run(end: ExecEnd, output: &[u8]) -> crate::exec::ExecRun {
+        crate::exec::ExecRun {
+            end,
+            output: output.to_vec(),
+            dropped: 0,
+            size: segment(b"").size,
+        }
+    }
+
+    fn exec_outcome(args: &[&str], ctx: &Context, backend: &mut MockBackend) -> (i32, Report) {
+        match execute(cli(args), ctx, backend) {
+            Ok(Outcome::Exit(code, report)) => (code, report),
+            other => panic!("exec stands in for the command, so it exits: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_types_one_line_and_passes_the_exit_code_through() {
+        let mut backend = mock();
+        backend.exec_run = exec_run(
+            ExecEnd::Finished {
+                exit: Some(3),
+                ran: true,
+            },
+            b"built\r\n",
+        );
+        let (code, report) = exec_outcome(
+            &[
+                "tty7",
+                "exec",
+                "%1",
+                "--raw",
+                "--timeout",
+                "30",
+                "--",
+                "make",
+                "&&",
+                "ls",
+            ],
+            &Context::default(),
+            &mut backend,
+        );
+        assert_eq!(code, 3, "the command's own code, not ours");
+        assert_eq!(
+            backend.execs,
+            vec![(1, b"make && ls\r".to_vec(), Some(Duration::from_secs(30)))],
+            "the words are one shell line, typed and submitted"
+        );
+        assert_eq!(report.human, "built\r\n");
+        assert_eq!(report.json["exit"], 3);
+        assert_eq!(report.json["exit_code_known"], true);
+        assert_eq!(report.json["command"], "make && ls");
+        assert_eq!(report.json["output"], "built\r\n");
+        assert_eq!(report.json["timed_out"], false);
+        // Nothing was sent anywhere but through the exec seam.
+        assert!(backend.sent.is_empty());
+    }
+
+    #[test]
+    fn exec_renders_the_output_the_way_capture_plain_does() {
+        let mut backend = mock();
+        backend.exec_run = exec_run(
+            ExecEnd::Finished {
+                exit: Some(0),
+                ran: true,
+            },
+            b"\x1b[31mred\x1b[0m\r\nprogress 10%\rprogress 100%\r\n",
+        );
+        let (code, report) = exec_outcome(
+            &["tty7", "exec", "%1", "--", "x"],
+            &Context::default(),
+            &mut backend,
+        );
+        assert_eq!(code, 0);
+        assert!(!report.human.contains('\u{1b}'), "{:?}", report.human);
+        assert!(report.human.contains("red"), "{:?}", report.human);
+        assert!(report.human.contains("progress 100%"), "{:?}", report.human);
+        assert!(
+            !report.human.contains("progress 10%\n"),
+            "{:?}",
+            report.human
+        );
+    }
+
+    #[test]
+    fn exec_refuses_a_pane_it_cannot_follow_before_typing_anything() {
+        // The backend sends nothing on these; the verb has to turn them into
+        // an error that says what to do instead of an exit code that says
+        // nothing.
+        let mut backend = mock();
+        backend.exec_run = exec_run(ExecEnd::NoIntegration, b"");
+        let err = execute(
+            cli(&["tty7", "exec", "%1", "--", "ls"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("shell-integration"), "{err}");
+        assert!(err.contains("wait --until free"), "{err}");
+
+        let mut backend = mock();
+        backend.exec_run = exec_run(ExecEnd::Busy, b"");
+        let err = execute(
+            cli(&["tty7", "exec", "%1", "--", "ls"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not at a shell prompt"), "{err}");
+
+        // The caller's own pane can only ever be busy — running this.
+        let ctx = Context {
+            pane: Some("%1".into()),
+            ..Context::default()
+        };
+        let err = execute(cli(&["tty7", "exec", "--", "ls"]), &ctx, &mut backend)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("this shell"), "{err}");
+    }
+
+    #[test]
+    fn exec_refuses_a_line_the_editor_would_act_on() {
+        for line in ["make\nrm -rf build", "ls\tx", "a\u{1b}b"] {
+            let mut backend = mock();
+            let err = execute(
+                cli(&["tty7", "exec", "%1", "--", line]),
+                &Context::default(),
+                &mut backend,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("control"), "{line:?}: {err}");
+            assert!(backend.execs.is_empty(), "nothing may be typed: {line:?}");
+        }
+    }
+
+    #[test]
+    fn exec_reports_every_way_it_can_end_without_an_exit_code() {
+        let cases = [
+            (ExecEnd::TimedOut { started: true }, 124, true, false),
+            (ExecEnd::TimedOut { started: false }, 124, true, false),
+            (ExecEnd::PaneExited(Some(0)), 1, false, true),
+            (
+                ExecEnd::Finished {
+                    exit: None,
+                    ran: true,
+                },
+                1,
+                false,
+                false,
+            ),
+            (
+                ExecEnd::Finished {
+                    exit: None,
+                    ran: false,
+                },
+                1,
+                false,
+                false,
+            ),
+        ];
+        for (end, want, timed_out, pane_exited) in cases {
+            let mut backend = mock();
+            backend.exec_run = exec_run(end.clone(), b"partial\r\n");
+            let (code, report) = exec_outcome(
+                &["tty7", "exec", "%1", "--raw", "--timeout", "1", "--", "x"],
+                &Context::default(),
+                &mut backend,
+            );
+            assert_eq!(code, want, "{end:?}");
+            assert_eq!(report.json["exit_code_known"], false, "{end:?}");
+            assert_eq!(report.json["timed_out"], timed_out, "{end:?}");
+            assert_eq!(report.json["pane_exited"], pane_exited, "{end:?}");
+            assert_eq!(
+                report.human, "partial\r\n",
+                "what did arrive is still the answer: {end:?}"
+            );
+        }
+    }
+
+    fn procs_with_paste_mode(mode: Option<bool>) -> tty7_core::daemon::protocol::PaneProcs {
+        tty7_core::daemon::protocol::PaneProcs {
+            context: Some(tty7_core::daemon::protocol::PaneContext {
+                local_pty: true,
+                bracketed_paste: mode,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn send_from_file_sends_the_bytes_verbatim_and_never_echoes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, b"s3cr\\et\n\xff").unwrap();
+        let mut backend = mock();
+        let json = json_of(run_cli(
+            &["tty7", "send", "%1", "--from-file", path.to_str().unwrap()],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(backend.sent, vec![(1, b"s3cr\\et\n\xff".to_vec())]);
+        assert!(
+            json["sent"].is_null(),
+            "the secret must not be echoed: {json}"
+        );
+        assert!(!json.to_string().contains("s3cr"), "{json}");
+        assert_eq!(json["source"], "file");
+        assert_eq!(json["bytes"], 9);
+        assert!(
+            backend.procs_calls.is_empty(),
+            "without --paste the pane is not asked anything"
+        );
+
+        // Keys still follow the payload, the way they follow typed text.
+        let mut backend = mock();
+        run_cli(
+            &[
+                "tty7",
+                "send",
+                "%1",
+                "--from-file",
+                path.to_str().unwrap(),
+                "--enter",
+            ],
+            &Context::default(),
+            &mut backend,
+        );
+        assert_eq!(
+            backend.sent,
+            vec![(1, b"s3cr\\et\n\xff".to_vec()), (1, b"\r".to_vec())]
+        );
+    }
+
+    #[test]
+    fn send_from_file_takes_its_positional_as_an_address_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload");
+        std::fs::write(&path, b"x").unwrap();
+        let mut backend = mock();
+        let err = execute(
+            cli(&[
+                "tty7",
+                "send",
+                "echo",
+                "--from-file",
+                path.to_str().unwrap(),
+            ]),
+            &Context::default(),
+            &mut backend,
+        )
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("has to be the pane"), "{err}");
+        assert!(backend.sent.is_empty(), "nothing may be typed");
+
+        // With no address it is this pane, as it is for text.
+        let ctx = Context {
+            pane: Some("%3".into()),
+            ..Context::default()
+        };
+        run_cli(
+            &["tty7", "send", "--from-file", path.to_str().unwrap()],
+            &ctx,
+            &mut backend,
+        );
+        assert_eq!(backend.sent, vec![(3, b"x".to_vec())]);
+    }
+
+    #[test]
+    fn send_paste_frames_only_for_a_pane_that_switched_bracketed_paste_on() {
+        let mut backend = mock();
+        backend.procs_reply = procs_with_paste_mode(Some(true));
+        let json = json_of(run_cli(
+            &[
+                "tty7",
+                "send",
+                "%1",
+                "a\r\nb\x1b[201~c",
+                "--paste",
+                "--enter",
+            ],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(
+            backend.sent,
+            vec![
+                (1, b"\x1b[200~a\nb[201~c\x1b[201~".to_vec()),
+                (1, b"\r".to_vec())
+            ],
+            "the GUI's framing: CRLF folded, ESC stripped so the text cannot close the paste"
+        );
+        assert_eq!(json["bracketed"], true);
+        assert_eq!(json["bracketed_paste_mode"], true);
+
+        // Off: brackets would reach the program as keystrokes, so the text goes
+        // the way a paste into such a pane always has — a CR per line break.
+        let mut backend = mock();
+        backend.procs_reply = procs_with_paste_mode(Some(false));
+        let json = json_of(run_cli(
+            &["tty7", "send", "%1", "a\nb", "--paste"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(backend.sent, vec![(1, b"a\rb".to_vec())]);
+        assert_eq!(json["bracketed"], false);
+        assert_eq!(json["bracketed_paste_mode"], false);
+
+        // A server that cannot say is not taken as a yes.
+        let mut backend = mock();
+        backend.procs_reply = procs_with_paste_mode(None);
+        let json = json_of(run_cli(
+            &["tty7", "send", "%1", "a\nb", "--paste"],
+            &Context::default(),
+            &mut backend,
+        ));
+        assert_eq!(backend.sent, vec![(1, b"a\rb".to_vec())]);
+        assert!(json["bracketed_paste_mode"].is_null(), "{json}");
+    }
+
+    #[test]
+    fn send_paste_needs_something_to_paste() {
+        let mut backend = mock();
+        let err = execute(
+            cli(&["tty7", "send", "%1", "--paste", "--enter"]),
+            &Context::default(),
+            &mut backend,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--paste needs text"), "{err}");
+        assert!(backend.sent.is_empty());
     }
 }

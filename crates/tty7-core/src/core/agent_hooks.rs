@@ -21,10 +21,38 @@ pub fn run_agent_hook(agent: &str, event: &str) {
     if !std::io::stdin().is_terminal() {
         let _ = std::io::stdin().take(MAX_STDIN).read_to_string(&mut input);
     }
+    let input = hook_payload(agent, input, |k| std::env::var(k).ok());
     let Some(event) = effective_event(agent, event, &input) else {
         return;
     };
-    write_to_controlling_tty(&build_hook_sequence(agent, event, &input));
+    let body = build_hook_body(agent, event, &input);
+    if report_to_daemon(&body) {
+        return;
+    }
+    write_to_controlling_tty(&hook_sequence(&body));
+}
+
+/// Hand the report to the daemon that owns this pane, over its socket.
+///
+/// The tty is the channel of last resort. The agent draws on it too, and a
+/// tty write is not atomic — on macOS the kernel parks a writer mid-write
+/// whenever the output queue is full, which is exactly when an agent is busy
+/// redrawing — so the agent's output can land inside the sequence, break it,
+/// and leave the rest of it on screen as text. The socket has no such
+/// neighbour. It only works where the daemon runs, though: a hook the
+/// environment points at no daemon, at a daemon that predates this message,
+/// or at a pane it does not run in (see `DaemonPane::report_agent_event`)
+/// falls back to the tty.
+fn report_to_daemon(body: &str) -> bool {
+    let Some(pane) = std::env::var(crate::daemon::pane::TTY7_PANE_ENV)
+        .ok()
+        .and_then(|p| p.trim().parse::<u64>().ok())
+    else {
+        return false;
+    };
+    crate::client::PaneClient::local()
+        .report_agent_event(pane, std::process::id(), body)
+        .is_ok()
 }
 
 #[cfg(not(unix))]
@@ -38,14 +66,62 @@ fn detach_console() {
 #[cfg(unix)]
 fn detach_console() {}
 
+/// The event's payload: what the agent wrote on stdin, or — for jcode, which
+/// leaves stdin closed and describes the event in its environment instead —
+/// the JSON mirror it exports as `JCODE_HOOK_PAYLOAD` (`session_id`, `cwd`,
+/// and the event's own fields).
+fn hook_payload(agent: &str, stdin: String, env: impl Fn(&str) -> Option<String>) -> String {
+    if agent == "jcode"
+        && stdin.trim().is_empty()
+        && let Some(payload) = env("JCODE_HOOK_PAYLOAD").filter(|p| !p.trim().is_empty())
+    {
+        return payload;
+    }
+    stdin
+}
+
 fn effective_agent(agent: &str, ran_by_grok: bool) -> &str {
     if ran_by_grok { "grok" } else { agent }
 }
 
+/// The tools that stop a turn to ask the user a question: Claude's
+/// `AskUserQuestion` and Codex's `request_user_input`. Neither goes through a
+/// permission prompt, so their `PreToolUse` is the only sign the turn is now
+/// waiting on the user.
+const QUESTION_TOOLS: &[&str] = &["AskUserQuestion", "request_user_input"];
+
 fn effective_event<'a>(agent: &str, event: &'a str, stdin_json: &str) -> Option<&'a str> {
-    // Qoder and CodeBuddy also emit SessionStart after compacting the active
-    // turn. Preserve its status until a real turn or session boundary arrives.
-    if matches!(agent, "qodercli" | "codebuddy")
+    // `tool-start` is not an event of its own: it fires before every tool
+    // call, and only the ones that ask the user something change the status.
+    if event == "tool-start" {
+        let payload = serde_json::from_str::<serde_json::Value>(stdin_json).ok()?;
+        let tool = payload.get("tool_name").and_then(|t| t.as_str())?;
+        return QUESTION_TOOLS.contains(&tool).then_some("question-asked");
+    }
+    // Antigravity has no turn-start event, only `PreInvocation` before every
+    // model call. The first call of a turn starts it; later ones are the same
+    // turn still working, and must not count as new prompts. `Stop` with
+    // `fullyIdle: false` ends one execution loop while more are queued.
+    if agent == "antigravity"
+        && let Ok(payload) = serde_json::from_str::<serde_json::Value>(stdin_json)
+    {
+        if event == "prompt-submit"
+            && payload
+                .get("invocationNum")
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0)
+                > 0
+        {
+            return Some("tool-complete");
+        }
+        if event == "stop" && payload.get("fullyIdle").and_then(|v| v.as_bool()) == Some(false) {
+            return None;
+        }
+    }
+    // Qoder, its China build and CodeBuddy also emit SessionStart after
+    // compacting the active turn. Preserve its status until a real turn or
+    // session boundary arrives.
+    if matches!(agent, "qodercli" | "qoderclicn" | "codebuddy")
         && event == "session-start"
         && let Ok(payload) = serde_json::from_str::<serde_json::Value>(stdin_json)
         && payload.get("source").and_then(|value| value.as_str()) == Some("compact")
@@ -63,7 +139,19 @@ fn effective_event<'a>(agent: &str, event: &'a str, stdin_json: &str) -> Option<
     Some(event)
 }
 
+#[cfg(test)]
 fn build_hook_sequence(agent: &str, event: &str, stdin_json: &str) -> Vec<u8> {
+    hook_sequence(&build_hook_body(agent, event, stdin_json))
+}
+
+/// The report as it goes out on the tty: the body wrapped in the OSC 777
+/// notification the daemon's reader looks for.
+fn hook_sequence(body: &str) -> Vec<u8> {
+    format!("\x1b]777;notify;{AGENT_EVENT_SENTINEL};{body}\x07").into_bytes()
+}
+
+/// The report itself, as JSON — see `cli_agent::parse_agent_event_body`.
+fn build_hook_body(agent: &str, event: &str, stdin_json: &str) -> String {
     let payload: serde_json::Value =
         serde_json::from_str(stdin_json).unwrap_or(serde_json::json!({}));
     let mut body = serde_json::json!({
@@ -80,6 +168,8 @@ fn build_hook_sequence(agent: &str, event: &str, stdin_json: &str) -> Vec<u8> {
         ("cwd", "cwd"),
         // Goose spells the working directory its own way.
         ("cwd", "working_dir"),
+        // What started a session — see `cli_agent::AgentEvent::source`.
+        ("source", "source"),
     ] {
         if let Some(v) = payload
             .get(key)
@@ -90,11 +180,30 @@ fn build_hook_sequence(agent: &str, event: &str, stdin_json: &str) -> Vec<u8> {
             body[key] = serde_json::Value::String(v.to_string());
         }
     }
+    if let Some(message) = body.get_mut("message")
+        && let Some(text) = message.as_str()
+    {
+        *message = clip_chars(text, MESSAGE_MAX).into();
+    }
+    // Antigravity names the session after the conversation, in camelCase.
+    // Scoped to it: the alias table is last-write-wins, and another agent's
+    // unrelated `conversationId` must not replace its real session id.
+    if agent == "antigravity"
+        && body.get("session_id").is_none()
+        && let Some(id) = payload
+            .get("conversationId")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+    {
+        body["session_id"] = serde_json::Value::String(id.to_string());
+    }
     // Cursor puts `cwd` only on its tool events; the rest carry the workspace
     // roots instead, and the first of those is where the session runs.
+    // Antigravity's `workspacePaths` is the same list under its own name.
     if body.get("cwd").is_none()
         && let Some(root) = payload
             .get("workspace_roots")
+            .or_else(|| payload.get("workspacePaths"))
             .and_then(|r| r.as_array())
             .and_then(|r| r.first())
             .and_then(|r| r.as_str())
@@ -102,39 +211,238 @@ fn build_hook_sequence(agent: &str, event: &str, stdin_json: &str) -> Vec<u8> {
     {
         body["cwd"] = serde_json::Value::String(root.to_string());
     }
-    if let Some(prompt) = ["prompt", "userPrompt", "user_prompt"]
-        .iter()
-        .find_map(|k| payload.get(*k))
-        .and_then(|v| v.as_str())
-        .and_then(prompt_label)
-    {
-        body["prompt"] = serde_json::Value::String(prompt);
+    if agent == "claude" {
+        claude_readout(event, &payload, &mut body);
     }
-    format!("\x1b]777;notify;{AGENT_EVENT_SENTINEL};{body}\x07").into_bytes()
+    body.to_string()
 }
 
-/// How much of a prompt rides back to the terminal.
-///
-/// Two reasons it is short. The payload goes out as an OSC, and the tokenizer
-/// reading it *abandons* anything past 8 KiB rather than truncating — a pasted
-/// file would silently cost the whole event, not just its tail. And what the
-/// client does with this is label one row of a list and look for that text in
-/// the scrollback, neither of which can use more than a line.
-const PROMPT_LABEL_MAX: usize = 200;
+/// How much of the end of a transcript is read for the latest reply. One
+/// assistant entry is a few KiB; this is room for a long tool result after it.
+const TRANSCRIPT_TAIL: u64 = 512 * 1024;
 
-/// The first line of what the user typed, which is both the label an outline
-/// row shows and the needle that finds the turn again in the scrollback.
+/// How long `Stop` waits for its turn's reply to reach the transcript, and
+/// how often it looks meanwhile.
+const TRANSCRIPT_CATCH_UP: std::time::Duration = std::time::Duration::from_millis(600);
+const TRANSCRIPT_POLL: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// What Claude Code says about its settings, for the composer's toolbar:
+/// permission mode, model, the effort level.
 ///
-/// A line rather than the whole prompt because the terminal wrapped it across
-/// rows: a needle spanning a line break matches no single row, so the later
-/// lines would only make the search fail.
-fn prompt_label(text: &str) -> Option<String> {
-    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let end = line
-        .char_indices()
-        .nth(PROMPT_LABEL_MAX)
-        .map_or(line.len(), |(i, _)| i);
-    Some(line[..end].to_string())
+/// Worked out here, in the hook, because the hook runs where the agent runs —
+/// on a remote host its transcript and settings are only readable there.
+fn claude_readout(event: &str, payload: &serde_json::Value, body: &mut serde_json::Value) {
+    let str_of = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(mode) = str_of(payload.get("permission_mode")) {
+        body["permission_mode"] = mode.into();
+    }
+    // A new session names its model. After that only a finished turn says
+    // which it is: the model that wrote the reply `Stop` carries. Any other
+    // reply in the transcript may be from before a `/model`, or from before
+    // a resume under another `--model` — and saying nothing beats that.
+    let model = str_of(payload.get("model")).or_else(|| {
+        if event != "stop" {
+            return None;
+        }
+        let reply = str_of(payload.get("last_assistant_message"))?;
+        let path = str_of(payload.get("transcript_path"))?;
+        let prompt_id = str_of(payload.get("prompt_id"));
+        turn_reply_model(Path::new(&path), &reply, prompt_id.as_deref())
+    });
+    if let Some(model) = &model {
+        body["model"] = model.clone().into();
+    }
+    // Claude says the level it is running at, when it says it — and at the
+    // end of a turn it says it whenever the model takes one, so a finished
+    // turn without it ran on a model that does not: that is reported as an
+    // empty level. So is one for a model Claude's own model catalog lists
+    // without effort levels. Otherwise the environment wins over the settings
+    // file, as it does for Claude — read only for a model this event names,
+    // since the file may set it per model.
+    let effort = str_of(payload.get("effort").and_then(|e| e.get("level"))).or_else(|| {
+        let model = model.as_deref()?;
+        if event == "stop" || catalog_says_no_effort(&claude_model_catalogs(), model) {
+            return Some(String::new());
+        }
+        std::env::var("CLAUDE_CODE_EFFORT_LEVEL")
+            .ok()
+            .filter(|e| !e.is_empty())
+            .or_else(|| configured_effort(&claude_settings(), Some(model)))
+    });
+    if let Some(effort) = effort {
+        body["effort"] = effort.into();
+    }
+}
+
+/// The effort level Claude's settings give a model: the one set for that
+/// model if there is one, the general one otherwise.
+fn configured_effort(settings: &serde_json::Value, model: Option<&str>) -> Option<String> {
+    let level = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.get("effortLevel"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let per_model = settings.get("modelSettings");
+    model
+        .and_then(|m| {
+            let per_model = per_model?;
+            level(
+                per_model
+                    .get(m)
+                    .or_else(|| per_model.get(m.trim_end_matches("[1m]"))),
+            )
+        })
+        .or_else(|| level(Some(settings)))
+}
+
+fn claude_config_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".claude")))
+}
+
+fn claude_settings() -> serde_json::Value {
+    claude_config_dir()
+        .and_then(|d| std::fs::read(d.join("settings.json")).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(serde_json::json!({}))
+}
+
+/// The model catalogs Claude Code keeps in its cache, one per account it
+/// has signed in with, as parsed JSON. None, if it has not fetched any.
+fn claude_model_catalogs() -> Vec<serde_json::Value> {
+    let Some(dir) = claude_config_dir().map(|d| d.join("cache").join("model-catalog")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter(|e| e.metadata().is_ok_and(|m| m.len() <= MAX_CONFIG_BYTES))
+        .filter_map(|e| std::fs::read(e.path()).ok())
+        .filter_map(|b| serde_json::from_slice(&b).ok())
+        .collect()
+}
+
+/// Whether Claude's model catalogs list `model` as taking no effort level —
+/// Haiku, say. Only a model they list counts, and only when every catalog
+/// that lists it agrees: a model they do not know may well take one.
+fn catalog_says_no_effort(catalogs: &[serde_json::Value], model: &str) -> bool {
+    let model = model.trim_end_matches("[1m]");
+    let mut listed = catalogs
+        .iter()
+        .filter_map(|c| c.pointer("/catalog/config/models")?.as_array())
+        .flatten()
+        .filter(|m| m.get("id").and_then(|id| id.as_str()) == Some(model))
+        .peekable();
+    listed.peek().is_some()
+        && listed.all(|m| {
+            m.pointer("/thinking/effort_options")
+                .and_then(|o| o.as_array())
+                .is_none_or(|o| o.is_empty())
+        })
+}
+
+/// The model that wrote `reply` to the prompt `prompt_id`, once the
+/// transcript has it as its latest words. Claude Code runs `Stop` before
+/// that write is always on disk, so this waits a little for it — reading
+/// the tail again only once the transcript has grown.
+fn turn_reply_model(path: &Path, reply: &str, prompt_id: Option<&str>) -> Option<String> {
+    let deadline = std::time::Instant::now() + TRANSCRIPT_CATCH_UP;
+    let mut read = None;
+    loop {
+        if let Some(model) =
+            transcript_tail(path, &mut read).and_then(|t| reply_model_in(&t, reply, prompt_id))
+        {
+            return Some(model);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(TRANSCRIPT_POLL);
+    }
+}
+
+/// The transcript's last [`TRANSCRIPT_TAIL`] bytes, unless it is still the
+/// length `read` last saw — then nothing new is in it.
+fn transcript_tail(path: &Path, read: &mut Option<u64>) -> Option<String> {
+    use std::io::{Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if read.replace(len) == Some(len) {
+        return None;
+    }
+    file.seek(SeekFrom::Start(len.saturating_sub(TRANSCRIPT_TAIL)))
+        .ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    Some(String::from_utf8_lossy(&tail).into_owned())
+}
+
+/// The model of the transcript's latest main-thread words, when those words
+/// are `reply` and come after the prompt `prompt_id` names — the same words
+/// can close an earlier turn too. Subagents' entries are skipped — they may
+/// run on a model of their own — and so are the notices Claude Code writes
+/// as replies.
+fn reply_model_in(jsonl: &str, reply: &str, prompt_id: Option<&str>) -> Option<String> {
+    let mut words = None;
+    let mut prompted = prompt_id.is_none();
+    for line in jsonl.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let kind = entry.get("type").and_then(|t| t.as_str());
+        if kind == Some("user") {
+            if prompt_id.is_some() && entry.get("promptId").and_then(|p| p.as_str()) == prompt_id {
+                prompted = true;
+                words = None;
+            }
+            continue;
+        }
+        if kind != Some("assistant")
+            || entry.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+        {
+            continue;
+        }
+        let Some(message) = entry.get("message") else {
+            continue;
+        };
+        let model = message.get("model").and_then(|m| m.as_str());
+        let text: String = message
+            .get("content")
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect();
+        if let Some(model) = model.filter(|m| *m != "<synthetic>")
+            && !text.trim().is_empty()
+        {
+            words = Some((model.to_string(), text));
+        }
+    }
+    let (model, text) = words.filter(|_| prompted)?;
+    (text.trim() == reply.trim()).then_some(model)
+}
+
+/// How much of an agent's message rides back to the terminal. It only ever
+/// fills a status line, and every byte of the sequence is a byte another
+/// writer on the same tty can cut in on.
+const MESSAGE_MAX: usize = 200;
+
+fn clip_chars(text: &str, max: usize) -> &str {
+    text.char_indices()
+        .nth(max)
+        .map_or(text, |(i, _)| &text[..i])
 }
 
 #[cfg(unix)]
@@ -148,13 +456,34 @@ fn write_to_controlling_tty(bytes: &[u8]) -> bool {
     false
 }
 
+/// Write `bytes` to the terminal device at `path`.
+///
+/// The device is opened without waiting. A blocking open of a terminal whose
+/// other end has gone — the pane closed while the agent was still running its
+/// session-end hook — waits for a carrier that never comes, and on macOS it
+/// waits holding the lock every lookup under `/dev` needs: the hook hangs, the
+/// agent it belongs to cannot finish exiting, and every new terminal, `ps`
+/// and `tty` on the machine hangs behind them. Once open, the device goes back
+/// to blocking writes, so a full output queue delays the sequence rather than
+/// cutting it short; a terminal with no other end fails the write instead.
 #[cfg(unix)]
 fn write_dev(path: &std::path::Path, bytes: &[u8]) -> bool {
     use std::io::Write as _;
-    match std::fs::OpenOptions::new().write(true).open(path) {
-        Ok(mut tty) => tty.write_all(bytes).and_then(|_| tty.flush()).is_ok(),
-        Err(_) => false,
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let Ok(mut tty) = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)
+    else {
+        return false;
+    };
+    let fd = tty.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return false;
     }
+    tty.write_all(bytes).and_then(|_| tty.flush()).is_ok()
 }
 
 #[cfg(unix)]
@@ -266,7 +595,7 @@ fn ancestor_pids(procs: &[crate::daemon::winproc::Proc]) -> Vec<u32> {
     out
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum HookAgent {
     Claude,
     Codex,
@@ -285,10 +614,16 @@ pub enum HookAgent {
     Crush,
     CodeBuddy,
     Cursor,
+    PrimeAgent,
+    Antigravity,
+    QoderCLICn,
+    Empryo,
+    Jcode,
+    Muse,
 }
 
 impl HookAgent {
-    pub const ALL: [HookAgent; 17] = [
+    pub const ALL: [HookAgent; 23] = [
         HookAgent::Claude,
         HookAgent::Codex,
         HookAgent::TraeCode,
@@ -303,9 +638,15 @@ impl HookAgent {
         HookAgent::Goose,
         HookAgent::Kimi,
         HookAgent::QoderCLI,
+        HookAgent::QoderCLICn,
         HookAgent::Crush,
         HookAgent::CodeBuddy,
         HookAgent::Cursor,
+        HookAgent::PrimeAgent,
+        HookAgent::Antigravity,
+        HookAgent::Empryo,
+        HookAgent::Jcode,
+        HookAgent::Muse,
     ];
 
     /// The hooks behind a detected agent process, if it has any.
@@ -323,12 +664,18 @@ impl HookAgent {
             CLIAgent::Pi => Some(HookAgent::Pi),
             CLIAgent::Grok => Some(HookAgent::Grok),
             CLIAgent::OhMyPi => Some(HookAgent::OhMyPi),
+            CLIAgent::PrimeAgent => Some(HookAgent::PrimeAgent),
+            CLIAgent::Antigravity => Some(HookAgent::Antigravity),
+            CLIAgent::Empryo => Some(HookAgent::Empryo),
+            CLIAgent::Jcode => Some(HookAgent::Jcode),
+            CLIAgent::Muse => Some(HookAgent::Muse),
             CLIAgent::Gemini => Some(HookAgent::Gemini),
             CLIAgent::Droid => Some(HookAgent::Droid),
             CLIAgent::Qwen => Some(HookAgent::Qwen),
             CLIAgent::Goose => Some(HookAgent::Goose),
             CLIAgent::Kimi => Some(HookAgent::Kimi),
             CLIAgent::QoderCLI => Some(HookAgent::QoderCLI),
+            CLIAgent::QoderCLICn => Some(HookAgent::QoderCLICn),
             CLIAgent::Crush => Some(HookAgent::Crush),
             CLIAgent::CodeBuddy => Some(HookAgent::CodeBuddy),
             CLIAgent::Cursor => Some(HookAgent::Cursor),
@@ -336,8 +683,7 @@ impl HookAgent {
             | CLIAgent::Amp
             | CLIAgent::Auggie
             | CLIAgent::Hermes
-            | CLIAgent::Vibe
-            | CLIAgent::Antigravity => None,
+            | CLIAgent::Vibe => None,
         }
     }
 
@@ -352,7 +698,9 @@ impl HookAgent {
             HookAgent::Gemini => Some(GEMINI_HOOK_EVENTS),
             HookAgent::Droid => Some(DROID_HOOK_EVENTS),
             HookAgent::Qwen => Some(QWEN_HOOK_EVENTS),
-            HookAgent::QoderCLI => Some(QODER_HOOK_EVENTS),
+            HookAgent::QoderCLI | HookAgent::QoderCLICn => Some(QODER_HOOK_EVENTS),
+            HookAgent::Empryo => Some(EMPRYO_HOOK_EVENTS),
+            HookAgent::Jcode => Some(JCODE_HOOK_EVENTS),
             HookAgent::Crush => Some(CRUSH_HOOK_EVENTS),
             HookAgent::CodeBuddy => Some(CODEBUDDY_HOOK_EVENTS),
             HookAgent::Cursor => Some(CURSOR_HOOK_EVENTS),
@@ -361,8 +709,11 @@ impl HookAgent {
             | HookAgent::Pi
             | HookAgent::Grok
             | HookAgent::OhMyPi
+            | HookAgent::PrimeAgent
+            | HookAgent::Antigravity
             | HookAgent::Goose
-            | HookAgent::Kimi => None,
+            | HookAgent::Kimi
+            | HookAgent::Muse => None,
         }
     }
 
@@ -383,6 +734,17 @@ impl HookAgent {
     /// `hooks.json` was flat from the start.
     fn flat_hook_map(self) -> bool {
         matches!(self, HookAgent::Crush | HookAgent::Cursor)
+    }
+
+    /// The `name` tty7's hook-map entries carry, for an agent that shows one.
+    /// Gemini CLI prints `Executing Hook: <name>` above its input while a hook
+    /// runs, and falls back to the whole command — the quoted path of the
+    /// tty7 binary and its arguments — for a hook without a name.
+    fn hook_entry_name(self) -> Option<&'static str> {
+        match self {
+            HookAgent::Gemini => Some("tty7"),
+            _ => None,
+        }
     }
 
     /// The schema version a hook map has to declare at its root, if the agent
@@ -406,6 +768,11 @@ impl HookAgent {
             HookAgent::Pi => "pi",
             HookAgent::Grok => "grok",
             HookAgent::OhMyPi => "omp",
+            HookAgent::PrimeAgent => "prime-agent",
+            HookAgent::Antigravity => "antigravity",
+            HookAgent::Empryo => "empryo",
+            HookAgent::Jcode => "jcode",
+            HookAgent::Muse => "muse",
             HookAgent::Gemini => "gemini",
             HookAgent::Droid => "droid",
             HookAgent::Qwen => "qwen",
@@ -415,6 +782,7 @@ impl HookAgent {
             HookAgent::Crush => "crush",
             HookAgent::CodeBuddy => "codebuddy",
             HookAgent::Cursor => "cursor",
+            HookAgent::QoderCLICn => "qoderclicn",
         }
     }
 
@@ -428,6 +796,11 @@ impl HookAgent {
             HookAgent::Pi => "Pi",
             HookAgent::Grok => "Grok Build",
             HookAgent::OhMyPi => "Oh My Pi",
+            HookAgent::PrimeAgent => "Prime Agent",
+            HookAgent::Antigravity => "Antigravity",
+            HookAgent::Empryo => "Empryo",
+            HookAgent::Jcode => "jcode",
+            HookAgent::Muse => "Muse Code",
             HookAgent::Gemini => "Gemini",
             HookAgent::Droid => "Droid",
             HookAgent::Qwen => "Qwen Code",
@@ -437,6 +810,7 @@ impl HookAgent {
             HookAgent::Crush => "Crush",
             HookAgent::CodeBuddy => "CodeBuddy",
             HookAgent::Cursor => "Cursor CLI",
+            HookAgent::QoderCLICn => "Qoder CN CLI",
         }
     }
 
@@ -447,7 +821,7 @@ impl HookAgent {
     fn target_path(self, target: &HookTarget) -> PathBuf {
         match self {
             HookAgent::Claude => target.claude_settings_path(),
-            HookAgent::Codex => target.under_home(&[".codex", "hooks.json"]),
+            HookAgent::Codex => target.codex_hooks_path(),
             HookAgent::TraeCode => target.traecli_hooks_path(),
             HookAgent::Copilot => target.under_home(&[".copilot", "hooks", OWNED_FILE_STEM_JSON]),
             HookAgent::OpenCode => target.under(
@@ -455,11 +829,26 @@ impl HookAgent {
                 &["opencode", "plugins", OWNED_FILE_STEM_JS],
             ),
             HookAgent::Pi => target.under_home(&[".pi", "agent", "extensions", "tty7", "index.ts"]),
+            HookAgent::PrimeAgent => {
+                target.under_home(&[".prime", "agent", "extensions", "tty7", "index.ts"])
+            }
+            HookAgent::Antigravity => target.under_home(&[".gemini", "config", "hooks.json"]),
+            HookAgent::Empryo => target.under_home(&[".empryo", "hooks.json"]),
+            HookAgent::Jcode => target.jcode_config_path(),
+            HookAgent::Muse => target.under_home(&[
+                ".local",
+                "share",
+                "tty7",
+                "agent-hooks",
+                "muse",
+                ".muse-plugin",
+                "plugin.json",
+            ]),
             HookAgent::Grok => target.under_home(&[".grok", "hooks", OWNED_FILE_STEM_JSON]),
             HookAgent::OhMyPi => {
                 target.under_home(&[".omp", "agent", "extensions", "tty7", "index.ts"])
             }
-            HookAgent::Gemini => target.under_home(&[".gemini", "settings.json"]),
+            HookAgent::Gemini => target.gemini_settings_path(),
             HookAgent::Droid => target.under_home(&[".factory", "settings.json"]),
             HookAgent::Qwen => target.under_home(&[".qwen", "settings.json"]),
             // The Open Plugins layout, which Goose implements rather than
@@ -470,6 +859,7 @@ impl HookAgent {
             }
             HookAgent::Kimi => target.kimi_config_path(),
             HookAgent::QoderCLI => target.qoder_settings_path(),
+            HookAgent::QoderCLICn => target.qoder_cn_settings_path(),
             HookAgent::Crush => target.crush_settings_path(),
             HookAgent::CodeBuddy => target.codebuddy_settings_path(),
             // The user-level file; Cursor merges it under any project one.
@@ -509,13 +899,25 @@ impl<'a> HookTarget<'a> {
     }
 
     pub fn remote(host: &'a dyn Host, home: PathBuf) -> HookTarget<'a> {
+        use crate::daemon::install::asset;
         let dialect = crate::daemon::install::RemoteProtocol::of_this_build();
-        let binary = crate::daemon::install::asset::remote_paths(
-            &home.to_string_lossy(),
-            dialect.control,
-            dialect.protocol,
-        )
-        .binary;
+        let home_str = home.to_string_lossy();
+        // A Windows server reports its home natively (`C:\Users\me`), and the
+        // hook command runs there, so the binary is named the way that
+        // machine's installer put it — and spelled natively again.
+        let binary = match asset::sftp_path_from_windows(&home_str) {
+            Some(sftp_home) => {
+                let installed = asset::remote_paths_on(
+                    asset::RemotePlatform::Windows,
+                    &sftp_home,
+                    dialect.control,
+                    dialect.protocol,
+                )
+                .binary;
+                asset::windows_native_path(&installed).unwrap_or(installed)
+            }
+            None => asset::remote_paths(&home_str, dialect.control, dialect.protocol).binary,
+        };
         HookTarget {
             host,
             home,
@@ -548,6 +950,29 @@ impl<'a> HookTarget<'a> {
         self.under_home(&[".claude", "settings.json"])
     }
 
+    /// Codex keeps its whole home, `hooks.json` included, in `CODEX_HOME`
+    /// when that is set. Local-only, like the other overrides.
+    fn codex_hooks_path(&self) -> PathBuf {
+        if self.is_local()
+            && let Some(dir) = std::env::var_os("CODEX_HOME").filter(|d| !d.is_empty())
+        {
+            return PathBuf::from(dir).join("hooks.json");
+        }
+        self.under_home(&[".codex", "hooks.json"])
+    }
+
+    /// Gemini CLI roots its user-level `.gemini` directory, settings included,
+    /// at `GEMINI_CLI_HOME` in place of the user's home when that is set.
+    /// Local-only, like the other overrides.
+    fn gemini_settings_path(&self) -> PathBuf {
+        if self.is_local()
+            && let Some(dir) = std::env::var_os("GEMINI_CLI_HOME").filter(|d| !d.is_empty())
+        {
+            return PathBuf::from(dir).join(".gemini").join("settings.json");
+        }
+        self.under_home(&[".gemini", "settings.json"])
+    }
+
     fn xdg_config_dir(&self) -> PathBuf {
         if self.is_local()
             && let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty())
@@ -555,6 +980,15 @@ impl<'a> HookTarget<'a> {
             return PathBuf::from(dir);
         }
         self.under_home(&[".config"])
+    }
+
+    fn jcode_config_path(&self) -> PathBuf {
+        if self.is_local()
+            && let Some(dir) = std::env::var_os("JCODE_HOME").filter(|d| !d.is_empty())
+        {
+            return PathBuf::from(dir).join("config.toml");
+        }
+        self.under_home(&[".jcode", "config.toml"])
     }
 
     fn kimi_config_path(&self) -> PathBuf {
@@ -573,6 +1007,22 @@ impl<'a> HookTarget<'a> {
             return PathBuf::from(dir).join("settings.json");
         }
         self.under_home(&[".qoder", "settings.json"])
+    }
+
+    /// The China build keeps its settings in `~/.qoder-cn`. It resolves the
+    /// directory the same way the global build does, under a `-cn` name:
+    /// `QODERCN_CONFIG_DIR` wins, otherwise the home falls back through
+    /// `QODERCN_CLI_HOME` and `GEMINI_CLI_HOME` before the user's own, with
+    /// `.qoder-cn` as the directory name. Only the first is honoured here —
+    /// local-only, like every other override, so a local env var must not
+    /// redirect a remote machine's hooks.
+    fn qoder_cn_settings_path(&self) -> PathBuf {
+        if self.is_local()
+            && let Some(dir) = std::env::var_os("QODERCN_CONFIG_DIR").filter(|d| !d.is_empty())
+        {
+            return PathBuf::from(dir).join("settings.json");
+        }
+        self.under_home(&[".qoder-cn", "settings.json"])
     }
 
     /// The global `crush.json`. Crush resolves it through `CRUSH_GLOBAL_CONFIG`
@@ -683,6 +1133,15 @@ pub enum HooksState {
 
 pub fn hooks_state(target: &HookTarget, agent: HookAgent) -> HooksState {
     let path = agent.target_path(target);
+    if agent == HookAgent::Muse {
+        return muse_hooks_state(target);
+    }
+    if agent == HookAgent::Antigravity {
+        return named_hook_set_state(target, &path, &antigravity_hook_set(target));
+    }
+    if agent == HookAgent::Jcode {
+        return jcode_hooks_state(target, &path);
+    }
     if let Some(events) = agent.toml_hook_events() {
         return toml_hooks_state(target, &path, agent, events);
     }
@@ -708,6 +1167,8 @@ pub enum HookOutcome {
     /// Installed on a remote, where `codex features enable hooks` still has to
     /// be run once by hand.
     InstalledEnableCodexThere,
+    /// Bundle prepared on a remote; its own Muse CLI must install and approve it.
+    MuseInstallManually(String),
     /// Installed, but running `codex features enable hooks` here failed.
     InstalledCodexEnableFailed(String),
     Removed,
@@ -719,6 +1180,17 @@ pub enum HookOutcome {
 
 pub fn install_hooks(target: &HookTarget, agent: HookAgent) -> anyhow::Result<HookOutcome> {
     let path = agent.target_path(target);
+    if agent == HookAgent::Muse {
+        return muse_hooks_install(target, &path);
+    }
+    if agent == HookAgent::Antigravity {
+        named_hook_set_install(target, &path, antigravity_hook_set(target))?;
+        return Ok(HookOutcome::Installed);
+    }
+    if agent == HookAgent::Jcode {
+        jcode_hooks_install(target, &path)?;
+        return Ok(HookOutcome::Installed);
+    }
     if let Some(events) = agent.toml_hook_events() {
         toml_hooks_install(target, &path, agent, events)?;
         return Ok(HookOutcome::Installed);
@@ -744,6 +1216,15 @@ pub fn install_hooks(target: &HookTarget, agent: HookAgent) -> anyhow::Result<Ho
 
 pub fn uninstall_hooks(target: &HookTarget, agent: HookAgent) -> anyhow::Result<HookOutcome> {
     let path = agent.target_path(target);
+    if agent == HookAgent::Muse {
+        return muse_hooks_uninstall(target, &path);
+    }
+    if agent == HookAgent::Antigravity {
+        return named_hook_set_uninstall(target, &path);
+    }
+    if agent == HookAgent::Jcode {
+        return jcode_hooks_uninstall(target, &path);
+    }
     if agent.toml_hook_events().is_some() {
         return toml_hooks_uninstall(target, &path, agent);
     }
@@ -809,18 +1290,33 @@ fn home_dir() -> Option<PathBuf> {
 const OWNED_FILE_STEM_JSON: &str = "tty7.json";
 const OWNED_FILE_STEM_JS: &str = "tty7.js";
 
+/// `PermissionRequest` fires the moment the permission dialog opens; the
+/// `Notification` that also reports it can trail by seconds, and stays as the
+/// fallback for older Claude builds that do not know the event. A hook that
+/// prints nothing leaves the decision to the dialog. `PreToolUse` is there for
+/// `AskUserQuestion` alone (see [`QUESTION_TOOLS`]).
 const CLAUDE_HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt-submit"),
+    ("PermissionRequest", "permission-request"),
+    ("PreToolUse", "tool-start"),
     ("Notification", "notification"),
     ("PostToolUse", "tool-complete"),
     ("Stop", "stop"),
     ("SessionEnd", "session-end"),
 ];
 
+/// Codex's `PermissionRequest` answered with no output falls through to its
+/// own approval prompt, so it reports the wait without deciding anything.
+/// `PostToolUse` is what takes the pane off waiting once the approved tool has
+/// run, and `PreToolUse` catches `request_user_input` (see
+/// [`QUESTION_TOOLS`]), which Codex runs without asking for approval.
 const CODEX_HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt-submit"),
+    ("PermissionRequest", "permission-request"),
+    ("PreToolUse", "tool-start"),
+    ("PostToolUse", "tool-complete"),
     ("Stop", "stop"),
 ];
 
@@ -845,6 +1341,16 @@ const GEMINI_HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionEnd", "session-end"),
 ];
 
+/// Empryo uses Claude-compatible lifecycle hooks in ~/.empryo/hooks.json.
+const EMPRYO_HOOK_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "session-start"),
+    ("UserPromptSubmit", "prompt-submit"),
+    ("PostToolUse", "tool-complete"),
+    ("Stop", "stop"),
+    ("StopFailure", "stop"),
+    ("SessionEnd", "session-end"),
+];
+
 const DROID_HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "prompt-submit"),
@@ -865,6 +1371,18 @@ const QWEN_HOOK_EVENTS: &[(&str, &str)] = &[
     ("PostToolUse", "tool-complete"),
     ("Stop", "stop"),
     ("SessionEnd", "session-end"),
+];
+
+/// jcode's lifecycle keys under `[hooks]` in its `config.toml`, each holding
+/// one command or an ordered list of them. jcode runs these as detached
+/// observers and describes the event in `JCODE_HOOK_*` environment variables
+/// rather than on stdin — see [`hook_payload`].
+const JCODE_HOOK_EVENTS: &[(&str, &str)] = &[
+    ("turn_start", "prompt-submit"),
+    ("turn_end", "stop"),
+    ("session_start", "session-start"),
+    ("session_end", "session-end"),
+    ("post_tool", "tool-complete"),
 ];
 
 /// Kimi Code's hooks live as `[[hooks]]` entries in its main `config.toml` —
@@ -988,11 +1506,15 @@ fn hook_map_state(
             .get("hooks")
             .and_then(|h| h.get(hook_event))
             .and_then(|e| e.as_array())
-            .and_then(|list| list.iter().find_map(|m| marker_command(m, &marker)));
+            .and_then(|list| list.iter().find_map(|m| marker_hook(m, &marker)));
         match ours {
-            Some(cmd) => {
+            Some(hook) => {
                 any = true;
-                if cmd != target.hook_command(agent, tty7_event) {
+                let command = hook.get("command").and_then(|c| c.as_str());
+                let name = hook.get("name").and_then(|n| n.as_str());
+                if command != Some(target.hook_command(agent, tty7_event).as_str())
+                    || name != agent.hook_entry_name()
+                {
                     complete = false;
                 }
             }
@@ -1063,9 +1585,11 @@ fn hook_map_install(
         if agent.flat_hook_map() {
             list.push(serde_json::json!({ "command": command }));
         } else {
-            list.push(serde_json::json!({
-                "hooks": [{ "type": "command", "command": command }]
-            }));
+            let mut hook = serde_json::json!({ "type": "command", "command": command });
+            if let Some(name) = agent.hook_entry_name() {
+                hook["name"] = serde_json::Value::String(name.to_string());
+            }
+            list.push(serde_json::json!({ "hooks": [hook] }));
         }
     }
 
@@ -1117,22 +1641,338 @@ fn hook_map_uninstall(
 /// same level as its `matcher`. Both are one list under `hooks.<Event>`, so
 /// the state reader, the installer and the uninstaller all stay shared.
 fn marker_command<'a>(entry: &'a serde_json::Value, marker: &str) -> Option<&'a str> {
-    if let Some(command) = entry
-        .get("command")
-        .and_then(|c| c.as_str())
-        .filter(|c| c.contains(marker))
-    {
-        return Some(command);
+    marker_hook(entry, marker)?.get("command")?.as_str()
+}
+
+/// The object that holds tty7's command in an entry of a hook map — the
+/// entry itself when it is flat, else the hook nested in it — so the state
+/// reader can check the fields beside the command too.
+fn marker_hook<'a>(entry: &'a serde_json::Value, marker: &str) -> Option<&'a serde_json::Value> {
+    let ours = |h: &serde_json::Value| {
+        h.get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(|c| c.contains(marker))
+    };
+    if ours(entry) {
+        return Some(entry);
     }
     entry
         .get("hooks")
         .and_then(|h| h.as_array())?
         .iter()
-        .find_map(|h| {
-            h.get("command")
-                .and_then(|c| c.as_str())
-                .filter(|c| c.contains(marker))
+        .find(|h| ours(h))
+}
+
+const MUSE_PLUGIN_ID: &str = "tty7-presence";
+const MUSE_HOOK_EVENTS: &[(&str, &str, &str)] = &[
+    ("session-start", "SessionStart", "session-start"),
+    ("prompt-submit", "UserPromptSubmit", "prompt-submit"),
+    (
+        "permission-request",
+        "PermissionRequest",
+        "permission-request",
+    ),
+    ("tool-complete", "PostToolUse", "tool-complete"),
+    ("stop", "Stop", "stop"),
+    ("stop-failure", "StopFailure", "stop"),
+    ("interrupt", "Interrupt", "stop"),
+    ("session-end", "SessionEnd", "session-end"),
+];
+
+fn muse_plugin_manifest(target: &HookTarget) -> serde_json::Value {
+    let hooks: Vec<_> = MUSE_HOOK_EVENTS
+        .iter()
+        .map(|(id, event, tty7_event)| {
+            serde_json::json!({
+                "id": id, "event": event,
+                "command": [target.exe.to_string_lossy(), "agent-hook", "muse", tty7_event],
+                "timeoutMs": 5000, "async": *event == "Interrupt",
+            })
         })
+        .collect();
+    serde_json::json!({
+        "schemaVersion": 1, "name": MUSE_PLUGIN_ID, "displayName": "tty7 presence",
+        "version": "1.0.0", "description": "tty7 agent-hook muse presence",
+        "compat": {"source": "native", "manifestDir": ".muse-plugin"},
+        "capabilities": {"hooks": hooks},
+    })
+}
+
+/// Muse's native CLI owns its cache and approval records; do not write those directly.
+fn muse_cli(args: &[String]) -> anyhow::Result<serde_json::Value> {
+    let mut cmd = std::process::Command::new("muse");
+    cmd.env("MUSE_NO_AUTO_UPDATE", "1")
+        .args(["plugins"])
+        .args(args)
+        .arg("--json");
+    // Settings and `tty7 doctor` both wait on this; a Muse that hangs (a
+    // login prompt, a stuck update check) must not take either down with it.
+    let out = crate::core::proc::output_within(
+        crate::core::proc::hide_console(&mut cmd),
+        std::time::Duration::from_secs(30),
+    )?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "muse plugins {} failed ({}): {}",
+            args.first().map(String::as_str).unwrap_or(""),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(serde_json::from_slice(&out.stdout)?)
+}
+
+fn muse_inspected_state(target: &HookTarget, inspected: &serde_json::Value) -> HooksState {
+    if inspected["plugin"]["id"] != MUSE_PLUGIN_ID {
+        return HooksState::NotInstalled;
+    }
+    let expected = muse_plugin_manifest(target);
+    let complete = inspected["active"] == true
+        && inspected["valid"] == true
+        && expected["capabilities"]["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|hook| {
+                let declared = inspected["plugin"]["capabilities"]["hooks"]
+                    .as_array()
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|installed| {
+                            installed["id"] == hook["id"]
+                                && installed["event"] == hook["event"]
+                                && installed["command"] == hook["command"]
+                                && installed["async"] == hook["async"]
+                        })
+                    });
+                let approved =
+                    inspected["runtime_capabilities"]
+                        .as_array()
+                        .is_some_and(|entries| {
+                            entries.iter().any(|entry| {
+                                entry["candidate"]["kind"] == "hook"
+                                    && entry["candidate"]["capability_id"] == hook["id"]
+                                    && entry["status"] == "trusted_enabled"
+                            })
+                        });
+                declared && approved
+            });
+    if complete {
+        HooksState::Installed
+    } else {
+        HooksState::Outdated
+    }
+}
+
+fn muse_hooks_state(target: &HookTarget) -> HooksState {
+    // A source bundle alone is not an installed plugin. Host has no remote exec API.
+    if !target.is_local() {
+        return HooksState::NotInstalled;
+    }
+    muse_cli(&["inspect".into(), MUSE_PLUGIN_ID.into()])
+        .map(|value| muse_inspected_state(target, &value))
+        .unwrap_or(HooksState::NotInstalled)
+}
+
+fn muse_install_commands(bundle: &Path) -> String {
+    format!(
+        "muse plugins install \"{}\" --scope user && muse plugins approve {MUSE_PLUGIN_ID} && muse plugins enable {MUSE_PLUGIN_ID}",
+        bundle.display()
+    )
+}
+
+fn muse_install_with(
+    target: &HookTarget,
+    path: &Path,
+    mut run: impl FnMut(&[String]) -> anyhow::Result<serde_json::Value>,
+) -> anyhow::Result<HookOutcome> {
+    let bundle = path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("invalid Muse bundle path"))?;
+    let content = serde_json::to_string_pretty(&muse_plugin_manifest(target))?;
+    owned_file_install(target, path, &content, &HookAgent::Muse.marker())?;
+    if !target.is_local() {
+        return Ok(HookOutcome::MuseInstallManually(muse_install_commands(
+            bundle,
+        )));
+    }
+    run(&[
+        "install".into(),
+        bundle.to_string_lossy().into_owned(),
+        "--scope".into(),
+        "user".into(),
+    ])?;
+    run(&["approve".into(), MUSE_PLUGIN_ID.into()])?;
+    run(&["enable".into(), MUSE_PLUGIN_ID.into()])?;
+    let inspected = run(&["inspect".into(), MUSE_PLUGIN_ID.into()])?;
+    if muse_inspected_state(target, &inspected) != HooksState::Installed {
+        anyhow::bail!("Muse plugin was not activated; inspect {MUSE_PLUGIN_ID} before retrying");
+    }
+    Ok(HookOutcome::Installed)
+}
+
+fn muse_hooks_install(target: &HookTarget, path: &Path) -> anyhow::Result<HookOutcome> {
+    muse_install_with(target, path, muse_cli)
+}
+
+fn muse_hooks_uninstall(target: &HookTarget, path: &Path) -> anyhow::Result<HookOutcome> {
+    if !target.is_local() {
+        return Ok(HookOutcome::MuseInstallManually(format!(
+            "muse plugins remove {MUSE_PLUGIN_ID}"
+        )));
+    }
+    if muse_hooks_state(target) != HooksState::NotInstalled {
+        muse_cli(&["remove".into(), MUSE_PLUGIN_ID.into()])?;
+    }
+    owned_file_uninstall(target, path, &HookAgent::Muse.marker())
+}
+
+/// jcode accepts either one command or an ordered list (HookCommands).
+fn jcode_commands(item: &toml_edit::Item) -> anyhow::Result<Vec<String>> {
+    if let Some(command) = item.as_str() {
+        return Ok(vec![command.to_owned()]);
+    }
+    if let Some(array) = item.as_array() {
+        return array
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    anyhow::anyhow!("jcode hook commands must be strings; not touching it")
+                })
+            })
+            .collect();
+    }
+    anyhow::bail!("jcode hook must be a string or an array of strings; not touching it")
+}
+
+fn set_jcode_commands(table: &mut toml_edit::Table, key: &str, commands: &[String]) {
+    match commands {
+        [] => {
+            table.remove(key);
+        }
+        [command] => {
+            table[key] = toml_edit::value(command.clone());
+        }
+        _ => {
+            let mut array = toml_edit::Array::new();
+            for command in commands {
+                array.push(command.as_str());
+            }
+            table[key] = toml_edit::value(array);
+        }
+    }
+}
+
+fn jcode_hooks_state(target: &HookTarget, path: &Path) -> HooksState {
+    let Ok(text) = target.read(path) else {
+        return HooksState::NotInstalled;
+    };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return HooksState::NotInstalled;
+    };
+    let Some(table) = doc.get("hooks").and_then(|item| item.as_table()) else {
+        return HooksState::NotInstalled;
+    };
+    let marker = HookAgent::Jcode.marker();
+    let commands: Vec<_> = JCODE_HOOK_EVENTS
+        .iter()
+        .map(|(key, _)| {
+            table
+                .get(*key)
+                .map(jcode_commands)
+                .transpose()
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        })
+        .collect();
+    let ours = commands
+        .iter()
+        .flatten()
+        .any(|command| command.contains(&marker));
+    let complete = JCODE_HOOK_EVENTS
+        .iter()
+        .zip(&commands)
+        .all(|((_, event), list)| {
+            let expected = target.hook_command(HookAgent::Jcode, event);
+            let marked: Vec<_> = list
+                .iter()
+                .filter(|command| command.contains(&marker))
+                .collect();
+            marked.len() == 1 && marked[0] == &expected
+        });
+    if complete {
+        HooksState::Installed
+    } else if ours {
+        HooksState::Outdated
+    } else {
+        HooksState::NotInstalled
+    }
+}
+
+fn jcode_hooks_install(target: &HookTarget, path: &Path) -> anyhow::Result<()> {
+    let mut doc: toml_edit::DocumentMut = match target.read(path) {
+        Ok(text) => text.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "{} is not valid TOML ({e}); not touching it",
+                path.display()
+            )
+        })?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
+    };
+    let hooks = doc.entry("hooks").or_insert(toml_edit::table());
+    let table = hooks.as_table_mut().ok_or_else(|| {
+        anyhow::anyhow!("{} hooks is not a table; not touching it", path.display())
+    })?;
+    let marker = HookAgent::Jcode.marker();
+    for (key, event) in JCODE_HOOK_EVENTS {
+        let mut commands = table
+            .get(*key)
+            .map(jcode_commands)
+            .transpose()?
+            .unwrap_or_default();
+        commands.retain(|command| !command.contains(&marker));
+        commands.push(target.hook_command(HookAgent::Jcode, event));
+        set_jcode_commands(table, key, &commands);
+    }
+    target.write(path, doc.to_string().as_bytes())
+}
+
+fn jcode_hooks_uninstall(target: &HookTarget, path: &Path) -> anyhow::Result<HookOutcome> {
+    let text = match target.read(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HookOutcome::NothingInstalled),
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "{} is not valid TOML ({e}); not touching it",
+            path.display()
+        )
+    })?;
+    let Some(table) = doc.get_mut("hooks").and_then(|v| v.as_table_mut()) else {
+        return Ok(HookOutcome::NoTty7Hooks);
+    };
+    let marker = HookAgent::Jcode.marker();
+    let mut removed = false;
+    for (key, _) in JCODE_HOOK_EVENTS {
+        let Some(item) = table.get(*key) else {
+            continue;
+        };
+        let mut commands = jcode_commands(item)?;
+        let before = commands.len();
+        commands.retain(|command| !command.contains(&marker));
+        if commands.len() != before {
+            set_jcode_commands(table, key, &commands);
+            removed = true;
+        }
+    }
+    if !removed {
+        return Ok(HookOutcome::NoTty7Hooks);
+    }
+    target.write(path, doc.to_string().as_bytes())?;
+    Ok(HookOutcome::Removed)
 }
 
 fn toml_hooks_state(
@@ -1324,11 +2164,108 @@ fn enable_codex_hooks_feature() -> Result<(), String> {
     }
 }
 
+/// The key tty7's entry lives under in Antigravity's `hooks.json`.
+///
+/// Antigravity names every hook set at the root of the file —
+/// `{"<name>": {"<Event>": [...]}}` — rather than grouping handlers under a
+/// shared `hooks` object the way Claude does, so tty7 owns one named set and
+/// never has to pick its commands out of the user's lists.
+const ANTIGRAVITY_HOOK_SET: &str = "tty7";
+
+/// Antigravity CLI's lifecycle events, mapped onto tty7's.
+///
+/// It has no session-start or session-end event. `PreInvocation` fires before
+/// every model call of a turn, so `effective_event` keeps only the first one
+/// as the turn start; `Stop` fires when the execution loop ends. The
+/// `PreToolUse` gate is left alone: it must answer with a `decision`, and an
+/// empty reply from a status hook has no business deciding anything.
+fn antigravity_hook_set(target: &HookTarget) -> serde_json::Value {
+    let handler = |event: &str| {
+        serde_json::json!({
+            "type": "command",
+            "command": target.hook_command(HookAgent::Antigravity, event),
+            "timeout": 5,
+        })
+    };
+    serde_json::json!({
+        "PreInvocation": [handler("prompt-submit")],
+        "PostToolUse": [{ "matcher": "*", "hooks": [handler("tool-complete")] }],
+        "Stop": [handler("stop")],
+    })
+}
+
+fn read_json_object(target: &HookTarget, path: &Path) -> anyhow::Result<Option<serde_json::Value>> {
+    let text = match target.read(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
+    };
+    if text.trim().is_empty() {
+        return Ok(Some(serde_json::json!({})));
+    }
+    let root: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "{} is not valid JSON ({e}); not touching it",
+            path.display()
+        )
+    })?;
+    if !root.is_object() {
+        return Err(anyhow::anyhow!(
+            "{} is not a JSON object; not touching it",
+            path.display()
+        ));
+    }
+    Ok(Some(root))
+}
+
+fn named_hook_set_state(
+    target: &HookTarget,
+    path: &Path,
+    expected: &serde_json::Value,
+) -> HooksState {
+    match read_json_object(target, path) {
+        Ok(Some(root)) => match root.get(ANTIGRAVITY_HOOK_SET) {
+            None => HooksState::NotInstalled,
+            Some(set) if set == expected => HooksState::Installed,
+            Some(_) => HooksState::Outdated,
+        },
+        _ => HooksState::NotInstalled,
+    }
+}
+
+fn named_hook_set_install(
+    target: &HookTarget,
+    path: &Path,
+    set: serde_json::Value,
+) -> anyhow::Result<()> {
+    let mut root = read_json_object(target, path)?.unwrap_or_else(|| serde_json::json!({}));
+    root.as_object_mut()
+        .unwrap()
+        .insert(ANTIGRAVITY_HOOK_SET.to_string(), set);
+    target.write(path, serde_json::to_string_pretty(&root)?.as_bytes())
+}
+
+fn named_hook_set_uninstall(target: &HookTarget, path: &Path) -> anyhow::Result<HookOutcome> {
+    let Some(mut root) = read_json_object(target, path)? else {
+        return Ok(HookOutcome::NothingInstalled);
+    };
+    if root
+        .as_object_mut()
+        .unwrap()
+        .remove(ANTIGRAVITY_HOOK_SET)
+        .is_none()
+    {
+        return Ok(HookOutcome::NoTty7Hooks);
+    }
+    target.write(path, serde_json::to_string_pretty(&root)?.as_bytes())?;
+    Ok(HookOutcome::Removed)
+}
+
 fn owned_file_content(target: &HookTarget, agent: HookAgent) -> Option<String> {
     match agent {
         HookAgent::Copilot => copilot_hooks_json(target),
         HookAgent::OpenCode => opencode_plugin_js(target),
-        HookAgent::Pi | HookAgent::OhMyPi => pi_extension_ts(target, agent),
+        HookAgent::Pi | HookAgent::OhMyPi | HookAgent::PrimeAgent => pi_extension_ts(target, agent),
         HookAgent::Grok => grok_hooks_json(target),
         HookAgent::Goose => goose_hooks_json(target),
         HookAgent::Claude
@@ -1338,10 +2275,15 @@ fn owned_file_content(target: &HookTarget, agent: HookAgent) -> Option<String> {
         | HookAgent::Droid
         | HookAgent::Qwen
         | HookAgent::QoderCLI
+        | HookAgent::QoderCLICn
         | HookAgent::Crush
         | HookAgent::CodeBuddy
         | HookAgent::Cursor
-        | HookAgent::Kimi => None,
+        | HookAgent::Antigravity
+        | HookAgent::Kimi
+        | HookAgent::Empryo
+        | HookAgent::Jcode
+        | HookAgent::Muse => None,
     }
 }
 
@@ -1484,77 +2426,156 @@ fn goose_hooks_json(target: &HookTarget) -> Option<String> {
     serde_json::to_string_pretty(&serde_json::json!({ "hooks": hooks })).ok()
 }
 
+/// The OpenCode plugin bridge — one file that both plugin loaders accept.
+///
+/// OpenCode 1.x (since 1.3.4) takes a default export `{ id, server }`, and
+/// OpenCode 2.x takes `{ id, setup }` (or `{ id, effect }`) and rejects
+/// anything else with "Plugin must export a default definition with an id
+/// and an effect or setup function" (#999). Each loader ignores the key the
+/// other one reads, so a default export carrying all three loads on both.
+/// The named `Tty7Presence` export is the same 1.x factory, for 1.x builds
+/// older than 1.3.4 that call every export; newer loaders never look at it.
+///
+/// The two majors differ in more than the export: 2.x hands `setup` no Bun
+/// `$` and no `event` hook — events come from `ctx.event.subscribe()`, with
+/// their fields under `data` rather than `properties`, and permission prompts
+/// arrive as `permission.asked`. Both feed one tracker, so the session-id,
+/// subagent and busy/idle rules are written once.
+///
+/// The emitter is spawned directly (no shell): `sh` is not there on Windows,
+/// and 2.x may run on Node rather than Bun.
 fn opencode_plugin_js(target: &HookTarget) -> Option<String> {
-    let prefix = serde_json::to_string(&format!(
-        "{} ",
-        target.hook_command(HookAgent::OpenCode, "").trim_end()
-    ))
-    .ok()?;
-    Some(format!(
+    let exe = serde_json::to_string(&target.exe.display().to_string()).ok()?;
+    Some(
         r#"// tty7 agent-hook opencode bridge — generated by tty7, do not edit.
 // Bridges OpenCode plugin events onto `tty7 agent-hook opencode <event>`,
 // which is inert outside tty7 (gated on the TTY7 env var).
-export const Tty7Presence = async ({{ $ }}) => {{
-  if (!process.env["TTY7"]) return {{}}
-  const cmd = {prefix}
+// Loads on OpenCode 1.x (default `{ id, server }`) and 2.x (`{ id, setup }`).
+import { spawn } from "node:child_process"
+
+const EXE = __EXE__
+
+// Spawned directly, not through a shell: there is no `sh` on Windows.
+function run(event, sessionId) {
+  return new Promise((resolve) => {
+    try {
+      const payload = sessionId ? JSON.stringify({ session_id: sessionId }) : ""
+      const child = spawn(EXE, ["agent-hook", "opencode", event], {
+        stdio: [payload ? "pipe" : "ignore", "ignore", "ignore"],
+        windowsHide: true,
+      })
+      child.on("error", () => resolve())
+      child.on("close", () => resolve())
+      if (payload) {
+        child.stdin.on("error", () => {})
+        child.stdin.end(payload)
+      }
+    } catch {
+      resolve()
+    }
+  })
+}
+
+// One pane's view of the event stream, shared by both plugin APIs.
+function presence() {
   let sessionId = ""
   let announced = ""
   // A subagent runs in a child session on the *same* event stream, and its
-  // status events are indistinguishable from the pane's own — only
-  // `session.created`/`session.updated` name a parent. Remember the children,
-  // so a task tool cannot hand the pane the wrong session to resume, nor call
-  // the pane done when only the subagent is.
+  // status events are indistinguishable from the pane's own — only session
+  // creation names a parent. Remember the children, so a task tool cannot
+  // hand the pane the wrong session to resume, nor call the pane done when
+  // only the subagent is.
   const children = new Set()
-  const emit = (event) => {{
-    // Every event carries the session id (`properties.sessionID`), so a pane
-    // that restarts can resume the same session with `opencode --session`.
-    const payload = sessionId ? new Response(JSON.stringify({{ session_id: sessionId }})) : undefined
-    const proc = payload ? $`sh -c ${{cmd + event}} < ${{payload}}` : $`sh -c ${{cmd + event}}`
-    return proc.quiet().nothrow()
-  }}
-  // The session id is only known once opencode creates the session (the
-  // `session.created` event); the session-start report rides on the first
-  // event that names one, so a restored pane can reattach to it.
-  const capture = async (id) => {{
+  // Every event carries the session id, so a pane that restarts can resume
+  // the same session with `opencode --session`.
+  const emit = (event) => run(event, sessionId)
+  // The session id is only known once opencode creates the session; the
+  // session-start report rides on the first event that names one, so a
+  // restored pane can reattach to it.
+  const capture = async (id) => {
     if (id && !children.has(id)) sessionId = id
-    if (sessionId && sessionId !== announced) {{
+    if (sessionId && sessionId !== announced) {
       announced = sessionId
       await emit("session-start")
-    }}
-  }}
-  const ACTION = {{
+    }
+  }
+  const ACTION = {
     "session.status.busy": "prompt-submit",
     "session.status.idle": "stop",
     "session.idle": "stop",
+    "permission.asked": "permission-request",
     "permission.replied": "prompt-submit",
-  }}
+  }
+  // `fields` is 1.x's `event.properties` or 2.x's `event.data`.
+  const observe = async (type, fields) => {
+    const info = fields.info
+    // 1.x: `session.created`/`session.updated` carry the whole session.
+    if (info?.id && info.parentID) children.add(info.id)
+    // 2.x: `session.created` names the session and its parent directly.
+    if (type === "session.created" && fields.sessionID && fields.parentID) children.add(fields.sessionID)
+    if (fields.sessionID && children.has(fields.sessionID)) return
+    await capture(fields.sessionID)
+    const key = type === "session.status" ? `session.status.${fields.status?.type}` : type
+    const action = ACTION[key]
+    if (action) await emit(action)
+  }
+  return { emit, capture, observe }
+}
 
-  return {{
-    dispose: async () => {{
-      await emit("session-end")
-    }},
-    "tool.execute.before": async (input) => {{
-      await capture(input?.sessionID)
-      await emit("prompt-submit")
-    }},
-    "permission.ask": async (input) => {{
-      await capture(input?.sessionID)
-      await emit("permission-request")
-    }},
-    event: async ({{ event }}) => {{
-      const properties = event.properties ?? {{}}
-      const info = properties.info
-      if (info?.id && info.parentID) children.add(info.id)
-      if (properties.sessionID && children.has(properties.sessionID)) return
-      await capture(properties.sessionID)
-      const key = event.type === "session.status" ? `session.status.${{properties.status?.type}}` : event.type
-      const action = ACTION[key]
-      if (action) await emit(action)
-    }},
-  }}
-}}
+// OpenCode 1.x: a factory returning hooks, run in the TUI's own process.
+const server = async () => {
+  if (!process.env["TTY7"]) return {}
+  const pane = presence()
+  return {
+    dispose: async () => {
+      await pane.emit("session-end")
+    },
+    "tool.execute.before": async (input) => {
+      await pane.capture(input?.sessionID)
+      await pane.emit("prompt-submit")
+    },
+    "permission.ask": async (input) => {
+      await pane.capture(input?.sessionID)
+      await pane.emit("permission-request")
+    },
+    event: async ({ event }) => {
+      await pane.observe(event.type, event.properties ?? {})
+    },
+  }
+}
+
+// OpenCode 2.x: `setup` subscribes to the event stream and returns cleanup.
+const setup = async (ctx) => {
+  if (!process.env["TTY7"]) return
+  // By default 2.x runs plugins in one background service shared by every
+  // opencode on the machine: its sessions are not this pane's, and the
+  // emitter it spawns has no way back to the pane's terminal. Only a server
+  // the TUI started for itself (`--standalone`, or `opencode serve` run in
+  // the pane) belongs to one pane.
+  if (process.argv.includes("--service")) return
+  if (typeof ctx?.event?.subscribe !== "function") return
+  const pane = presence()
+  const abort = new AbortController()
+  // Not awaited: setup has to return for the plugin to finish loading.
+  ;(async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: abort.signal })) {
+        if (event?.type) await pane.observe(event.type, event.data ?? {})
+      }
+    } catch {}
+  })()
+  return async () => {
+    abort.abort()
+    await pane.emit("session-end")
+  }
+}
+
+export const Tty7Presence = server
+
+export default { id: "tty7", server, setup }
 "#
-    ))
+        .replace("__EXE__", &exe),
+    )
 }
 
 /// The Pi extension bridge, shared with Oh My Pi.
@@ -1566,8 +2587,12 @@ export const Tty7Presence = async ({{ $ }}) => {{
 /// rather than two copies drifting apart.
 fn pi_extension_ts(target: &HookTarget, agent: HookAgent) -> Option<String> {
     let (slug, package) = match agent {
-        HookAgent::Pi => ("pi", "@mariozechner/pi-coding-agent"),
+        // Pi moved from `@mariozechner/` to `@earendil-works/`. Current Pi
+        // resolves both names for extensions, and the import is type-only, so
+        // it is erased before an older Pi that knows only the old name runs it.
+        HookAgent::Pi => ("pi", "@earendil-works/pi-coding-agent"),
         HookAgent::OhMyPi => ("omp", "@oh-my-pi/pi-coding-agent"),
+        HookAgent::PrimeAgent => ("prime-agent", "@earendil-works/pi-coding-agent"),
         _ => return None,
     };
     let exe = serde_json::to_string(&target.exe.display().to_string()).ok()?;
@@ -1608,8 +2633,18 @@ export default function (pi: ExtensionAPI) {{
   // What the pane showed before a UI prompt put it on "waiting", so closing
   // the prompt can put it back.
   let turn = "session-start";
+  // Whether this build says when a run is over for good. agent_end also ends
+  // each attempt an automatic retry, a compaction or a queued message picks
+  // up again, and reading that as "done" calls the pane finished while it
+  // still works. Pi's agent_settled comes once the run is really over, and a
+  // build that sends it shows so the first time it does. Nothing earlier
+  // tells: on() returns nothing in Pi or Oh My Pi, and a build that takes the
+  // name without ever sending it must still end its turns on agent_end.
+  let settles = false;
   pi.on("agent_start", (_event, ctx) => emit((turn = "prompt-submit"), ctx));
-  pi.on("agent_end", (_event, ctx) => emit((turn = "stop"), ctx));
+  pi.on("agent_end", (_event, ctx) => {{
+    if (!settles) emit((turn = "stop"), ctx);
+  }});
   pi.on("session_shutdown", (_event, ctx) => emit("session-end", ctx));
   // Last, and guarded: the three above already worked, so a Pi build that
   // rejects this event name must not take them — or the whole extension —
@@ -1634,6 +2669,24 @@ export default function (pi: ExtensionAPI) {{
   try {{
     pi.on("ui_prompt_end", (_event, ctx) => emit(turn, ctx));
   }} catch {{}}
+  try {{
+    pi.on("agent_settled" as any, (_event: unknown, ctx: SessionCtx) => {{
+      settles = true;
+      emit((turn = "stop"), ctx);
+    }});
+  }} catch {{}}
+  // Oh My Pi asks before running a tool through events of its own rather
+  // than Pi's UI-prompt pair, and announces its retries — which follow an
+  // agent_end — where Pi does not.
+  try {{
+    pi.on("tool_approval_requested" as any, (_event: unknown, ctx: SessionCtx) =>
+      emit("permission-request", ctx),
+    );
+    pi.on("tool_approval_resolved" as any, (_event: unknown, ctx: SessionCtx) => emit(turn, ctx));
+    pi.on("auto_retry_start" as any, (_event: unknown, ctx: SessionCtx) =>
+      emit((turn = "prompt-submit"), ctx),
+    );
+  }} catch {{}}
 }}
 "#
     ))
@@ -1642,6 +2695,222 @@ export default function (pi: ExtensionAPI) {{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hook whose pane closed under it gives up instead of waiting on the
+    /// terminal's other end for good.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_with_its_other_end_gone_fails_the_write_at_once() {
+        // Both ends are opened close-on-exec from the start: the other tests
+        // spawn processes on threads of their own, and a child that inherited
+        // the pane's end would keep it open after it is closed here, so the
+        // write would go through.
+        let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+        let master = unsafe { libc::posix_openpt(flags) };
+        assert!(master >= 0);
+        assert_eq!(unsafe { libc::grantpt(master) }, 0);
+        assert_eq!(unsafe { libc::unlockpt(master) }, 0);
+        let name = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(master)) }
+            .to_string_lossy()
+            .into_owned();
+        let path = std::ffi::CString::new(name.clone()).unwrap();
+        let slave = unsafe { libc::open(path.as_ptr(), flags) };
+        assert!(slave >= 0);
+        // The agent still holds its end; the pane's is gone.
+        unsafe { libc::close(master) };
+
+        // A child another test forked a moment ago still holds a copy of the
+        // pane's end until it gets to exec, and a write in that moment goes
+        // through; one made once it has let go fails. None may wait.
+        let mut wrote = Ok(true);
+        for _ in 0..50 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let name = name.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(write_dev(std::path::Path::new(&name), b"x"));
+            });
+            wrote = rx.recv_timeout(std::time::Duration::from_secs(5));
+            if wrote != Ok(true) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        unsafe { libc::close(slave) };
+        assert_eq!(wrote, Ok(false));
+    }
+
+    /// The turn's reply names the model: a subagent's entry after it and
+    /// Claude Code's own synthetic notices are not the conversation's, and
+    /// the thinking entry before the words carries none.
+    #[test]
+    fn the_readout_takes_the_model_that_wrote_the_turns_reply() {
+        let jsonl = [
+            r#"{"type":"assistant","message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"Earlier."}]}}"#,
+            r#"{"type":"user","promptId":"p2","message":{"content":"hi"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"thinking","thinking":""}]}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"Hi there!\n"}]}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"Hi there!"}]}}"#,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#,
+            "not json",
+        ]
+        .join("\n");
+        assert_eq!(
+            reply_model_in(&jsonl, "Hi there!", Some("p2")).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            reply_model_in(&jsonl, "Hi there!", None).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(reply_model_in("", "Hi there!", Some("p2")), None);
+    }
+
+    /// Until the reply is written, the transcript's latest words are the
+    /// previous turn's — possibly under another model, possibly the very
+    /// same words — and say nothing.
+    #[test]
+    fn a_transcript_behind_the_turn_names_no_model() {
+        let jsonl = [
+            r#"{"type":"user","promptId":"p1","message":{"content":"say hi"}}"#,
+            r#"{"type":"assistant","message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"Hi!"}]}}"#,
+        ]
+        .join("\n");
+        assert_eq!(reply_model_in(&jsonl, "Hello.", Some("p1")), None);
+        assert_eq!(reply_model_in(&jsonl, "Hi!", Some("p2")), None);
+        let asked =
+            jsonl + "\n" + r#"{"type":"user","promptId":"p2","message":{"content":"say hi"}}"#;
+        assert_eq!(reply_model_in(&asked, "Hi!", Some("p2")), None);
+    }
+
+    #[test]
+    fn the_readout_rides_the_hook_sequence() {
+        let dir = std::env::temp_dir().join(format!("tty7-readout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"assistant","message":{"model":"claude-opus-5-5","content":[{"type":"text","text":"Done."}]}}"#,
+        )
+        .unwrap();
+        let stdin = |extra: serde_json::Value| {
+            let mut payload = serde_json::json!({
+                "session_id": "s",
+                "permission_mode": "plan",
+                "transcript_path": transcript,
+            });
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            payload.to_string()
+        };
+        let readout = |event: &str, stdin: &str| {
+            let seq = build_hook_sequence("claude", event, stdin);
+            crate::core::cli_agent::parse_agent_event(
+                seq.strip_prefix(b"\x1b]")
+                    .unwrap()
+                    .strip_suffix(b"\x07")
+                    .unwrap(),
+            )
+            .unwrap()
+            .readout
+        };
+        let stop = readout(
+            "stop",
+            &stdin(serde_json::json!({
+                "last_assistant_message": "Done.",
+                "effort": { "level": "xhigh" },
+            })),
+        );
+        let submit = readout("prompt-submit", &stdin(serde_json::json!({})));
+        let no_effort = readout(
+            "stop",
+            &stdin(serde_json::json!({ "last_assistant_message": "Done." })),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(stop.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(stop.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(
+            stop.effort.as_deref(),
+            Some("xhigh"),
+            "the level Claude reports is the one it runs at"
+        );
+        assert_eq!(
+            (submit.model, submit.effort),
+            (None, None),
+            "before its reply a turn says nothing of the model it runs on"
+        );
+        assert_eq!(
+            no_effort.effort.as_deref(),
+            Some(""),
+            "a turn that ends without a level ran on a model that takes none"
+        );
+    }
+
+    #[test]
+    fn a_model_the_catalog_lists_without_effort_levels_takes_none() {
+        let catalog = serde_json::json!({
+            "version": 2,
+            "catalog": { "config": { "models": [
+                {
+                    "id": "claude-opus-5-5",
+                    "thinking": {
+                        "type": "effort",
+                        "effort_options": [{ "id": "low" }, { "id": "high" }],
+                    },
+                },
+                { "id": "claude-haiku-4-5-20251001", "thinking": { "type": "none" } },
+            ] } },
+        });
+        let catalogs = [catalog];
+        assert!(catalog_says_no_effort(
+            &catalogs,
+            "claude-haiku-4-5-20251001"
+        ));
+        assert!(!catalog_says_no_effort(&catalogs, "claude-opus-5-5"));
+        assert!(!catalog_says_no_effort(&catalogs, "claude-opus-5-5[1m]"));
+        assert!(
+            !catalog_says_no_effort(&catalogs, "claude-new-model"),
+            "a model the catalog does not know may take a level"
+        );
+        assert!(!catalog_says_no_effort(&[], "claude-haiku-4-5-20251001"));
+    }
+
+    #[test]
+    fn an_effort_set_for_the_model_wins_over_the_general_one() {
+        let settings = serde_json::json!({
+            "effortLevel": "high",
+            "modelSettings": { "claude-opus-5-5": { "effortLevel": "medium" } },
+        });
+        assert_eq!(
+            configured_effort(&settings, Some("claude-opus-5-5")).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            configured_effort(&settings, Some("claude-opus-5-5[1m]")).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            configured_effort(&settings, Some("claude-sonnet-5-5")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(configured_effort(&settings, None).as_deref(), Some("high"));
+        assert_eq!(configured_effort(&serde_json::json!({}), None), None);
+    }
+
+    #[test]
+    fn other_agents_carry_no_readout() {
+        let stdin = r#"{"session_id":"s","permission_mode":"plan"}"#;
+        let seq = build_hook_sequence("codex", "stop", stdin);
+        let ev = crate::core::cli_agent::parse_agent_event(
+            seq.strip_prefix(b"\x1b]")
+                .unwrap()
+                .strip_suffix(b"\x07")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ev.readout, Default::default());
+    }
 
     /// The exhaustive match keeps every detected agent mapped; this keeps the
     /// other direction honest, so a hooked agent cannot become unreachable
@@ -1711,68 +2980,40 @@ mod tests {
         crate::core::cli_agent::parse_agent_event(&seq[2..seq.len() - 1]).expect("parses")
     }
 
+    /// What the user typed never rides along: nothing downstream reads it,
+    /// and a pasted prompt made the sequence long enough for the agent's own
+    /// output to land in the middle of it.
     #[test]
-    fn a_submitted_prompt_rides_back_as_the_turns_label() {
-        let ev = round_trip(
-            "claude",
-            "prompt-submit",
-            r#"{"prompt":"restore the outline","session_id":"s-1"}"#,
-        );
-        assert_eq!(ev.prompt.as_deref(), Some("restore the outline"));
-        assert_eq!(
-            ev.message, None,
-            "a prompt is not a message; the turn starts with nothing said back"
-        );
-    }
-
-    #[test]
-    fn a_prompt_is_cut_to_its_first_line() {
-        let ev = round_trip(
-            "claude",
-            "prompt-submit",
-            r#"{"prompt":"\n\n  what did we decide  \nand then some more\nand more"}"#,
-        );
-        assert_eq!(
-            ev.prompt.as_deref(),
-            Some("what did we decide"),
-            "later lines wrapped when they were drawn and would only fail the search"
-        );
-    }
-
-    #[test]
-    fn a_pasted_file_cannot_cost_the_whole_event() {
+    fn a_submitted_prompt_stays_out_of_the_sequence() {
         let prompt = "x".repeat(64 * 1024);
+        let seq = build_hook_sequence(
+            "claude",
+            "prompt-submit",
+            &serde_json::json!({ "prompt": prompt, "session_id": "s-1" }).to_string(),
+        );
+        assert!(!String::from_utf8_lossy(&seq).contains("xxxx"));
+        assert!(seq.len() < 200, "{} bytes", seq.len());
         let ev = round_trip(
             "claude",
             "prompt-submit",
-            &serde_json::json!({ "prompt": prompt }).to_string(),
+            r#"{"prompt":"hi","session_id":"s-1"}"#,
         );
         assert_eq!(
-            ev.prompt.map(|p| p.chars().count()),
-            Some(PROMPT_LABEL_MAX),
-            "the tokenizer abandons an oversized payload rather than truncating it"
+            ev.kind,
+            crate::core::cli_agent::AgentEventKind::PromptSubmit
         );
+        assert_eq!(ev.message, None, "a prompt is not a message");
     }
 
     #[test]
-    fn a_prompt_of_wide_characters_is_cut_on_a_character_boundary() {
-        let prompt = "把大纲恢复一下".repeat(100);
+    fn a_long_message_is_cut_on_a_character_boundary() {
         let ev = round_trip(
-            "claude",
-            "prompt-submit",
-            &serde_json::json!({ "prompt": prompt }).to_string(),
+            "gemini",
+            "permission-request",
+            &serde_json::json!({ "message": "允许".repeat(1000) }).to_string(),
         );
-        assert_eq!(ev.prompt.map(|p| p.chars().count()), Some(PROMPT_LABEL_MAX));
-    }
-
-    #[test]
-    fn an_agent_that_reports_no_prompt_carries_none() {
-        assert_eq!(round_trip("codex", "stop", "{}").prompt, None);
-        assert_eq!(
-            round_trip("claude", "prompt-submit", r#"{"prompt":"   "}"#).prompt,
-            None,
-            "whitespace is not a label"
-        );
+        assert_eq!(ev.message.map(|m| m.chars().count()), Some(MESSAGE_MAX));
+        assert_eq!(clip_chars("short", MESSAGE_MAX), "short");
     }
 
     #[test]
@@ -1781,6 +3022,46 @@ mod tests {
         assert_eq!(effective_agent("grok", true), "grok");
         assert_eq!(effective_agent("claude", false), "claude");
         assert_eq!(effective_agent("grok", false), "grok");
+    }
+
+    #[test]
+    fn tool_start_only_speaks_for_question_tools() {
+        for (agent, tool) in [
+            ("claude", "AskUserQuestion"),
+            ("codex", "request_user_input"),
+        ] {
+            let input = format!(r#"{{"tool_name":"{tool}","tool_input":{{}}}}"#);
+            assert_eq!(
+                effective_event(agent, "tool-start", &input),
+                Some("question-asked"),
+                "{agent} {tool}"
+            );
+        }
+        for input in [
+            r#"{"tool_name":"Bash"}"#,
+            r#"{"tool_name":"shell"}"#,
+            "{}",
+            "not json",
+        ] {
+            assert_eq!(
+                effective_event("claude", "tool-start", input),
+                None,
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_and_codex_report_permission_prompts_first_hand() {
+        for events in [CLAUDE_HOOK_EVENTS, CODEX_HOOK_EVENTS] {
+            for (hook, sentinel) in [
+                ("PermissionRequest", "permission-request"),
+                ("PreToolUse", "tool-start"),
+                ("PostToolUse", "tool-complete"),
+            ] {
+                assert!(events.contains(&(hook, sentinel)), "{hook}");
+            }
+        }
     }
 
     #[test]
@@ -1802,6 +3083,9 @@ mod tests {
             .chain(CURSOR_HOOK_EVENTS)
             .map(|(_, e)| *e)
             .chain(GROK_HOOK_EVENTS.iter().map(|(_, e, _)| *e))
+            // Never sent as itself: `effective_event` turns it into a real
+            // kind or drops it (`tool_start_only_speaks_for_question_tools`).
+            .filter(|e| *e != "tool-start")
             .collect();
         events.extend([
             "prompt-submit",
@@ -1820,6 +3104,25 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_hook_names_the_server_its_own_installer_placed() {
+        let host = FakeRemote::shared();
+        let dialect = crate::daemon::install::RemoteProtocol::of_this_build();
+        let name = crate::daemon::install::asset::binary_name(dialect.control, dialect.protocol);
+
+        let unix = HookTarget::remote(&*host, PathBuf::from("/home/me"));
+        assert_eq!(
+            unix.exe,
+            PathBuf::from(format!("/home/me/.local/share/tty7/bin/{name}"))
+        );
+
+        let windows = HookTarget::remote(&*host, PathBuf::from(r"C:\Users\me"));
+        assert_eq!(
+            windows.exe,
+            PathBuf::from(format!(r"C:\Users\me\AppData\Local\tty7\bin\{name}.exe"))
+        );
+    }
+
+    #[test]
     fn the_new_hook_agents_target_the_paths_their_clis_read() {
         let host = FakeRemote::shared();
         let t = HookTarget::remote(&*host, PathBuf::from("/home/me"));
@@ -1835,9 +3138,16 @@ mod tests {
             ),
             (HookAgent::Kimi, "/home/me/.kimi-code/config.toml"),
             (HookAgent::QoderCLI, "/home/me/.qoder/settings.json"),
+            (HookAgent::QoderCLICn, "/home/me/.qoder-cn/settings.json"),
             (HookAgent::Crush, "/home/me/.config/crush/crush.json"),
             (HookAgent::CodeBuddy, "/home/me/.codebuddy/settings.json"),
             (HookAgent::Cursor, "/home/me/.cursor/hooks.json"),
+            (HookAgent::Empryo, "/home/me/.empryo/hooks.json"),
+            (HookAgent::Jcode, "/home/me/.jcode/config.toml"),
+            (
+                HookAgent::PrimeAgent,
+                "/home/me/.prime/agent/extensions/tty7/index.ts",
+            ),
         ] {
             assert_eq!(
                 agent.target_path(&t),
@@ -1859,6 +3169,7 @@ mod tests {
             HookAgent::Goose,
             HookAgent::Kimi,
             HookAgent::QoderCLI,
+            HookAgent::QoderCLICn,
             HookAgent::Crush,
             HookAgent::CodeBuddy,
             HookAgent::Cursor,
@@ -2164,6 +3475,32 @@ mod tests {
         assert_eq!(state.session_id.as_deref(), Some("cur-1"));
     }
 
+    /// A Pi bridge written before Pi changed its package name is ours but
+    /// stale, so launch's refresh rewrites it with the current import.
+    #[test]
+    fn a_pi_bridge_importing_the_old_package_is_refreshed() {
+        let host = FakeRemote::shared();
+        let base = std::env::temp_dir().join(format!("tty7-pi-bridge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let target = HookTarget::remote(&*host, base.clone());
+        let path = HookAgent::Pi.target_path(&target);
+        let current = pi_extension_ts(&target, HookAgent::Pi).expect("pi bridge builds");
+        let old = current.replace(
+            "@earendil-works/pi-coding-agent",
+            "@mariozechner/pi-coding-agent",
+        );
+        assert_ne!(old, current);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &old).unwrap();
+
+        assert_eq!(hooks_state(&target, HookAgent::Pi), HooksState::Outdated);
+        assert_eq!(refresh_hooks(&target), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), current);
+        assert_eq!(hooks_state(&target, HookAgent::Pi), HooksState::Installed);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Cursor's `hooks.json` is flat like Crush's, but it is also ignored
     /// outright without `"version": 1` at the root — so a file tty7 creates
     /// has to carry one, and a user's own file keeps whatever it declares.
@@ -2246,6 +3583,80 @@ mod tests {
         assert_eq!(read()["version"], 1);
         assert_eq!(
             hooks_state(&target, HookAgent::Cursor),
+            HooksState::Installed
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Gemini shows a running hook by its `name`, else by its whole command,
+    /// so tty7's entries carry a short one — and an install from before they
+    /// did reads as outdated, for the launch-time refresh to name it.
+    #[test]
+    fn gemini_hooks_carry_a_short_name_and_unnamed_ones_are_refreshed() {
+        let host = FakeRemote::shared();
+        let base = std::env::temp_dir().join(format!("tty7-gemini-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let target = HookTarget::remote(&*host, base.clone());
+        let config = HookAgent::Gemini.target_path(&target);
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap()
+        };
+
+        install_hooks(&target, HookAgent::Gemini).expect("install succeeds");
+        for (hook, event) in GEMINI_HOOK_EVENTS {
+            assert_eq!(
+                read()["hooks"][*hook][0]["hooks"][0],
+                serde_json::json!({
+                    "type": "command",
+                    "command": target.hook_command(HookAgent::Gemini, event),
+                    "name": "tty7",
+                }),
+                "{hook}"
+            );
+        }
+
+        // What an earlier tty7 wrote: the same commands, no name.
+        let mut unnamed = serde_json::json!({ "ui": { "theme": "Default" }, "hooks": {} });
+        for (hook, event) in GEMINI_HOOK_EVENTS {
+            unnamed["hooks"][*hook] = serde_json::json!([{
+                "hooks": [{
+                    "type": "command",
+                    "command": target.hook_command(HookAgent::Gemini, event),
+                }]
+            }]);
+        }
+        std::fs::write(&config, unnamed.to_string()).unwrap();
+        assert_eq!(
+            hooks_state(&target, HookAgent::Gemini),
+            HooksState::Outdated
+        );
+        assert_eq!(refresh_hooks(&target), 1);
+        let refreshed = read();
+        assert_eq!(refreshed["ui"], unnamed["ui"]);
+        for (hook, _) in GEMINI_HOOK_EVENTS {
+            let entries = refreshed["hooks"][*hook].as_array().unwrap();
+            assert_eq!(entries.len(), 1, "{hook}: replaced, not doubled");
+            assert_eq!(entries[0]["hooks"][0]["name"], "tty7", "{hook}");
+        }
+        assert_eq!(
+            hooks_state(&target, HookAgent::Gemini),
+            HooksState::Installed
+        );
+
+        // Nobody else's entries get a name, and a named one of theirs is no
+        // reason to call Claude's hooks outdated.
+        install_hooks(&target, HookAgent::Claude).unwrap();
+        let claude = HookAgent::Claude.target_path(&target);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&claude).unwrap()).unwrap();
+        assert!(
+            written["hooks"]["Stop"][0]["hooks"][0]
+                .get("name")
+                .is_none()
+        );
+        assert_eq!(
+            hooks_state(&target, HookAgent::Claude),
             HooksState::Installed
         );
 
@@ -2478,6 +3889,14 @@ mod tests {
         ) -> io::Result<Vec<crate::host::SearchHit>> {
             self.0.search(roots, query, limit, max_dirs, show_hidden)
         }
+        fn search_content(
+            &self,
+            roots: &[PathBuf],
+            query: &crate::host::ContentQuery,
+            limits: &crate::host::ContentLimits,
+        ) -> io::Result<crate::host::ContentResults> {
+            self.0.search_content(roots, query, limits)
+        }
         fn write_file(&self, p: &Path, bytes: &[u8]) -> io::Result<crate::host::Meta> {
             self.0.write_file(p, bytes)
         }
@@ -2542,9 +3961,12 @@ mod tests {
             ),
             (HookAgent::Kimi, "/home/me/.kimi-code/config.toml"),
             (HookAgent::QoderCLI, "/home/me/.qoder/settings.json"),
+            (HookAgent::QoderCLICn, "/home/me/.qoder-cn/settings.json"),
             (HookAgent::Crush, "/home/me/.config/crush/crush.json"),
             (HookAgent::CodeBuddy, "/home/me/.codebuddy/settings.json"),
             (HookAgent::Cursor, "/home/me/.cursor/hooks.json"),
+            (HookAgent::Empryo, "/home/me/.empryo/hooks.json"),
+            (HookAgent::Jcode, "/home/me/.jcode/config.toml"),
         ] {
             assert_eq!(
                 agent.target_path(&target),
@@ -2579,6 +4001,365 @@ mod tests {
         assert_eq!(
             here.hook_command(HookAgent::Claude, "stop"),
             format!("{command_exe} agent-hook claude stop")
+        );
+    }
+
+    fn installed_muse_fixture(target: &HookTarget) -> serde_json::Value {
+        let mut hooks = muse_plugin_manifest(target)["capabilities"]["hooks"].clone();
+        for hook in hooks.as_array_mut().unwrap() {
+            let timeout = hook.as_object_mut().unwrap().remove("timeoutMs").unwrap();
+            hook["timeout_ms"] = timeout;
+        }
+        let runtime: Vec<_> = MUSE_HOOK_EVENTS
+            .iter()
+            .map(|(id, _, _)| {
+                serde_json::json!({
+                    "candidate": {"kind": "hook", "capability_id": id}, "status": "trusted_enabled"
+                })
+            })
+            .collect();
+        serde_json::json!({"active": true, "valid": true, "plugin": {"id": MUSE_PLUGIN_ID,
+            "capabilities": {"hooks": hooks}}, "runtime_capabilities": runtime})
+    }
+
+    #[test]
+    fn muse_install_uses_native_cli_and_requires_approved_hooks() {
+        let host = local_host();
+        let dir = std::env::temp_dir().join(format!("tty7-muse-install-{}", std::process::id()));
+        let target = HookTarget {
+            host: &*host,
+            home: dir.clone(),
+            exe: PathBuf::from("/tty7 bin/tty7-app"),
+        };
+        let path = HookAgent::Muse.target_path(&target);
+        let fixture = installed_muse_fixture(&target);
+        let mut calls = Vec::new();
+        let outcome = muse_install_with(&target, &path, |args| {
+            calls.push(args.to_vec());
+            Ok(if args[0] == "inspect" {
+                fixture.clone()
+            } else {
+                serde_json::json!({})
+            })
+        })
+        .unwrap();
+        assert_eq!(outcome, HookOutcome::Installed);
+        let bundle = path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            calls,
+            vec![
+                vec![
+                    "install".to_owned(),
+                    bundle,
+                    "--scope".into(),
+                    "user".into()
+                ],
+                vec!["approve".into(), "tty7-presence".into()],
+                vec!["enable".into(), "tty7-presence".into()],
+                vec!["inspect".into(), "tty7-presence".into()],
+            ]
+        );
+        assert_eq!(
+            muse_inspected_state(&target, &fixture),
+            HooksState::Installed
+        );
+        let mut unapproved = fixture.clone();
+        unapproved["runtime_capabilities"][0]["status"] = "needs_review".into();
+        assert_eq!(
+            muse_inspected_state(&target, &unapproved),
+            HooksState::Outdated
+        );
+        assert!(
+            muse_install_with(&target, &path, |args| {
+                if args[0] == "approve" {
+                    anyhow::bail!("approval failed");
+                }
+                Ok(serde_json::json!({}))
+            })
+            .is_err(),
+            "a failed approval is not reported as installed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn muse_remote_bundle_requires_manual_install_and_preserves_session_ids() {
+        let host = FakeRemote::shared();
+        let dir = std::env::temp_dir().join(format!("tty7-muse-remote-{}", std::process::id()));
+        let target = HookTarget::remote(&*host, dir.clone());
+        let path = HookAgent::Muse.target_path(&target);
+        let outcome = muse_install_with(&target, &path, |_| {
+            panic!("must not run local Muse for a remote")
+        })
+        .unwrap();
+        let HookOutcome::MuseInstallManually(command) = outcome else {
+            panic!("manual installation required");
+        };
+        assert!(command.contains("muse plugins install"));
+        assert!(command.contains("muse plugins approve tty7-presence"));
+        assert_eq!(
+            hooks_state(&target, HookAgent::Muse),
+            HooksState::NotInstalled
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let hooks = manifest["capabilities"]["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 8);
+        let interrupt = hooks
+            .iter()
+            .find(|hook| hook["event"] == "Interrupt")
+            .unwrap();
+        assert_eq!(
+            interrupt["async"], true,
+            "Muse admits only asynchronous cancellation hooks"
+        );
+        let permission = hooks
+            .iter()
+            .find(|hook| hook["event"] == "PermissionRequest")
+            .unwrap();
+        assert_eq!(permission["command"][3], "permission-request");
+        let event = round_trip(
+            "muse",
+            "session-start",
+            r#"{"session_id":"muse-session-42","cwd":"/workspace"}"#,
+        );
+        assert_eq!(event.agent, Some(CLIAgent::Muse));
+        assert_eq!(event.session_id.as_deref(), Some("muse-session-42"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empryo_hooks_merge_with_existing_lifecycle_hooks() {
+        let dir = std::env::temp_dir().join(format!("tty7-empryo-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let host = FakeRemote::shared();
+        let target = HookTarget::remote(&*host, dir.clone());
+        let path = HookAgent::Empryo.target_path(&target);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"hooks":{"SessionStart":[]}}"#).unwrap();
+        assert_eq!(
+            hooks_state(&target, HookAgent::Empryo),
+            HooksState::NotInstalled
+        );
+        install_hooks(&target, HookAgent::Empryo).expect("install succeeds");
+        assert_eq!(
+            hooks_state(&target, HookAgent::Empryo),
+            HooksState::Installed
+        );
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(root["hooks"]["SessionStart"].as_array().unwrap().len() >= 1);
+        assert!(
+            root["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("agent-hook empryo session-end")
+        );
+        install_hooks(&target, HookAgent::Empryo).expect("reinstall succeeds");
+        assert_eq!(
+            hooks_state(&target, HookAgent::Empryo),
+            HooksState::Installed
+        );
+        assert_eq!(
+            uninstall_hooks(&target, HookAgent::Empryo).unwrap(),
+            HookOutcome::Removed
+        );
+        assert_eq!(
+            uninstall_hooks(&target, HookAgent::Empryo).unwrap(),
+            HookOutcome::NoTty7Hooks
+        );
+        assert!(path.exists(), "uninstall preserves the shared config file");
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root, serde_json::json!({"hooks": {}}));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_jcode_report_reads_its_session_from_the_environment() {
+        let env = |k: &str| {
+            (k == "JCODE_HOOK_PAYLOAD").then(|| {
+                r#"{"event":"session_start","session_id":"j-7","cwd":"/work"}"#.to_string()
+            })
+        };
+        let input = hook_payload("jcode", String::new(), env);
+        let event = round_trip("jcode", "session-start", &input);
+        assert_eq!(event.agent, Some(CLIAgent::Jcode));
+        assert_eq!(event.session_id.as_deref(), Some("j-7"));
+        assert_eq!(event.cwd.as_deref(), Some(Path::new("/work")));
+        // Only jcode is read from there, and stdin still wins when it has
+        // something to say.
+        assert_eq!(hook_payload("claude", String::new(), env), "");
+        assert_eq!(hook_payload("jcode", "{}".into(), env), "{}");
+    }
+
+    #[test]
+    fn jcode_hooks_use_native_config_lifecycle_keys() {
+        let dir = std::env::temp_dir().join(format!("tty7-jcode-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let host = FakeRemote::shared();
+        let target = HookTarget::remote(&*host, dir.clone());
+        let path = HookAgent::Jcode.target_path(&target);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[hooks]\nturn_start = \"user-hook\"\n").unwrap();
+        install_hooks(&target, HookAgent::Jcode).expect("install succeeds");
+        assert_eq!(
+            hooks_state(&target, HookAgent::Jcode),
+            HooksState::Installed
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+        let commands = jcode_commands(&doc["hooks"]["turn_start"]).unwrap();
+        assert_eq!(
+            commands,
+            vec![
+                "user-hook".to_owned(),
+                target.hook_command(HookAgent::Jcode, "prompt-submit")
+            ]
+        );
+        install_hooks(&target, HookAgent::Jcode).expect("reinstall succeeds");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "reinstall adds no duplicates"
+        );
+        assert!(text.contains("agent-hook jcode prompt-submit"));
+        assert_eq!(
+            uninstall_hooks(&target, HookAgent::Jcode).unwrap(),
+            HookOutcome::Removed
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("user-hook")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn antigravity_owns_a_named_hook_set_beside_the_users() {
+        let dir = std::env::temp_dir().join(format!("tty7-agy-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let host = FakeRemote::shared();
+        let target = HookTarget::remote(&*host, dir.clone());
+        let path = HookAgent::Antigravity.target_path(&target);
+        assert_eq!(path, dir.join(".gemini/config/hooks.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let theirs = serde_json::json!({
+            "my-linter-hook": {
+                "PostToolUse": [{ "matcher": "run_command", "hooks": [{ "command": "./lint.sh" }] }]
+            }
+        });
+        std::fs::write(&path, theirs.to_string()).unwrap();
+
+        assert_eq!(
+            hooks_state(&target, HookAgent::Antigravity),
+            HooksState::NotInstalled
+        );
+        install_hooks(&target, HookAgent::Antigravity).expect("install succeeds");
+        assert_eq!(
+            hooks_state(&target, HookAgent::Antigravity),
+            HooksState::Installed
+        );
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["my-linter-hook"], theirs["my-linter-hook"],
+            "the user's set survives"
+        );
+        let set = &root[ANTIGRAVITY_HOOK_SET];
+        assert!(
+            set["PreInvocation"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("agent-hook antigravity prompt-submit")
+        );
+        assert_eq!(set["PostToolUse"][0]["matcher"], "*");
+        assert!(
+            set["Stop"][0]["command"]
+                .as_str()
+                .unwrap()
+                .ends_with("agent-hook antigravity stop")
+        );
+        assert!(
+            set.get("PreToolUse").is_none(),
+            "a status hook must not gate tools"
+        );
+
+        root_set_to(&path, serde_json::json!({ "Stop": [] }), &root);
+        assert_eq!(
+            hooks_state(&target, HookAgent::Antigravity),
+            HooksState::Outdated
+        );
+        install_hooks(&target, HookAgent::Antigravity).expect("reinstall succeeds");
+        assert_eq!(
+            hooks_state(&target, HookAgent::Antigravity),
+            HooksState::Installed
+        );
+
+        assert_eq!(
+            uninstall_hooks(&target, HookAgent::Antigravity).expect("uninstall succeeds"),
+            HookOutcome::Removed
+        );
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root, theirs,
+            "uninstall leaves exactly what was there before"
+        );
+        assert_eq!(
+            uninstall_hooks(&target, HookAgent::Antigravity).expect("second uninstall"),
+            HookOutcome::NoTty7Hooks
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn root_set_to(path: &Path, set: serde_json::Value, root: &serde_json::Value) {
+        let mut root = root.clone();
+        root[ANTIGRAVITY_HOOK_SET] = set;
+        std::fs::write(path, root.to_string()).unwrap();
+    }
+
+    #[test]
+    fn antigravity_payloads_map_onto_turns() {
+        let first = r#"{"conversationId":"c-1","invocationNum":0,"workspacePaths":["/repo"]}"#;
+        let later = r#"{"conversationId":"c-1","invocationNum":2,"workspacePaths":["/repo"]}"#;
+        assert_eq!(
+            effective_event("antigravity", "prompt-submit", first),
+            Some("prompt-submit")
+        );
+        assert_eq!(
+            effective_event("antigravity", "prompt-submit", later),
+            Some("tool-complete")
+        );
+        assert_eq!(
+            effective_event(
+                "antigravity",
+                "stop",
+                r#"{"conversationId":"c-1","fullyIdle":true}"#
+            ),
+            Some("stop")
+        );
+        assert_eq!(
+            effective_event(
+                "antigravity",
+                "stop",
+                r#"{"conversationId":"c-1","fullyIdle":false}"#
+            ),
+            None
+        );
+        let ev = round_trip("antigravity", "prompt-submit", first);
+        assert_eq!(ev.session_id.as_deref(), Some("c-1"));
+        assert_eq!(ev.cwd.as_deref(), Some(Path::new("/repo")));
+        assert_eq!(
+            ev.agent,
+            Some(crate::core::cli_agent::CLIAgent::Antigravity)
         );
     }
 
@@ -2645,40 +4426,89 @@ mod tests {
 
         let opencode = opencode_plugin_js(&target).expect("opencode content builds");
         assert!(opencode.contains("agent-hook opencode"));
-        assert!(opencode.contains(hook_exe));
+        assert!(opencode.contains(&format!("const EXE = {exe_json}")));
         assert!(opencode.contains(r#"process.env["TTY7"]"#));
         for (needle, message) in [
             (
-                "properties.sessionID",
-                "opencode captures the session id from event properties",
+                r#"export default { id: "tty7", server, setup }"#,
+                "opencode default-exports one definition both plugin loaders accept (#999)",
+            ),
+            (
+                "export const Tty7Presence = server",
+                "opencode keeps the named factory for 1.x loaders that call every export",
+            ),
+            (
+                r#"spawn(EXE, ["agent-hook", "opencode", event]"#,
+                "opencode spawns the emitter without a shell, which Windows lacks",
+            ),
+            (
+                "event.properties ?? {}",
+                "opencode 1.x reads event fields from properties",
+            ),
+            (
+                "ctx.event.subscribe(",
+                "opencode 2.x reads events from the subscribe stream",
+            ),
+            (
+                "event.data ?? {}",
+                "opencode 2.x reads event fields from data",
+            ),
+            (
+                r#"process.argv.includes("--service")"#,
+                "opencode 2.x stays inert in the machine-wide background service",
             ),
             (
                 r#"session_id: sessionId"#,
                 "opencode forwards the session id to the emitter",
             ),
             (
-                "session.status",
-                "opencode maps session.status busy/idle to prompt-submit/stop",
+                r#""session.status.busy": "prompt-submit""#,
+                "opencode maps session.status busy to prompt-submit",
             ),
             (
-                "session.idle",
+                r#""session.status.idle": "stop""#,
+                "opencode maps session.status idle to stop",
+            ),
+            (
+                r#""session.idle": "stop""#,
                 "opencode still maps the session.idle event to stop",
             ),
             (
-                "info.parentID",
-                "opencode tells a subagent's child session apart from the pane's own",
+                r#""permission.asked": "permission-request""#,
+                "opencode 2.x reports its permission.asked event as a permission request",
             ),
             (
-                "children.has(properties.sessionID)",
+                r#""permission.ask": async"#,
+                "opencode 1.x keeps the permission.ask hook",
+            ),
+            (
+                "info.parentID",
+                "opencode 1.x tells a subagent's child session apart from the pane's own",
+            ),
+            (
+                "fields.parentID",
+                "opencode 2.x tells a subagent's child session apart from the pane's own",
+            ),
+            (
+                "children.has(fields.sessionID)",
                 "opencode lets a child session's events pass without touching the pane",
             ),
         ] {
             assert!(opencode.contains(needle), "{message}");
         }
+        assert!(
+            !opencode.contains("sh -c"),
+            "opencode no longer routes the emitter through sh"
+        );
 
         for (agent, slug, package) in [
-            (HookAgent::Pi, "pi", "@mariozechner/pi-coding-agent"),
+            (HookAgent::Pi, "pi", "@earendil-works/pi-coding-agent"),
             (HookAgent::OhMyPi, "omp", "@oh-my-pi/pi-coding-agent"),
+            (
+                HookAgent::PrimeAgent,
+                "prime-agent",
+                "@earendil-works/pi-coding-agent",
+            ),
         ] {
             let bridge =
                 pi_extension_ts(&target, agent).unwrap_or_else(|| panic!("{slug} content builds"));
@@ -2697,6 +4527,10 @@ mod tests {
                 "session_shutdown",
                 "ui_prompt_start",
                 "ui_prompt_end",
+                "agent_settled",
+                "tool_approval_requested",
+                "tool_approval_resolved",
+                "auto_retry_start",
             ] {
                 assert!(
                     bridge.contains(&format!(r#"pi.on("{event}""#)),
@@ -2861,6 +4695,102 @@ mod tests {
             std::fs::read_to_string(settings)
                 .unwrap()
                 .contains("agent-hook qodercli")
+        );
+        assert_eq!(
+            uninstall_hooks(&target, agent).unwrap(),
+            HookOutcome::Removed
+        );
+        assert_eq!(hooks_state(&target, agent), HooksState::NotInstalled);
+        for path in [settings, untouched] {
+            let actual: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(actual, user_config, "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn qoder_cn_config_dir_controls_local_hook_lifecycle() {
+        const CASE_ENV: &str = "TTY7_TEST_QODER_CN_CONFIG_CASE";
+        const ROOT_ENV: &str = "TTY7_TEST_QODER_CN_CONFIG_ROOT";
+        let Ok(case) = std::env::var(CASE_ENV) else {
+            for case in ["override", "empty", "unset"] {
+                let sandbox = tempfile::tempdir().unwrap();
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "core::agent_hooks::tests::qoder_cn_config_dir_controls_local_hook_lifecycle",
+                        "--nocapture",
+                    ])
+                    .env(CASE_ENV, case)
+                    .env(ROOT_ENV, sandbox.path());
+                match case {
+                    "override" => {
+                        child.env("QODERCN_CONFIG_DIR", sandbox.path().join("custom config"))
+                    }
+                    "empty" => child.env("QODERCN_CONFIG_DIR", ""),
+                    _ => child.env_remove("QODERCN_CONFIG_DIR"),
+                };
+                let output = crate::core::proc::output_within(
+                    crate::core::proc::hide_console(&mut child),
+                    std::time::Duration::from_secs(30),
+                )
+                .expect("run the isolated Qoder CN hook test");
+                assert!(
+                    output.status.success(),
+                    "{case}:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+            return;
+        };
+
+        let root = PathBuf::from(std::env::var_os(ROOT_ENV).unwrap());
+        let host = local_host();
+        let target = HookTarget {
+            host: &*host,
+            home: root.join("home"),
+            exe: std::env::current_exe().unwrap(),
+        };
+        let default_settings = target.home.join(".qoder-cn").join("settings.json");
+        let custom_settings = root.join("custom config").join("settings.json");
+        let (settings, untouched) = if case == "override" {
+            (&custom_settings, &default_settings)
+        } else {
+            (&default_settings, &custom_settings)
+        };
+        let user_config = serde_json::json!({
+            "model": "qoder-cn-test",
+            "hooks": {
+                "Stop": [{ "hooks": [{ "type": "command", "command": "echo user-hook" }] }]
+            }
+        });
+        for path in [settings, untouched] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, user_config.to_string()).unwrap();
+        }
+
+        let agent = HookAgent::QoderCLICn;
+        assert_eq!(agent.target_path(&target), *settings);
+        let remote_host = FakeRemote::shared();
+        let remote = HookTarget::remote(&*remote_host, PathBuf::from("/home/me"));
+        assert_eq!(
+            agent.target_path(&remote),
+            PathBuf::from("/home/me/.qoder-cn/settings.json"),
+            "a local override must not redirect remote hooks"
+        );
+
+        assert_eq!(hooks_state(&target, agent), HooksState::NotInstalled);
+        assert_eq!(
+            install_hooks(&target, agent).unwrap(),
+            HookOutcome::Installed
+        );
+        assert_eq!(hooks_state(&target, agent), HooksState::Installed);
+        assert!(
+            std::fs::read_to_string(settings)
+                .unwrap()
+                .contains("agent-hook qoderclicn")
         );
         assert_eq!(
             uninstall_hooks(&target, agent).unwrap(),
@@ -3249,6 +5179,60 @@ mod tests {
         uninstall_hooks(&t, HookAgent::Claude).expect("uninstall is idempotent");
 
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Codex moved to `CODEX_HOME` reads its hooks from there, and a
+    /// `hooks.json` under `~/.codex` is one it never looks at.
+    #[test]
+    fn codex_hooks_live_in_codex_home_when_it_is_set() {
+        let dir = std::env::temp_dir().join(format!("tty7-codex-home-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("CODEX_HOME", &dir) };
+
+        let host = local_host();
+        let t = HookTarget::local(&*host).expect("home resolves in tests");
+        assert_eq!(HookAgent::Codex.target_path(&t), dir.join("hooks.json"));
+        assert_eq!(hooks_state(&t, HookAgent::Codex), HooksState::NotInstalled);
+        let remote_host = FakeRemote::shared();
+        let remote = HookTarget::remote(&*remote_host, PathBuf::from("/home/me"));
+        assert_eq!(
+            HookAgent::Codex.target_path(&remote),
+            PathBuf::from("/home/me/.codex/hooks.json"),
+            "a local CODEX_HOME says nothing about a remote machine"
+        );
+
+        unsafe { std::env::remove_var("CODEX_HOME") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Gemini CLI moved to `GEMINI_CLI_HOME` keeps its `.gemini` directory
+    /// there, and `~/.gemini/settings.json` is a file it never reads.
+    #[test]
+    fn gemini_hooks_live_under_gemini_cli_home_when_it_is_set() {
+        let dir =
+            std::env::temp_dir().join(format!("tty7-gemini-home-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("GEMINI_CLI_HOME", &dir) };
+
+        let host = local_host();
+        let t = HookTarget::local(&*host).expect("home resolves in tests");
+        assert_eq!(
+            HookAgent::Gemini.target_path(&t),
+            dir.join(".gemini").join("settings.json")
+        );
+        assert_eq!(hooks_state(&t, HookAgent::Gemini), HooksState::NotInstalled);
+        let remote_host = FakeRemote::shared();
+        let remote = HookTarget::remote(&*remote_host, PathBuf::from("/home/me"));
+        assert_eq!(
+            HookAgent::Gemini.target_path(&remote),
+            PathBuf::from("/home/me/.gemini/settings.json"),
+            "a local GEMINI_CLI_HOME says nothing about a remote machine"
+        );
+
+        unsafe { std::env::remove_var("GEMINI_CLI_HOME") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 

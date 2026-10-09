@@ -29,10 +29,15 @@ pub enum CLIAgent {
     QoderCLI,
     Crush,
     CodeBuddy,
+    Empryo,
+    PrimeAgent,
+    QoderCLICn,
+    Muse,
+    Jcode,
 }
 
 impl CLIAgent {
-    pub const ALL: [CLIAgent; 23] = [
+    pub const ALL: [CLIAgent; 28] = [
         CLIAgent::Claude,
         CLIAgent::Codex,
         CLIAgent::TraeCode,
@@ -54,8 +59,13 @@ impl CLIAgent {
         CLIAgent::OhMyPi,
         CLIAgent::Kimi,
         CLIAgent::QoderCLI,
+        CLIAgent::QoderCLICn,
         CLIAgent::Crush,
         CLIAgent::CodeBuddy,
+        CLIAgent::Empryo,
+        CLIAgent::PrimeAgent,
+        CLIAgent::Muse,
+        CLIAgent::Jcode,
     ];
 
     fn aliases(self) -> &'static [&'static str] {
@@ -98,6 +108,12 @@ impl CLIAgent {
             // launch is the cost: it wears the CLI's avatar for as long as the
             // launcher takes to exit.
             CLIAgent::QoderCLI => &["qoder", "qodercli"],
+            // The mainland-China build of Qoder: the same vendor as the global
+            // one, a separate install that keeps its state in `~/.qoder-cn`.
+            // It ships the same dispatcher-plus-CLI pair under `-cn` names, so
+            // `qoder-cn` is detected too. A bare `qoder` still belongs to the
+            // global build.
+            CLIAgent::QoderCLICn => &["qodercn", "qoderclicn", "qoder-cn"],
             // Charm's terminal agent. One binary, and the name on `PATH` is
             // the one it starts as.
             CLIAgent::Crush => &["crush"],
@@ -106,6 +122,10 @@ impl CLIAgent {
             // `cbc` also names the COIN-OR solver; a solver run wearing the
             // avatar until it exits is the cost of catching the short name.
             CLIAgent::CodeBuddy => &["codebuddy", "codebuddy-code", "cbc"],
+            CLIAgent::Empryo => &["empryo"],
+            CLIAgent::Muse => &["muse"],
+            CLIAgent::Jcode => &["jcode"],
+            CLIAgent::PrimeAgent => &["prime-agent"],
         }
     }
 
@@ -134,6 +154,11 @@ impl CLIAgent {
             CLIAgent::QoderCLI => "qodercli",
             CLIAgent::Crush => "crush",
             CLIAgent::CodeBuddy => "codebuddy",
+            CLIAgent::Empryo => "empryo",
+            CLIAgent::Muse => "muse",
+            CLIAgent::Jcode => "jcode",
+            CLIAgent::PrimeAgent => "prime-agent",
+            CLIAgent::QoderCLICn => "qoderclicn",
         }
     }
 
@@ -167,6 +192,11 @@ impl CLIAgent {
             CLIAgent::QoderCLI => "Qoder CLI",
             CLIAgent::Crush => "Crush",
             CLIAgent::CodeBuddy => "CodeBuddy",
+            CLIAgent::Empryo => "Empryo",
+            CLIAgent::Muse => "Muse Code",
+            CLIAgent::Jcode => "jcode",
+            CLIAgent::PrimeAgent => "Prime Agent",
+            CLIAgent::QoderCLICn => "Qoder CN CLI",
         }
     }
 
@@ -199,18 +229,24 @@ impl CLIAgent {
             CLIAgent::Copilot => Some(format!("copilot{flags} --resume {session_id}")),
             CLIAgent::Grok => Some(format!("grok{flags} --resume {session_id}")),
             CLIAgent::QoderCLI => Some(format!("qodercli{flags} --resume {session_id}")),
+            CLIAgent::QoderCLICn => Some(format!("qodercn{flags} --resume {session_id}")),
             CLIAgent::Pi => Some(format!("pi{flags} --session {session_id}")),
             CLIAgent::OhMyPi => Some(format!("omp{flags} --resume {session_id}")),
             CLIAgent::Kimi => Some(format!("kimi{flags} --session {session_id}")),
             CLIAgent::Crush => Some(format!("crush{flags} --session {session_id}")),
             CLIAgent::CodeBuddy => Some(format!("codebuddy{flags} --resume {session_id}")),
+            CLIAgent::Empryo => Some(format!("empryo{flags} --session {session_id}")),
+            // Root options may sit on either side of `resume`.
+            CLIAgent::Muse => Some(format!("muse{flags} resume {session_id}")),
+            CLIAgent::Jcode => Some(format!("jcode{flags} --resume {session_id}")),
+            CLIAgent::PrimeAgent => Some(format!("prime-agent{flags} --resume {session_id}")),
             _ => None,
         }
     }
 
     fn opts_out_of_sessions(self, argv: &[String]) -> bool {
         let ephemeral: &[&str] = match self {
-            CLIAgent::Pi | CLIAgent::OhMyPi => &["--no-session"],
+            CLIAgent::Pi | CLIAgent::OhMyPi | CLIAgent::PrimeAgent => &["--no-session"],
             // "Do not save conversation history" — nothing is persisted, so
             // there is no session left to resume from.
             CLIAgent::Auggie => &["--dont-save-session"],
@@ -219,7 +255,9 @@ impl CLIAgent {
             CLIAgent::Qwen => &["--no-chat-recording"],
             // Print mode still emits a session id in hooks when persistence
             // is disabled, but there is no saved conversation to reopen.
-            CLIAgent::QoderCLI | CLIAgent::CodeBuddy => &["--no-session-persistence"],
+            CLIAgent::QoderCLI | CLIAgent::CodeBuddy | CLIAgent::QoderCLICn => {
+                &["--no-session-persistence"]
+            }
             _ => &[],
         };
         argv.iter().any(|t| ephemeral.contains(&t.as_str()))
@@ -240,11 +278,17 @@ impl CLIAgent {
             CLIAgent::QoderCLI => Some(format!(
                 "qodercli{flags} --resume {session_id} --fork-session"
             )),
+            // qoder-cn is the same CLI against a different config directory, so
+            // it takes the same switches.
+            CLIAgent::QoderCLICn => Some(format!(
+                "qodercn{flags} --resume {session_id} --fork-session"
+            )),
             CLIAgent::CodeBuddy => Some(format!(
                 "codebuddy{flags} --resume {session_id} --fork-session"
             )),
             CLIAgent::OpenCode => Some(format!("opencode{flags} --session {session_id} --fork")),
             CLIAgent::OhMyPi => Some(format!("omp{flags} --fork {session_id}")),
+            CLIAgent::PrimeAgent => Some(format!("prime-agent{flags} --fork {session_id}")),
             // Droid forks with a standalone flag rather than resume-plus-a-switch.
             CLIAgent::Droid => Some(format!("droid{flags} --fork {session_id}")),
             // `fork` is missing from `amp threads --help`, but the subcommand is
@@ -267,14 +311,57 @@ impl CLIAgent {
             | CLIAgent::Grok
             | CLIAgent::OpenCode
             | CLIAgent::OhMyPi
+            | CLIAgent::PrimeAgent
             | CLIAgent::Droid
             | CLIAgent::Amp
             | CLIAgent::Qwen
             | CLIAgent::Goose
             | CLIAgent::QoderCLI
+            | CLIAgent::QoderCLICn
             | CLIAgent::CodeBuddy => Some("Fork Session"),
             _ => None,
         }
+    }
+
+    /// A fresh start under `session_id`, for when [`Self::resume_command`]
+    /// finds nothing: Claude saves no conversation for a session that never
+    /// took a turn (or ran with transcript saving off), and resuming one
+    /// fails at once. `None` for agents that cannot name a new session.
+    pub fn start_command(self, session_id: &str, launch_argv: Option<&[String]>) -> Option<String> {
+        if self != CLIAgent::Claude || uuid::Uuid::parse_str(session_id).is_err() {
+            return None;
+        }
+        let flags = self.session_command_flags(session_id, launch_argv)?;
+        Some(format!("claude{flags} --session-id {session_id}"))
+    }
+
+    /// The line a restored pane types to bring its agent back: the resume,
+    /// falling back to [`Self::start_command`] with `||` when the pane's shell
+    /// has that operator. `shell_program` is that shell, `None` when it is not
+    /// known — then, as in a shell without `||`, the resume goes alone, since
+    /// one that cannot parse the line would not run the resume either.
+    ///
+    /// `||` fires on any failed exit, not only "no conversation found". The
+    /// other ways a resume fails fast (a flag this version rejects, no login)
+    /// fail the fresh start the same way; one that exits non-zero after the
+    /// user took turns follows with a start under an id that now has a
+    /// conversation, which Claude turns down as already in use. Telling the
+    /// cases apart would mean reading Claude's stderr, which a typed line
+    /// cannot do portably.
+    pub fn restore_command(
+        self,
+        session_id: &str,
+        launch_argv: Option<&[String]>,
+        shell_program: Option<&str>,
+    ) -> Option<String> {
+        let resume = self.resume_command(session_id, launch_argv)?;
+        let fresh = shell_program
+            .filter(|shell| crate::core::shell_quote::runs_or_list(shell))
+            .and_then(|_| self.start_command(session_id, launch_argv));
+        Some(match fresh {
+            Some(fresh) => format!("{resume} || {fresh}"),
+            None => resume,
+        })
     }
 
     fn session_command_flags(
@@ -282,7 +369,11 @@ impl CLIAgent {
         session_id: &str,
         launch_argv: Option<&[String]>,
     ) -> Option<String> {
+        // A leading `-` would be read as a flag, not the id: `--resume
+        // --dangerously-skip-permissions`. No agent writes such an id, but
+        // the listing takes ids from file and directory names on disk.
         if session_id.is_empty()
+            || session_id.starts_with('-')
             || !session_id
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
@@ -304,6 +395,32 @@ impl CLIAgent {
     }
 
     fn replay_flags(self, argv: &[String]) -> Option<Vec<String>> {
+        let tail = self.session_free_tail(argv)?;
+        let safe = |t: &str| {
+            !t.is_empty()
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_=./,:@+~".contains(&b))
+        };
+        if !tail.iter().all(|t| safe(t)) {
+            return None;
+        }
+        let mut prev_was_flag = false;
+        for t in &tail {
+            let is_flag = t.starts_with('-');
+            if !is_flag && !prev_was_flag {
+                return None;
+            }
+            prev_was_flag = is_flag;
+        }
+        Some(tail.into_iter().map(String::from).collect())
+    }
+
+    /// What follows the agent's own name in `argv`, with everything that names
+    /// a session taken out: the resume/fork subcommands and the flags listed as
+    /// stale for this agent, each with its value. `None` when no token in
+    /// `argv` names this agent — a wrapper, where there is no telling which
+    /// arguments are the agent's.
+    fn session_free_tail(self, argv: &[String]) -> Option<Vec<&str>> {
         let names_self = |token: &str| {
             token.split(['/', '\\']).any(|seg| {
                 CLIAgent::match_token(&base_stem(seg).to_ascii_lowercase()) == Some(self)
@@ -313,7 +430,7 @@ impl CLIAgent {
         let named = argv.iter().position(|t| names_self(t))?;
         let mut tail: Vec<&str> = argv[named + 1..].iter().map(String::as_str).collect();
 
-        if matches!(self, CLIAgent::Codex | CLIAgent::TraeCode)
+        if matches!(self, CLIAgent::Codex | CLIAgent::TraeCode | CLIAgent::Muse)
             && matches!(tail.first(), Some(&"resume") | Some(&"fork"))
         {
             tail.remove(0);
@@ -407,6 +524,15 @@ impl CLIAgent {
             // `--resume`, `-r` and `--session` are three spellings of one flag
             // in Oh My Pi; `--session-dir` is a different one and survives.
             CLIAgent::OhMyPi => &["--resume", "-r", "--session", "--fork", "--continue", "-c"],
+            // Prime Agent is a Pi fork with the same session switches;
+            // `--session-dir` is a different option and survives.
+            CLIAgent::PrimeAgent => &["--resume", "-r", "--fork", "--continue", "-c"],
+            // empryo resumes with `--session <id>`; `--save-session` only
+            // applies to headless runs and is not a session selector.
+            CLIAgent::Empryo => &["--session"],
+            // `muse resume --last` picks the newest session instead of the id.
+            CLIAgent::Muse => &["--last"],
+            CLIAgent::Jcode => &["--resume"],
             // `--resume`/`-r` is Kimi's hidden alias for `--session`/`-S`.
             // `--agent`/`--agent-file` bind the main agent at session creation
             // and Kimi rejects either next to `--session` outright; resuming
@@ -442,7 +568,7 @@ impl CLIAgent {
             // appends, and `--fork-session` is the flag the fork variant
             // appends itself. `--worktree` would create or switch trees again;
             // Qoder's `-w` means `--cwd` and must survive.
-            CLIAgent::QoderCLI => &[
+            CLIAgent::QoderCLI | CLIAgent::QoderCLICn => &[
                 "--resume",
                 "-r",
                 "--continue",
@@ -490,24 +616,7 @@ impl CLIAgent {
                 i += 1;
             }
         }
-
-        let safe = |t: &str| {
-            !t.is_empty()
-                && t.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_=./,:@+~".contains(&b))
-        };
-        if !tail.iter().all(|t| safe(t)) {
-            return None;
-        }
-        let mut prev_was_flag = false;
-        for t in &tail {
-            let is_flag = t.starts_with('-');
-            if !is_flag && !prev_was_flag {
-                return None;
-            }
-            prev_was_flag = is_flag;
-        }
-        Some(tail.into_iter().map(String::from).collect())
+        Some(tail)
     }
 
     pub fn accent_rgb(self) -> u32 {
@@ -537,8 +646,14 @@ impl CLIAgent {
             // black, which Codex and Grok already have covered.
             CLIAgent::Kimi => 0x027AFF,
             CLIAgent::QoderCLI => 0xFFFFFF,
+            // qoder-cn ships the same mark on the same black field.
+            CLIAgent::QoderCLICn => 0xFFFFFF,
             // The blue-violet field Charm ships the Crush heart on.
             CLIAgent::Crush => 0x6B50FF,
+            CLIAgent::Empryo => 0xE8663D,
+            CLIAgent::Muse => 0x0866FF,
+            CLIAgent::Jcode => 0x111111,
+            CLIAgent::PrimeAgent => 0x111111,
             // The near-black field CodeBuddy's own app icon sits on.
             CLIAgent::CodeBuddy => 0x1F1F1F,
         }
@@ -559,7 +674,7 @@ impl CLIAgent {
     pub fn icon_rgb(self) -> u32 {
         match self {
             CLIAgent::TraeCode => 0x32F08C,
-            CLIAgent::QoderCLI => 0x000000,
+            CLIAgent::QoderCLI | CLIAgent::QoderCLICn => 0x000000,
             _ => 0xFFFFFF,
         }
     }
@@ -582,20 +697,96 @@ impl CLIAgent {
             CLIAgent::Qwen => "icons/agents/qwen.svg",
             CLIAgent::Kimi => "icons/agents/kimi.svg",
             CLIAgent::QoderCLI => "icons/agents/qodercli.svg",
+            CLIAgent::QoderCLICn => "icons/agents/qoderclicn.svg",
             CLIAgent::Crush => "icons/agents/crush.svg",
             CLIAgent::CodeBuddy => "icons/agents/codebuddy.svg",
             CLIAgent::Aider
             | CLIAgent::Auggie
             | CLIAgent::Hermes
             | CLIAgent::Vibe
-            | CLIAgent::Antigravity => "icons/bot.svg",
+            | CLIAgent::Antigravity
+            | CLIAgent::Empryo
+            | CLIAgent::PrimeAgent
+            | CLIAgent::Muse
+            | CLIAgent::Jcode => "icons/bot.svg",
         }
     }
 
     fn match_token(token: &str) -> Option<CLIAgent> {
+        // Muse Code's `muse` launcher execs a versioned binary,
+        // `muse-bin-<version>`, so that is the name the process runs under.
+        let token = if token.starts_with("muse-bin-") {
+            "muse"
+        } else {
+            token
+        };
         CLIAgent::ALL
             .into_iter()
             .find(|a| a.aliases().contains(&token))
+    }
+
+    /// The program a launch with no override runs: the first name the agent
+    /// is detected by, which is the one its installer puts on `PATH`.
+    pub fn binary(self) -> &'static str {
+        self.aliases()[0]
+    }
+
+    /// The command line a quick launch types for this agent: the user's
+    /// `agent_launch` entry when there is one, the bare binary otherwise.
+    ///
+    /// Keys are matched the way [`CLIAgent::from_slug`] reads them, so a
+    /// hand-written `"Claude"` still counts. A blank entry is no override.
+    pub fn launch_command(self, overrides: &HashMap<String, String>) -> String {
+        overrides
+            .iter()
+            .find(|(slug, _)| CLIAgent::from_slug(slug) == Some(self))
+            .map(|(_, line)| line.trim())
+            .filter(|line| !line.is_empty())
+            .map_or_else(|| self.binary().to_string(), str::to_string)
+    }
+
+    /// The arguments that start an interactive session whose first message is
+    /// `prompt`. `None` for an agent whose positional prompt means a one-shot,
+    /// non-interactive run, or whose form is not known — the caller then
+    /// starts the agent bare rather than guess.
+    pub fn prompt_args(self, prompt: &str) -> Option<Vec<String>> {
+        match self {
+            CLIAgent::Claude | CLIAgent::Codex => Some(vec![prompt.to_string()]),
+            CLIAgent::Gemini => Some(vec!["-i".to_string(), prompt.to_string()]),
+            _ => None,
+        }
+    }
+
+    /// `argv` as a command line worth launching this agent with again: its
+    /// binary followed by the flags it ran with, minus everything that names
+    /// one particular session (a resume, a fork, a session id) and minus
+    /// positional arguments such as a prompt, which belong to that one run.
+    ///
+    /// A run that went through something that does not name the agent — a
+    /// wrapper script mapped by `agent_commands` — cannot be taken apart, so
+    /// it comes back whole: it is what was typed, and it launched the agent.
+    pub fn launch_argv_for_default(self, argv: &[String]) -> Option<Vec<String>> {
+        let env = argv.iter().take_while(|t| is_env_assignment(t)).count();
+        if argv.len() == env {
+            return None;
+        }
+        let Some(tail) = self.session_free_tail(argv) else {
+            return Some(argv.to_vec());
+        };
+        let mut out: Vec<String> = argv[..env].to_vec();
+        out.push(self.binary().to_string());
+        let mut takes_value = false;
+        for t in tail {
+            let is_flag = t.starts_with('-') && t.len() > 1;
+            if is_flag {
+                out.push(t.to_string());
+                takes_value = !t.contains('=');
+            } else if takes_value {
+                out.push(t.to_string());
+                takes_value = false;
+            }
+        }
+        Some(out)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -621,6 +812,20 @@ impl CLIAgent {
         if let Some(agent) = custom
             .get(&launcher_stem.to_ascii_lowercase())
             .and_then(|slug| CLIAgent::from_slug(slug))
+        {
+            return Some(agent);
+        }
+
+        // A wrapper that is a script runs as its interpreter, so the name the
+        // user mapped is the script's, one token in: `bash ~/bin/cc`,
+        // `node ~/bin/cc.js`. Only the mapped names are looked for there — the
+        // built-in ones already have the scan below.
+        if (is_interpreter(launcher_stem) || is_shell(launcher_stem))
+            && let Some(agent) = rest
+                .clone()
+                .find(|a| !a.starts_with('-') && !is_env_assignment(a))
+                .and_then(|script| custom.get(&base_stem(script).to_ascii_lowercase()))
+                .and_then(|slug| CLIAgent::from_slug(slug))
         {
             return Some(agent);
         }
@@ -719,6 +924,99 @@ fn is_interpreter(stem: &str) -> bool {
     )
 }
 
+fn is_shell(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish"
+    )
+}
+
+/// The program a launch command line runs: its first word that is not an
+/// environment assignment.
+pub fn launch_program(command: &str) -> Option<String> {
+    command_argv(command)
+        .into_iter()
+        .find(|t| !is_env_assignment(t))
+}
+
+/// The wrapper names `agent_launch` implies, in the shape `agent_commands`
+/// takes: `{"claude": "cc --fast"}` means a `cc` in a pane is Claude Code.
+///
+/// This is how a pane opened by a quick launch through a wrapper is still
+/// recognised without the user also writing an `agent_commands` entry: the
+/// launch typed exactly this command, so its program is known to be that
+/// agent. A program that is already an agent's own name needs no entry, and
+/// an interpreter (`npx`, `node`, `env`, …) or a shell is never mapped
+/// wholesale — `npx` is not Claude Code just because Claude Code is one of the
+/// things it can run.
+pub fn launch_aliases(overrides: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (slug, line) in overrides {
+        let Some(agent) = CLIAgent::from_slug(slug) else {
+            continue;
+        };
+        let Some(program) = launch_program(line) else {
+            continue;
+        };
+        let stem = base_stem(&program).to_ascii_lowercase();
+        if stem.is_empty()
+            || CLIAgent::match_token(&stem).is_some()
+            || is_interpreter(&stem)
+            || is_shell(&stem)
+        {
+            continue;
+        }
+        out.insert(stem, agent.slug().to_string());
+    }
+    out
+}
+
+/// Whether `program` names an executable file, either directly (it has a
+/// directory in it) or through one of the directories in `path`.
+///
+/// On Windows a bare name is also tried with the extensions an npm or winget
+/// install leaves behind, since `claude` there is really `claude.cmd`.
+pub fn program_on_path(program: &str, path: &std::ffi::OsStr) -> bool {
+    let program = program.trim();
+    if program.is_empty() {
+        return false;
+    }
+    if program.contains(['/', '\\']) {
+        // The launch is typed into a shell, which expands a leading `~/`.
+        let home = program
+            .strip_prefix("~/")
+            .and_then(|rest| Some(std::path::PathBuf::from(std::env::var_os("HOME")?).join(rest)));
+        return is_executable(home.as_deref().unwrap_or(std::path::Path::new(program)));
+    }
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat", ".ps1"]
+    } else {
+        &[""]
+    };
+    std::env::split_paths(path).any(|dir| {
+        exts.iter()
+            .any(|ext| is_executable(&dir.join(format!("{program}{ext}"))))
+    })
+}
+
+fn is_executable(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 pub const AGENT_EVENT_SENTINEL: &str = "tty7://cli-agent";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -757,6 +1055,50 @@ pub struct AgentSessionState {
     /// later one that finished while nobody was watching (#870).
     #[serde(default)]
     pub turns: u64,
+    /// The status was concluded by tty7, not reported by the agent: a turn
+    /// the user interrupted ([`Self::assume_interrupted`]) or one that went
+    /// quiet for too long ([`Self::assume_stale`]). Cleared by the next real
+    /// event, and a tool finishing after it proves the guess wrong and puts
+    /// the turn back on [`AgentStatus::Working`].
+    #[serde(default)]
+    pub inferred: bool,
+    /// The agent's settings as its hooks last described them. Only Claude
+    /// Code's hooks carry these today.
+    #[serde(default)]
+    pub readout: AgentReadout,
+}
+
+/// What an agent says about how it is set up — what the message composer's
+/// toolbar shows. Each field is only ever what the agent reported; a field
+/// it has not reported stays `None` rather than being guessed at.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReadout {
+    /// The agent's own word for it: `default`, `acceptEdits`, `plan`,
+    /// `bypassPermissions`, …
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    /// The model id, as the agent's transcript records it.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The reasoning effort level (`low`, `medium`, `high`, …); empty when
+    /// the agent runs a model that takes none.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+impl AgentReadout {
+    /// Take what `newer` reports and keep the rest: one event rarely carries
+    /// every field, and a missing one says nothing about its value.
+    pub fn merge(&mut self, newer: &AgentReadout) {
+        fn take<T: Clone>(slot: &mut Option<T>, newer: &Option<T>) {
+            if newer.is_some() {
+                slot.clone_from(newer);
+            }
+        }
+        take(&mut self.permission_mode, &newer.permission_mode);
+        take(&mut self.model, &newer.model);
+        take(&mut self.effort, &newer.effort);
+    }
 }
 
 impl AgentStatus {
@@ -775,14 +1117,59 @@ impl AgentSessionState {
         AgentStatus::Idle
     }
 
+    /// Whether a turn is in flight: the only statuses a user interrupt or a
+    /// lost `Stop` can leave behind.
+    pub fn mid_turn(&self) -> bool {
+        matches!(self.status, AgentStatus::Working | AgentStatus::Waiting)
+    }
+
+    /// End the turn the user just interrupted.
+    ///
+    /// Most agents fire no hook when <kbd>Esc</kbd> or <kbd>Ctrl+C</kbd>
+    /// cancels a turn — Claude's `Stop` explicitly skips user interrupts — so
+    /// without this the pane stays on working until the next prompt, and a
+    /// close asks about a turn that is long over. The caller has already
+    /// waited for a real event to say otherwise.
+    pub fn assume_interrupted(&mut self) {
+        if !self.mid_turn() {
+            return;
+        }
+        self.turns = self.turns.wrapping_add(1);
+        self.status = AgentStatus::Done;
+        self.message = None;
+        self.inferred = true;
+    }
+
+    /// Give up on a turn that has gone silent for longer than any real one
+    /// stays quiet. Idle rather than Done: nothing says it finished, only
+    /// that nothing says it is still going.
+    pub fn assume_stale(&mut self) {
+        if self.status != AgentStatus::Working {
+            return;
+        }
+        self.status = AgentStatus::Idle;
+        self.message = None;
+        self.inferred = true;
+    }
+
     pub fn apply_event(&mut self, ev: &AgentEvent) {
+        // A status set before the first hook came from a desktop notification
+        // — Crush's "turn completed", say — which says the pane wants a look,
+        // not that a question is open. Taken for one, the first tool report
+        // turned it into a turn running, and nothing would ever end it.
+        if !self.rich && self.status == AgentStatus::Waiting {
+            self.status = AgentStatus::Idle;
+            self.message = None;
+        }
         self.rich = true;
+        let guessed = std::mem::take(&mut self.inferred);
         if let Some(id) = &ev.session_id {
             self.session_id = Some(id.clone());
         }
         if let Some(cwd) = &ev.cwd {
             self.cwd = Some(cwd.clone());
         }
+        self.readout.merge(&ev.readout);
         match ev.kind {
             AgentEventKind::SessionStart => {
                 self.status = AgentStatus::Idle;
@@ -804,7 +1191,7 @@ impl AgentSessionState {
             }
             AgentEventKind::ToolComplete => {
                 self.activity = self.activity.wrapping_add(1);
-                if self.status == AgentStatus::Waiting {
+                if self.status == AgentStatus::Waiting || guessed {
                     self.status = AgentStatus::Working;
                     self.message = None;
                 }
@@ -845,20 +1232,21 @@ pub struct AgentEvent {
     pub session_id: Option<String>,
     pub message: Option<String>,
     pub cwd: Option<std::path::PathBuf>,
-    /// What the user typed, on a `PromptSubmit` — already clamped to a label's
-    /// worth of text by the hook that sent it, since this rides an OSC payload
-    /// the tokenizer abandons rather than truncates past 8 KiB.
-    ///
-    /// Separate from `message`, which carries what the *agent* said and is
-    /// deliberately cleared when a turn starts.
-    pub prompt: Option<String>,
+    /// What started the session, on a session start that says: `startup`,
+    /// `resume`, `clear` (Codex's `/new`), `compact`.
+    pub source: Option<String>,
+    pub readout: AgentReadout,
 }
 
 pub fn parse_agent_event(payload: &[u8]) -> Option<AgentEvent> {
     let rest = payload.strip_prefix(b"777;notify;")?;
     let rest = rest.strip_prefix(AGENT_EVENT_SENTINEL.as_bytes())?;
-    let json = rest.strip_prefix(b";")?;
+    parse_agent_event_body(rest.strip_prefix(b";")?)
+}
 
+/// The JSON body of an agent event, without the OSC around it — what a hook
+/// hands the daemon over its socket.
+pub fn parse_agent_event_body(json: &[u8]) -> Option<AgentEvent> {
     #[derive(Deserialize)]
     struct Wire {
         #[serde(default)]
@@ -874,7 +1262,9 @@ pub fn parse_agent_event(payload: &[u8]) -> Option<AgentEvent> {
         #[serde(default)]
         cwd: Option<String>,
         #[serde(default)]
-        prompt: Option<String>,
+        source: Option<String>,
+        #[serde(flatten)]
+        readout: AgentReadout,
     }
 
     let w: Wire = serde_json::from_slice(json).ok()?;
@@ -886,13 +1276,78 @@ pub fn parse_agent_event(payload: &[u8]) -> Option<AgentEvent> {
         session_id: nonempty(w.session_id),
         message: nonempty(w.message),
         cwd: nonempty(w.cwd).map(std::path::PathBuf::from),
-        prompt: nonempty(w.prompt),
+        source: nonempty(w.source),
+        readout: w.readout,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A later event that leaves a field out keeps what an earlier one said.
+    #[test]
+    fn the_readout_keeps_what_later_events_leave_out() {
+        let mut state = AgentSessionState::default();
+        let event = |readout: AgentReadout| AgentEvent {
+            agent: Some(CLIAgent::Claude),
+            kind: AgentEventKind::ToolComplete,
+            session_id: None,
+            message: None,
+            cwd: None,
+            source: None,
+            readout,
+        };
+        state.apply_event(&event(AgentReadout {
+            permission_mode: Some("plan".into()),
+            model: Some("claude-opus-5-5".into()),
+            ..Default::default()
+        }));
+        state.apply_event(&event(AgentReadout {
+            effort: Some("high".into()),
+            ..Default::default()
+        }));
+        assert_eq!(state.readout.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(state.readout.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(state.readout.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn claude_starts_fresh_under_the_same_id_with_its_flags() {
+        const ID: &str = "0b5c3a5e-6d0e-4c1f-9a4b-2f7f1d9e8c11";
+        let launched = argv(&["claude", "--model", "opus", "--session-id", ID]);
+        assert_eq!(
+            CLIAgent::Claude
+                .start_command(ID, Some(&launched))
+                .as_deref(),
+            Some(format!("claude --model opus --session-id {ID}").as_str())
+        );
+        assert_eq!(CLIAgent::Claude.start_command("not-a-uuid", None), None);
+        assert_eq!(CLIAgent::Codex.start_command(ID, None), None);
+    }
+
+    #[test]
+    fn a_restore_falls_back_to_a_fresh_start_only_where_the_shell_has_or() {
+        const ID: &str = "0b5c3a5e-6d0e-4c1f-9a4b-2f7f1d9e8c11";
+        let launched = argv(&["claude", "--model", "opus"]);
+        let resume = CLIAgent::Claude
+            .resume_command(ID, Some(&launched))
+            .unwrap();
+        let restore = |shell| CLIAgent::Claude.restore_command(ID, Some(&launched), shell);
+        let chained = format!("{resume} || claude --model opus --session-id {ID}");
+        assert_eq!(restore(Some("/bin/zsh")).as_deref(), Some(chained.as_str()));
+        assert_eq!(restore(Some("pwsh.exe")).as_deref(), Some(chained.as_str()));
+        // Windows PowerShell 5.1 and nu reject the whole line over `||`, and a
+        // shell nobody could name might be either.
+        assert_eq!(restore(Some("powershell.exe")), Some(resume.clone()));
+        assert_eq!(restore(Some("nu")), Some(resume.clone()));
+        assert_eq!(restore(None), Some(resume));
+        // Agents with no way to name a new session keep the bare resume.
+        assert_eq!(
+            CLIAgent::Codex.restore_command(ID, None, Some("bash")),
+            CLIAgent::Codex.resume_command(ID, None)
+        );
+    }
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
@@ -973,6 +1428,35 @@ mod tests {
                 "on {launcher}"
             );
         }
+    }
+
+    /// The China build installs the same dispatcher-plus-CLI pair under `-cn`
+    /// names, so a bare `qoder` has to stay with the global one.
+    #[test]
+    fn qoder_cn_is_detected_through_either_of_its_binaries() {
+        for launcher in [
+            "qodercn",
+            "qoderclicn",
+            "qoder-cn",
+            "/c/Users/me/.qoder-cn/entry/qodercn.cmd",
+        ] {
+            assert_eq!(
+                CLIAgent::detect_from_argv(&argv(&[launcher])),
+                Some(CLIAgent::QoderCLICn),
+                "on {launcher}"
+            );
+        }
+        for other in ["qoder", "qodercli"] {
+            assert_eq!(
+                CLIAgent::detect_from_argv(&argv(&[other])),
+                Some(CLIAgent::QoderCLI),
+                "the global build keeps {other}"
+            );
+        }
+        assert_eq!(
+            CLIAgent::from_slug("qoderclicn"),
+            Some(CLIAgent::QoderCLICn)
+        );
     }
 
     /// All three of CodeBuddy's npm bins are node scripts pointing at one file,
@@ -1075,7 +1559,17 @@ mod tests {
             .collect();
         assert_eq!(
             fallback,
-            ["aider", "auggie", "hermes", "vibe", "antigravity"]
+            [
+                "aider",
+                "auggie",
+                "hermes",
+                "vibe",
+                "antigravity",
+                "empryo",
+                "prime-agent",
+                "muse",
+                "jcode"
+            ]
         );
         assert!(
             !fallback.contains(&"omp"),
@@ -1089,6 +1583,103 @@ mod tests {
                 a.display_name()
             );
         }
+    }
+
+    #[test]
+    fn muse_and_jcode_are_detected_and_resume() {
+        assert_eq!(
+            CLIAgent::detect_from_argv(&argv(&["muse", "--yolo"])),
+            Some(CLIAgent::Muse)
+        );
+        // The `muse` launcher execs a versioned binary.
+        assert_eq!(
+            CLIAgent::detect_from_argv(&argv(&[
+                "/home/me/.local/share/muse/muse-bin-1.4.2",
+                "--yolo"
+            ])),
+            Some(CLIAgent::Muse)
+        );
+        assert_eq!(
+            CLIAgent::detect_from_argv(&argv(&["/home/me/.jcode/builds/stable/jcode"])),
+            Some(CLIAgent::Jcode)
+        );
+        assert_eq!(CLIAgent::from_slug("muse"), Some(CLIAgent::Muse));
+        assert_eq!(CLIAgent::from_slug("jcode"), Some(CLIAgent::Jcode));
+        assert_eq!(
+            CLIAgent::Muse
+                .resume_command("s-1", Some(&argv(&["muse", "--yolo"])))
+                .as_deref(),
+            Some("muse --yolo resume s-1")
+        );
+        assert_eq!(
+            CLIAgent::Muse
+                .resume_command("s-1", Some(&argv(&["muse", "resume", "old", "--yolo"])))
+                .as_deref(),
+            Some("muse --yolo resume s-1")
+        );
+        assert_eq!(
+            CLIAgent::Muse
+                .resume_command("s-1", Some(&argv(&["muse", "resume", "--last", "--yolo"])))
+                .as_deref(),
+            Some("muse --yolo resume s-1")
+        );
+        assert_eq!(
+            CLIAgent::Jcode
+                .resume_command("s-1", Some(&argv(&["jcode", "--resume", "old"])))
+                .as_deref(),
+            Some("jcode --resume s-1")
+        );
+        assert_eq!(CLIAgent::Muse.fork_command("s-1", None), None);
+        assert_eq!(CLIAgent::Jcode.fork_command("s-1", None), None);
+    }
+
+    #[test]
+    fn empryo_and_prime_agent_are_detected_and_resume() {
+        assert_eq!(
+            CLIAgent::detect_from_argv(&argv(&[
+                "/home/me/.empryo/bin/empryo",
+                "--session",
+                "750adff9"
+            ])),
+            Some(CLIAgent::Empryo)
+        );
+        assert_eq!(
+            CLIAgent::detect_from_argv(&argv(&["prime-agent", "--model", "x"])),
+            Some(CLIAgent::PrimeAgent)
+        );
+        assert_eq!(CLIAgent::from_slug("empryo"), Some(CLIAgent::Empryo));
+        assert_eq!(
+            CLIAgent::from_slug("prime-agent"),
+            Some(CLIAgent::PrimeAgent)
+        );
+        assert_eq!(
+            CLIAgent::Empryo
+                .resume_command(
+                    "750adff9-f366",
+                    Some(&argv(&["empryo", "--session", "old"]))
+                )
+                .as_deref(),
+            Some("empryo --session 750adff9-f366")
+        );
+        assert_eq!(
+            CLIAgent::PrimeAgent
+                .resume_command(
+                    "s-1",
+                    Some(&argv(&["prime-agent", "-r", "old", "--model", "m"]))
+                )
+                .as_deref(),
+            Some("prime-agent --model m --resume s-1")
+        );
+        assert_eq!(
+            CLIAgent::PrimeAgent.fork_command("s-1", None).as_deref(),
+            Some("prime-agent --fork s-1")
+        );
+        assert_eq!(
+            CLIAgent::PrimeAgent
+                .resume_command("s-1", Some(&argv(&["prime-agent", "--no-session"]))),
+            None
+        );
+        assert_eq!(CLIAgent::Empryo.fork_command("s-1", None), None);
     }
 
     #[test]
@@ -1266,7 +1857,8 @@ mod tests {
             session_id: id.map(String::from),
             message: msg.map(String::from),
             cwd: None,
-            prompt: None,
+            source: None,
+            readout: Default::default(),
         };
 
         s.apply_event(&ev(AgentEventKind::SessionStart, None, Some("sid-1")));
@@ -1325,6 +1917,30 @@ mod tests {
         assert_eq!(s.session_id.as_deref(), Some("sid-1"));
     }
 
+    /// A desktop notification before any hook marks the pane waiting; the
+    /// first hook report must not read that as a question being answered.
+    #[test]
+    fn a_hook_after_a_notification_does_not_start_a_turn() {
+        let mut s = AgentSessionState {
+            status: AgentStatus::Waiting,
+            message: Some("Agent's turn completed".into()),
+            ..Default::default()
+        };
+        s.apply_event(&AgentEvent {
+            agent: Some(CLIAgent::Crush),
+            kind: AgentEventKind::ToolComplete,
+            session_id: Some("sid".into()),
+            message: None,
+            cwd: None,
+            source: None,
+            readout: Default::default(),
+        });
+        assert_eq!(s.status, AgentStatus::Idle);
+        assert_eq!(s.message, None);
+        assert!(s.rich);
+        assert_eq!(s.activity, 1);
+    }
+
     #[test]
     fn tool_completions_count_even_when_the_status_holds_still() {
         let ev = |kind| AgentEvent {
@@ -1333,7 +1949,8 @@ mod tests {
             session_id: None,
             message: None,
             cwd: None,
-            prompt: None,
+            source: None,
+            readout: Default::default(),
         };
 
         let mut s = AgentSessionState::default();
@@ -1360,6 +1977,97 @@ mod tests {
     }
 
     #[test]
+    fn an_assumed_interrupt_ends_the_turn_until_the_agent_says_otherwise() {
+        let ev = |kind| AgentEvent {
+            agent: Some(CLIAgent::Claude),
+            kind,
+            session_id: None,
+            message: None,
+            cwd: None,
+            source: None,
+            readout: Default::default(),
+        };
+
+        let mut s = AgentSessionState::default();
+        s.assume_interrupted();
+        assert_eq!(s.status, AgentStatus::Idle, "no turn, nothing to interrupt");
+        assert!(!s.inferred);
+
+        s.apply_event(&ev(AgentEventKind::PromptSubmit));
+        s.apply_event(&ev(AgentEventKind::PermissionRequest));
+        s.assume_interrupted();
+        assert_eq!(
+            s.status,
+            AgentStatus::Done,
+            "a rejected prompt ends the turn"
+        );
+        assert_eq!(s.turns, 1);
+        assert!(s.inferred);
+
+        s.apply_event(&ev(AgentEventKind::ToolComplete));
+        assert_eq!(
+            s.status,
+            AgentStatus::Working,
+            "a tool finishing after the key proves the turn was still going"
+        );
+        assert!(!s.inferred);
+
+        s.apply_event(&ev(AgentEventKind::Stop));
+        assert_eq!(s.turns, 2);
+        s.apply_event(&ev(AgentEventKind::ToolComplete));
+        assert_eq!(
+            s.status,
+            AgentStatus::Done,
+            "a real Stop is not a guess and stays put"
+        );
+
+        s.apply_event(&ev(AgentEventKind::PromptSubmit));
+        s.assume_interrupted();
+        s.apply_event(&ev(AgentEventKind::Notification));
+        assert!(!s.inferred, "any real event retires the guess");
+        s.apply_event(&ev(AgentEventKind::ToolComplete));
+        assert_eq!(s.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn a_stale_turn_goes_idle_and_comes_back_on_the_next_tool() {
+        let ev = |kind| AgentEvent {
+            agent: Some(CLIAgent::Claude),
+            kind,
+            session_id: None,
+            message: None,
+            cwd: None,
+            source: None,
+            readout: Default::default(),
+        };
+
+        let mut s = AgentSessionState::default();
+        s.apply_event(&ev(AgentEventKind::PromptSubmit));
+        s.apply_event(&ev(AgentEventKind::PermissionRequest));
+        s.assume_stale();
+        assert_eq!(
+            s.status,
+            AgentStatus::Waiting,
+            "a prompt nobody answered is not stale"
+        );
+
+        s.apply_event(&ev(AgentEventKind::ToolComplete));
+        s.assume_stale();
+        assert_eq!(s.status, AgentStatus::Idle);
+        assert_eq!(s.turns, 0, "going quiet is not finishing");
+        assert!(s.inferred);
+
+        s.apply_event(&ev(AgentEventKind::ToolComplete));
+        assert_eq!(s.status, AgentStatus::Working);
+    }
+
+    #[test]
+    fn a_session_state_from_an_older_daemon_is_not_inferred() {
+        let s: AgentSessionState = serde_json::from_str(r#"{"status":"done"}"#).unwrap();
+        assert!(!s.inferred);
+    }
+
+    #[test]
     fn each_finished_turn_is_counted_once() {
         let ev = |kind| AgentEvent {
             agent: Some(CLIAgent::Claude),
@@ -1367,7 +2075,8 @@ mod tests {
             session_id: None,
             message: None,
             cwd: None,
-            prompt: None,
+            source: None,
+            readout: Default::default(),
         };
 
         let mut s = AgentSessionState::default();
@@ -1399,7 +2108,8 @@ mod tests {
             session_id: None,
             message: None,
             cwd: cwd.map(PathBuf::from),
-            prompt: None,
+            source: None,
+            readout: Default::default(),
         };
 
         let mut s = AgentSessionState::default();
@@ -2040,7 +2750,13 @@ mod tests {
 
     #[test]
     fn fork_commands_are_shell_safe() {
-        for id in ["abc; rm -rf /", "$(boom)", "", "a b"] {
+        for id in [
+            "abc; rm -rf /",
+            "$(boom)",
+            "",
+            "a b",
+            "--dangerously-skip-permissions",
+        ] {
             assert_eq!(
                 CLIAgent::Codex.fork_command(id, None),
                 None,
@@ -2295,5 +3011,161 @@ mod tests {
             serde_json::to_string(&AgentStatus::Waiting).unwrap(),
             "\"waiting\""
         );
+    }
+
+    fn overrides(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_launch_is_the_bare_binary_unless_overridden() {
+        let none = HashMap::new();
+        assert_eq!(CLIAgent::Claude.launch_command(&none), "claude");
+        assert_eq!(CLIAgent::Codex.launch_command(&none), "codex");
+        assert_eq!(CLIAgent::Cursor.launch_command(&none), "cursor-agent");
+        assert_eq!(CLIAgent::Antigravity.launch_command(&none), "agy");
+        assert_eq!(CLIAgent::QoderCLI.launch_command(&none), "qoder");
+
+        let set = overrides(&[
+            ("claude", "  claude --dangerously-skip-permissions "),
+            // Keys are read the way `from_slug` reads them.
+            ("Codex", "codex --model o3"),
+            // A blank entry is no override at all.
+            ("gemini", "   "),
+        ]);
+        assert_eq!(
+            CLIAgent::Claude.launch_command(&set),
+            "claude --dangerously-skip-permissions"
+        );
+        assert_eq!(CLIAgent::Codex.launch_command(&set), "codex --model o3");
+        assert_eq!(CLIAgent::Gemini.launch_command(&set), "gemini");
+        assert_eq!(CLIAgent::Aider.launch_command(&set), "aider");
+    }
+
+    #[test]
+    fn every_agent_launches_as_a_name_it_is_detected_by() {
+        let none = HashMap::new();
+        for agent in CLIAgent::ALL {
+            let argv = command_argv(&agent.launch_command(&none));
+            assert_eq!(
+                CLIAgent::detect_from_argv(&argv),
+                Some(agent),
+                "{agent:?} would launch as something detection does not know"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrapper_named_by_a_launch_override_is_detected_as_its_agent() {
+        let aliases = launch_aliases(&overrides(&[("claude", "FOO=1 cc --fast")]));
+        // Run as a binary, and run as a script under its interpreter.
+        for run in [
+            argv(&["cc", "--fast"]),
+            argv(&["/Users/me/bin/cc", "--fast"]),
+            argv(&["/bin/bash", "/Users/me/bin/cc", "--fast"]),
+            argv(&["node", "/Users/me/bin/cc.js", "--fast"]),
+        ] {
+            assert_eq!(
+                CLIAgent::detect_from_argv_with(&run, &aliases),
+                Some(CLIAgent::Claude),
+                "{run:?}"
+            );
+        }
+        // Without the override the same wrapper is nobody.
+        assert_eq!(
+            CLIAgent::detect_from_argv_with(&argv(&["cc", "--fast"]), &HashMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_launch_override_never_maps_an_interpreter_or_a_real_agent_name() {
+        let aliases = launch_aliases(&overrides(&[
+            ("claude", "npx @anthropic-ai/claude-code"),
+            ("codex", "bash -lc codex"),
+            // Already detected as itself; mapping it would add nothing.
+            ("gemini", "gemini --yolo"),
+            ("not-an-agent", "cc"),
+        ]));
+        assert!(aliases.is_empty(), "{aliases:?}");
+        // A shell running something else is still nobody.
+        assert_eq!(
+            CLIAgent::detect_from_argv_with(
+                &argv(&["bash", "./build.sh"]),
+                &launch_aliases(&overrides(&[("claude", "cc")]))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn launch_args_drop_the_session_and_the_prompt_but_keep_the_flags() {
+        assert_eq!(
+            CLIAgent::Claude.launch_argv_for_default(&argv(&[
+                "node",
+                "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                "--model",
+                "opus",
+                "--resume",
+                "abc-123",
+                "--append-system-prompt",
+                "be terse",
+                "fix the bug",
+            ])),
+            Some(argv(&[
+                "claude",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "be terse",
+            ]))
+        );
+        assert_eq!(
+            CLIAgent::Codex.launch_argv_for_default(&argv(&[
+                "codex",
+                "resume",
+                "019a",
+                "--model=o3",
+                "prompt",
+            ])),
+            Some(argv(&["codex", "--model=o3"]))
+        );
+        // A wrapper cannot be taken apart; what was typed is what launched it.
+        assert_eq!(
+            CLIAgent::Claude.launch_argv_for_default(&argv(&["cc", "--fast", "x"])),
+            Some(argv(&["cc", "--fast", "x"]))
+        );
+        assert_eq!(CLIAgent::Claude.launch_argv_for_default(&[]), None);
+    }
+
+    #[test]
+    fn program_on_path_finds_only_executables() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("claude");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::write(dir.path().join("codex"), "not executable").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(!program_on_path("codex", dir.path().as_os_str()));
+        }
+        std::fs::create_dir(dir.path().join("gemini")).unwrap();
+        let path =
+            std::env::join_paths([std::path::Path::new("/nonexistent"), dir.path()]).unwrap();
+        assert!(program_on_path("claude", &path));
+        assert!(
+            !program_on_path("gemini", &path),
+            "a directory is not a program"
+        );
+        assert!(!program_on_path("aider", &path));
+        assert!(program_on_path(
+            bin.to_str().unwrap(),
+            std::ffi::OsStr::new("")
+        ));
+        assert!(!program_on_path("", &path));
     }
 }

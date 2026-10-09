@@ -26,6 +26,7 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
     let bytes: &'static [u8] = match path {
         "icons/terminal.svg" => include_bytes!("../../assets/icons/terminal.svg"),
         "icons/git-branch.svg" => include_bytes!("../../assets/icons/git-branch.svg"),
+        "icons/pin.svg" => include_bytes!("../../assets/icons/pin.svg"),
         // Deliberately not `refresh.svg`: the panel header already carries a
         // refresh tile, and the same glyph meaning two different things one row
         // apart reads as a bug.
@@ -33,6 +34,12 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         "icons/git-commit.svg" => include_bytes!("../../assets/icons/git-commit.svg"),
         "icons/panel-left.svg" => include_bytes!("../../assets/icons/panel-left.svg"),
         "icons/panel-right.svg" => include_bytes!("../../assets/icons/panel-right.svg"),
+        "icons/panel-left-collapsed.svg" => {
+            include_bytes!("../../assets/icons/panel-left-collapsed.svg")
+        }
+        "icons/panel-right-collapsed.svg" => {
+            include_bytes!("../../assets/icons/panel-right-collapsed.svg")
+        }
         "icons/plus.svg" => include_bytes!("../../assets/icons/plus.svg"),
         "icons/ellipsis.svg" => include_bytes!("../../assets/icons/ellipsis.svg"),
         "icons/folder-closed.svg" => include_bytes!("../../assets/icons/folder-closed.svg"),
@@ -40,13 +47,48 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         "icons/info.svg" => include_bytes!("../../assets/icons/info.svg"),
         "icons/eye.svg" => include_bytes!("../../assets/icons/eye.svg"),
         "icons/search.svg" => include_bytes!("../../assets/icons/search.svg"),
+        "icons/github.svg" => include_bytes!("../../assets/icons/github.svg"),
         "icons/copy.svg" => include_bytes!("../../assets/icons/copy.svg"),
         "icons/folder.svg" => include_bytes!("../../assets/icons/folder.svg"),
         "icons/file.svg" => include_bytes!("../../assets/icons/file.svg"),
+        "icons/image.svg" => include_bytes!("../../assets/icons/image.svg"),
         "icons/circle-info.svg" => include_bytes!("../../assets/icons/circle-info.svg"),
         "icons/machine-local.svg" => include_bytes!("../../assets/icons/machine-local.svg"),
         "icons/machine-remote.svg" => include_bytes!("../../assets/icons/machine-remote.svg"),
         "icons/refresh.svg" => include_bytes!("../../assets/icons/refresh.svg"),
+        "icons/power.svg" => include_bytes!("../../assets/icons/power.svg"),
+        "icons/list-tree.svg" => include_bytes!("../../assets/icons/list-tree.svg"),
+        "icons/list-flat.svg" => include_bytes!("../../assets/icons/list-flat.svg"),
+        "icons/settings/about.svg" => include_bytes!("../../assets/icons/settings/about.svg"),
+        "icons/settings/appearance.svg" => {
+            include_bytes!("../../assets/icons/settings/appearance.svg")
+        }
+        "icons/settings/back.svg" => include_bytes!("../../assets/icons/settings/back.svg"),
+        "icons/settings/check.svg" => include_bytes!("../../assets/icons/settings/check.svg"),
+        "icons/settings/chevron-down.svg" => {
+            include_bytes!("../../assets/icons/settings/chevron-down.svg")
+        }
+        "icons/settings/chevron-right.svg" => {
+            include_bytes!("../../assets/icons/settings/chevron-right.svg")
+        }
+        "icons/settings/close.svg" => include_bytes!("../../assets/icons/settings/close.svg"),
+        "icons/settings/mobile.svg" => include_bytes!("../../assets/icons/settings/mobile.svg"),
+        "icons/settings/general.svg" => include_bytes!("../../assets/icons/settings/general.svg"),
+        "icons/settings/integrations.svg" => {
+            include_bytes!("../../assets/icons/settings/integrations.svg")
+        }
+        "icons/settings/keyboard.svg" => include_bytes!("../../assets/icons/settings/keyboard.svg"),
+        "icons/settings/machine-local.svg" => {
+            include_bytes!("../../assets/icons/settings/machine-local.svg")
+        }
+        "icons/settings/machine-remote.svg" => {
+            include_bytes!("../../assets/icons/settings/machine-remote.svg")
+        }
+        "icons/settings/more.svg" => include_bytes!("../../assets/icons/settings/more.svg"),
+        "icons/settings/plus.svg" => include_bytes!("../../assets/icons/settings/plus.svg"),
+        "icons/settings/search.svg" => include_bytes!("../../assets/icons/settings/search.svg"),
+        "icons/settings/ssh.svg" => include_bytes!("../../assets/icons/settings/ssh.svg"),
+        "icons/settings/terminal.svg" => include_bytes!("../../assets/icons/settings/terminal.svg"),
         "icons/agents/claude.svg" => include_bytes!("../../assets/icons/agents/claude.svg"),
         "icons/agents/codex.svg" => include_bytes!("../../assets/icons/agents/codex.svg"),
         "icons/agents/traecli.svg" => include_bytes!("../../assets/icons/agents/traecli.svg"),
@@ -63,9 +105,38 @@ fn agent_icon(path: &str) -> Option<&'static [u8]> {
         "icons/agents/qwen.svg" => include_bytes!("../../assets/icons/agents/qwen.svg"),
         "icons/agents/kimi.svg" => include_bytes!("../../assets/icons/agents/kimi.svg"),
         "icons/agents/qodercli.svg" => include_bytes!("../../assets/icons/agents/qodercli.svg"),
+        // The China build ships the same mark.
+        "icons/agents/qoderclicn.svg" => {
+            include_bytes!("../../assets/icons/agents/qoderclicn.svg")
+        }
         "icons/agents/crush.svg" => include_bytes!("../../assets/icons/agents/crush.svg"),
         "icons/agents/codebuddy.svg" => {
             include_bytes!("../../assets/icons/agents/codebuddy.svg")
+        }
+        // The GitHub tab's state glyphs: one shape per state, not one colour.
+        "icons/github/issue-open.svg" => include_bytes!("../../assets/icons/github/issue-open.svg"),
+        "icons/github/issue-closed.svg" => {
+            include_bytes!("../../assets/icons/github/issue-closed.svg")
+        }
+        "icons/github/issue-not-planned.svg" => {
+            include_bytes!("../../assets/icons/github/issue-not-planned.svg")
+        }
+        "icons/github/pr-open.svg" => include_bytes!("../../assets/icons/github/pr-open.svg"),
+        "icons/github/pr-closed.svg" => include_bytes!("../../assets/icons/github/pr-closed.svg"),
+        "icons/github/pr-merged.svg" => include_bytes!("../../assets/icons/github/pr-merged.svg"),
+        "icons/github/pr-draft.svg" => include_bytes!("../../assets/icons/github/pr-draft.svg"),
+        // …and its checks': passed, failed, running, skipped.
+        "icons/github/check-passed.svg" => {
+            include_bytes!("../../assets/icons/github/check-passed.svg")
+        }
+        "icons/github/check-failed.svg" => {
+            include_bytes!("../../assets/icons/github/check-failed.svg")
+        }
+        "icons/github/check-pending.svg" => {
+            include_bytes!("../../assets/icons/github/check-pending.svg")
+        }
+        "icons/github/check-skipped.svg" => {
+            include_bytes!("../../assets/icons/github/check-skipped.svg")
         }
         _ => return None,
     };
@@ -114,6 +185,8 @@ mod tests {
             "icons/git-branch.svg",
             "icons/git-sync.svg",
             "icons/git-commit.svg",
+            "icons/list-tree.svg",
+            "icons/list-flat.svg",
         ] {
             assert!(
                 Assets.load(path).unwrap().is_some(),

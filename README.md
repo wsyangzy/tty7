@@ -32,7 +32,7 @@ A background server owns your shells and panes — not the window. Everything
 below follows from that.
 
 - **Performance** — ~2× the throughput of Alacritty, Ghostty, or Kitty ([benchmarks](#benchmarks))
-- **Persistent sessions** — quit or reboot; your shells and supported agent sessions keep running, no tmux
+- **Persistent sessions** — quit the app and your shells keep running; after a reboot, layout, screen, and supported agent conversations come back. No tmux
 - **Agent-aware** — Claude Code, Codex & co.: status, notifications, and git context for every repo at once
 - **Scriptable by agents** — one agent opens a pane for another, hands off a task, waits, and reads the result, with or without the GUI running
 - **Editor-grade input** — suggestions, completion, highlighting, history search, with no plugin to install
@@ -52,10 +52,11 @@ Native builds for macOS, Windows, and Linux on [**Releases**](https://github.com
 
 | | |
 |---|---|
-| **Agent-aware** | per-pane detection (23 CLIs) · status dot · notifications · branch + diff · tray icon when input is needed · resume after reboot · tab sidebar grouped by repository |
+| **Agent-aware** | per-pane detection (28 CLIs) · status dot · notifications · branch + diff · tray icon when input is needed · resume after reboot · reopen any past session from Search Everywhere · one-key launch · tab sidebar grouped by repository, with pinned groups |
 | **CLI + Skills** | bundled `tty7` CLI · [agent skill](skills/tty7/SKILL.md) · `run` streams a command and exits with its code · `split` · `send` · `wait --until free` · `capture` |
 | **Editor-grade input** | ghost suggestions from history · explained tab completion · syntax highlighting · multi-line editing · click places the caret · <kbd>⌃ R</kbd> fuzzy history |
-| **Window** | tabs & splits · <kbd>⌘ P</kbd> palette · <kbd>⌘ F</kbd> scrollback search · <kbd>⌘ J</kbd> panel with process tree and listening ports · 13 themes, your own YAML, iTerm2 import · IME |
+| **Window** | tabs & splits · <kbd>⌘ P</kbd> Search Everywhere · <kbd>⌘ F</kbd> scrollback search · hibernate a tab to free its memory · IME |
+| **Side panel** | <kbd>⌘ J</kbd> · process tree and listening ports · file tree · changes and diffs · find in files · GitHub issues and pull requests, read-only, signed in through `gh` |
 | **Shell integration** | injected when a pane starts, nothing to install · prompt marks · working directory · exit codes · command-finished notifications · zsh, bash, fish, PowerShell, WSL, remote panes |
 | **Remote workspaces** | remote files, repos, changes, diffs, worktrees, tabs, and panes · reconnect from any client and continue where you left off |
 | **SSH** | native russh stack: profiles with keychain secrets · SFTP panel · port forwarding · jump hosts · one-time, unprivileged `tty7-server` install |
@@ -66,42 +67,51 @@ Native builds for macOS, Windows, and Linux on [**Releases**](https://github.com
 **Status** takes one click under Settings → Integrations to install that agent's hook,
 and brings the status dot, notifications, the tray icon, `tty7 wait`, and resume
 after a reboot. **Fork** needs both — the agent's own fork command, and the hook
-that tells tty7 which session to fork.
+that tells tty7 which session to fork. **Past sessions** are read from the agent's
+own history files and listed in Search Everywhere, where <kbd>⏎</kbd> resumes one.
 
 <details>
-<summary>The full support matrix, all twenty-three</summary>
+<summary>The full support matrix, all twenty-eight</summary>
 
-| Agent | Detected | Status · resume | Fork |
-|---|:-:|:-:|:-:|
-| **Claude Code** | ✓ | ✓ | ✓ |
-| **Codex** | ✓ | ✓ | ✓ |
-| **TraeCode** | ✓ | ✓ | ✓ |
-| **Grok** | ✓ | ✓ | ✓ |
-| **OpenCode** | ✓ | ✓ | ✓ |
-| **Oh My Pi** | ✓ | ✓ | ✓ |
-| **Droid** | ✓ | ✓ | ✓ |
-| **Qwen Code** | ✓ | ✓ | ✓ |
-| **Goose** | ✓ | ✓ | ✓ |
-| **Qoder CLI** | ✓ | ✓ | ✓ |
-| **CodeBuddy** | ✓ | ✓ | ✓ |
-| **Gemini** | ✓ | ✓ | |
-| **Copilot** | ✓ | ✓ | |
-| **Kimi Code** | ✓ | ✓ | |
-| **Pi** | ✓ | ✓ | |
-| **Crush** | ✓ | ✓ | |
-| **Cursor** | ✓ | ✓ | |
-| Aider | ✓ | | |
-| Amp | ✓ | | |
-| Auggie | ✓ | | |
-| Hermes | ✓ | | |
-| Vibe | ✓ | | |
-| Antigravity | ✓ | | |
+| Agent | Detected | Status · resume | Fork | Past sessions |
+|---|:-:|:-:|:-:|:-:|
+| **Claude Code** | ✓ | ✓ | ✓ | ✓ |
+| **Codex** | ✓ | ✓ | ✓ | ✓ |
+| **TraeCode** | ✓ | ✓ | ✓ |  |
+| **Grok** | ✓ | ✓ | ✓ |  |
+| **OpenCode** | ✓ | ✓ | ✓ | ✓ |
+| **Oh My Pi** | ✓ | ✓ | ✓ | ✓ |
+| **Prime Agent** | ✓ | ✓ | ✓ |  |
+| **Droid** | ✓ | ✓ | ✓ | ✓ |
+| **Qwen Code** | ✓ | ✓ | ✓ | ✓ |
+| **Goose** | ✓ | ✓ | ✓ |  |
+| **Qoder CLI** | ✓ | ✓ | ✓ | ✓ |
+| **Qoder CN CLI** | ✓ | ✓ | ✓ | ✓ |
+| **CodeBuddy** | ✓ | ✓ | ✓ | ✓ |
+| **Gemini** | ✓ | ✓ | | ✓ |
+| **Copilot** | ✓ | ✓ | | ✓ |
+| **Kimi Code** | ✓ | ✓ | | ✓ |
+| **Pi** | ✓ | ✓ | | ✓ |
+| **Crush** | ✓ | ✓ | |  |
+| **Antigravity** | ✓ | ✓ | |  |
+| **Cursor** | ✓ | ✓ | | ✓ |
+| **Empryo** | ✓ | ✓ | |  |
+| **Muse Code** | ✓ | ✓ | |  |
+| **jcode** | ✓ | ✓ | |  |
+| Aider | ✓ | | |  |
+| Amp | ✓ | | |  |
+| Auggie | ✓ | | |  |
+| Hermes | ✓ | | |  |
+| Vibe | ✓ | | |  |
 
 </details>
 
 None of them are wrapped or proxied — the agent you start is the agent you get,
 in a normal PTY, with its own interface. An agent launched through a wrapper
 script can be mapped to one by name with `agent_commands` in `config.json`.
+Every agent on your `PATH` is also a row in Search Everywhere (**Agent: Claude Code**, …)
+that opens it in a new tab, and the New Tab menu names the ones you have actually
+run. `agent_launch` sets the command line it starts with.
 
 ## Documentation
 

@@ -14,8 +14,8 @@ the agent say which one it is.
 
 | Agent | |
 |---|---|
-| Claude Code · Codex · TraeCode · Copilot CLI · OpenCode · Pi · Grok Build · Oh My Pi · Gemini · Droid · Qwen Code · Goose · Kimi Code · Qoder CLI · Crush · CodeBuddy · Cursor CLI | Hooks available |
-| Aider · Amp · Auggie · Hermes · Vibe · Antigravity | Detected and labelled, but no status channel yet |
+| Claude Code · Codex · TraeCode · Copilot CLI · OpenCode · Pi · Grok Build · Oh My Pi · Gemini · Droid · Qwen Code · Goose · Kimi Code · Qoder CLI · Qoder CN CLI · Crush · CodeBuddy · Cursor CLI · Prime Agent · Antigravity · Empryo · Muse Code · jcode | Hooks available |
+| Aider · Amp · Auggie · Hermes · Vibe | Detected and labelled, but no status channel yet |
 
 Installing writes into that agent's own configuration directory. Once installed
 the row grows a second **Uninstall** button beside the first, which itself
@@ -26,6 +26,13 @@ ships a newer hook.
   Crush ships only a `PreToolUse` hook today. It is enough to remember the
   session for resume, but there is no turn boundary behind it, so a Crush pane
   carries no status dot and `tty7 wait` times out rather than returning.
+</Note>
+
+<Note>
+  Antigravity has no session-start or permission event, so its pane goes
+  straight from no dot to working on the first model call, and a pending
+  permission prompt shows as working rather than amber. Its hooks live in a
+  `tty7` set inside `~/.gemini/config/hooks.json`, beside any sets of your own.
 </Note>
 
 <Note>
@@ -66,13 +73,30 @@ The same three states are what `tty7 agents` reports as `working` / `waiting` /
 
 ## Notifications
 
-Two, both following your **Settings → General → Notifications** policy:
+Both follow **Settings → General → Agent notifications** (`notify_on_agent_event`),
+independently of command completion notifications:
 
 - **"needs your permission…"** the moment an agent blocks on you
 - **"finished after 42s"** at the end of a turn
 
 Which means that by default — *When unfocused* — you are told the instant you
 are the bottleneck, and left alone while you are watching.
+
+A pane is watched only when both the window and that particular pane are
+focused. Pending input or an unread alert is the small solid orange dot at the
+avatar's lower right. Completion keeps its separate green unread marker.
+A completion notice waits 1.5 seconds; if the next turn starts immediately,
+the pending notice is cancelled.
+
+A program can also post its own notification with OSC 9, OSC 777
+(`notify;title;body`) or kitty's OSC 99. tty7 shows it under the same policy,
+held back only while you are looking at that pane, and a click reveals the
+pane. Claude Code writes one when its **Notifications** setting (`/config`) is
+`ghostty`, `kitty` or `iterm2`. Its default, `auto`, sends nothing in tty7. A
+pane correlates nearby OSC, BEL, hook and process-completion events so copies
+of the same alert are shown once. Distinct permission questions remain separate.
+Notification bursts are limited per pane; retired connections cannot inject
+alerts into a reconnected pane.
 
 ## The tray icon
 
@@ -84,12 +108,12 @@ Its menu lists every agent pane with its brand avatar and status dot — click o
 to reveal it — and also holds the notification policy switch and **Quit and Stop
 Server…**.
 
-Turn it off with **Settings → Window & Tabs → Show tray icon**
+Turn it off with **Settings → General → Show tray icon**
 (`show_tray_icon: false`).
 
 ## Sending an agent some context
 
-Two command-palette entries hand what is in front of you to the agent running in
+Two Search Everywhere actions hand what is in front of you to the agent running in
 the pane, as a ready-made prompt:
 
 | Command | Sends |

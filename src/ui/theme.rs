@@ -11,14 +11,33 @@ use crate::terminal::view::{
     ClearScrollback, CopyText, CutText, FindInTerminal, FindNext, FindPrevious, PasteText,
     RedoEdit, SelectAll, UndoEdit,
 };
+use crate::ui::app::TITLE_BAR_HEIGHT;
 use crate::ui::i18n::{L10nKey, t};
 use crate::ui::presets;
 use crate::ui::presets::Fill;
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
 
+/// Where macOS puts the window's traffic lights over the tab strip: nine
+/// points in from the left edge, and centred on the row of chrome tiles they
+/// share the bar with.
+///
+/// `y` is the gap between the window's top edge and the *top* of the button
+/// frame, and macOS draws those buttons 14 points tall — so the lights' centre
+/// falls seven points below it. The tiles sit in the middle of the bar's
+/// content box instead, which is `TITLE_BAR_HEIGHT` less the hairline
+/// `TitleBar` draws along its bottom edge. Deriving the number from those two
+/// facts rather than writing it out is what keeps the lights on the tile line:
+/// the value the 40-point bar needed was rewritten by hand when the bar grew
+/// to 48, without the border in it, and left the lights half a point — one
+/// device pixel on a Retina panel — below everything beside them.
 pub(crate) fn traffic_light_position() -> Point<Pixels> {
-    point(px(9.), px(13.))
+    // AppKit's own button frame, and the border `TitleBar` adds to the bar it
+    // wraps. Neither moves with the bar's height.
+    const BUTTON_H: f32 = 14.;
+    const BAR_BORDER: f32 = 1.;
+
+    point(px(9.), px((TITLE_BAR_HEIGHT - BAR_BORDER - BUTTON_H) / 2.))
 }
 
 pub(crate) fn set_menus(cx: &mut App) {
@@ -84,7 +103,12 @@ pub(crate) fn set_menus(cx: &mut App) {
             MenuItem::action(t(L10nKey::AppMenuFindPrevious), FindPrevious),
         ]),
         Menu::new(t(L10nKey::AppMenuView)).items([
-            MenuItem::action(t(L10nKey::AppMenuCommandPalette), TogglePalette),
+            MenuItem::action(t(L10nKey::AppMenuSearchEverywhere), TogglePalette),
+            MenuItem::action(t(L10nKey::CmdGoToFile), QuickOpenFile),
+            MenuItem::action(t(L10nKey::EditorGoToSymbolAction), EditorGoToSymbol),
+            MenuItem::action(t(L10nKey::EditorNavigateBack), EditorNavigateBack),
+            MenuItem::action(t(L10nKey::EditorNavigateForward), EditorNavigateForward),
+            MenuItem::action(t(L10nKey::EditorSplitRight), EditorSplitRight),
             MenuItem::separator(),
             MenuItem::action(t(L10nKey::AppMenuIncreaseFontSize), IncreaseFontSize),
             MenuItem::action(t(L10nKey::AppMenuDecreaseFontSize), DecreaseFontSize),
@@ -466,7 +490,18 @@ pub(crate) fn default_window_opacity(backdrop: WindowBackdrop, blur: bool) -> f3
 /// `theme.sidebar` itself stays opaque — the settings theme picker paints
 /// with it on top of the opaque settings overlay and must stay legible.
 pub(crate) fn workspace_surface_color(cx: &App) -> Hsla {
-    let base: Hsla = cx.theme().sidebar;
+    translucent_surface(cx.theme().sidebar, cx)
+}
+
+/// The left tab rail's fill: the one tinted surface in the workspace (see
+/// `Neutrals::rail`), with the same translucency rule as
+/// [`workspace_surface_color`].
+pub(crate) fn rail_surface_color(cx: &App) -> Hsla {
+    let base: Hsla = rgb(cx.global::<presets::Surfaces>().rail.base).into();
+    translucent_surface(base, cx)
+}
+
+fn translucent_surface(base: Hsla, cx: &App) -> Hsla {
     let translucent = cx
         .try_global::<presets::ActiveBackground>()
         .and_then(|bg| bg.opacity)
@@ -936,10 +971,34 @@ pub(crate) fn floating_surface<T: Styled>(element: T, cx: &App) -> T {
         .shadow_xl()
 }
 
-/// On-state shares the accent role with sliders and primary actions.
-pub(crate) fn switch(id: impl Into<gpui::ElementId>, cx: &App) -> gpui_component::switch::Switch {
-    let accent = cx.global::<presets::ActiveAccent>().0;
-    gpui_component::switch::Switch::new(id).color(Hsla::from(rgb(accent)))
+/// One device pixel: the v4 hairline, 0.5px on a Retina panel and a whole
+/// pixel on a 1x one. A literal `px(0.5)` would be antialiased down to half
+/// its ink on a 1x display, under the contrast floor `divider` is held to.
+pub(crate) fn hairline(window: &Window) -> Pixels {
+    px(1. / window.scale_factor().max(1.))
+}
+
+/// Tabular figures, so a column of counts, sizes and positions keeps its
+/// digits on one grid while the numbers change under it.
+pub(crate) fn tabular_figures() -> gpui::FontFeatures {
+    gpui::FontFeatures(std::sync::Arc::new(vec![("tnum".to_string(), 1)]))
+}
+
+/// The v4 primary button: an inverted neutral — body ink as the fill, the
+/// surface it sits on as the label — rather than the accent, which stays with
+/// focus and the things that are on. `surface` is the opaque fill under the
+/// button, so the label reads as cut out of it. Disabled, gpui-component
+/// drops the fill to 15% of itself, the faint well the rest of v4 uses.
+pub(crate) fn inverted_button(
+    surface: Hsla,
+    cx: &App,
+) -> gpui_component::button::ButtonCustomVariant {
+    let ink = cx.theme().foreground;
+    gpui_component::button::ButtonCustomVariant::new(cx)
+        .color(ink)
+        .foreground(surface)
+        .hover(ink.blend(surface.opacity(0.14)))
+        .active(ink.blend(surface.opacity(0.24)))
 }
 
 pub(crate) fn apply_cursor_hide_mode(cx: &mut App) {
@@ -981,6 +1040,18 @@ fn sync_native_appearance(_dark: Option<bool>) {}
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+
+    /// The lights share a line with the chrome tiles they sit beside. gpui
+    /// hangs the top of the 14pt frame `y` below the window's top edge, so
+    /// their centre is seven points under that; the tiles are centred in the
+    /// bar's content box, its height less the hairline `TitleBar` draws along
+    /// the bottom. Sixteen and a half points today, out of the 48pt bar.
+    #[test]
+    fn the_traffic_lights_sit_on_the_chrome_rows_centre() {
+        let position = traffic_light_position();
+        assert_eq!(position.x, px(9.));
+        assert_eq!(position.y + px(7.), px((TITLE_BAR_HEIGHT - 1.) / 2.));
+    }
 
     #[gpui::test]
     fn effective_preset_follows_the_cached_system_appearance(cx: &mut TestAppContext) {
@@ -1234,4 +1305,14 @@ mod tests {
             &[WindowBackdrop::Auto, WindowBackdrop::Off]
         );
     }
+}
+
+/// The text view's style for rendered Markdown, wherever tty7 shows it.
+///
+/// Inline `code` gets a faint neutral fill. The text view's own default is the
+/// theme's `accent`, which tty7 also paints selection with, so every code span
+/// read as selected text.
+pub(crate) fn markdown_style(cx: &gpui::App) -> gpui_component::text::TextViewStyle {
+    gpui_component::text::TextViewStyle::default()
+        .inline_code_background(cx.theme().foreground.opacity(0.08))
 }

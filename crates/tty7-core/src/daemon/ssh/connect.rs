@@ -400,14 +400,37 @@ pub fn build_config(spec: &NativeSshSpec) -> Arc<russh::client::Config> {
         preferred: build_preferred(&spec.algorithms, &known),
         ..Default::default()
     };
-    if let Some(iv) = spec.keepalive_interval_s.filter(|v| *v > 0) {
-        cfg.keepalive_interval = Some(Duration::from_secs(u64::from(iv)));
-    }
-    if let Some(max) = spec.keepalive_count_max {
-        cfg.keepalive_max = max as usize;
-    }
+    let (interval, max) = keepalive(spec);
+    cfg.keepalive_interval = interval;
+    cfg.keepalive_max = max;
     Arc::new(cfg)
 }
+
+/// Keepalive on every connection, not just the ones whose profile asks.
+///
+/// Without one a connection whose peer stops answering is never noticed:
+/// nothing is sent on an idle link, so neither a stalled path nor a host that
+/// rebooted under it produces an error, and the socket stays established for
+/// hours while the link it carries reads "connected". A probe every
+/// [`DEFAULT_KEEPALIVE_INTERVAL`] that goes unanswered
+/// [`DEFAULT_KEEPALIVE_MAX`] times in a row ends the session, which drops the
+/// connection from the cache and lets the next open dial a fresh one.
+///
+/// A profile's own interval wins; `0` there means the user turned it off.
+fn keepalive(spec: &NativeSshSpec) -> (Option<Duration>, usize) {
+    let interval = match spec.keepalive_interval_s {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(u64::from(secs))),
+        None => Some(DEFAULT_KEEPALIVE_INTERVAL),
+    };
+    let max = spec
+        .keepalive_count_max
+        .map_or(DEFAULT_KEEPALIVE_MAX, |max| max as usize);
+    (interval, max)
+}
+
+const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const DEFAULT_KEEPALIVE_MAX: usize = 3;
 
 fn build_preferred(
     a: &SshAlgorithms,
@@ -500,6 +523,24 @@ fn same_key_type(a: &russh::keys::Algorithm, b: &russh::keys::Algorithm) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A profile that says nothing about keepalive still gets one: without
+    /// it a peer that stops answering is never noticed.
+    #[test]
+    fn every_connection_is_kept_alive_unless_the_profile_turns_it_off() {
+        let mut spec = super::super::test_support::base_spec();
+        assert_eq!(
+            keepalive(&spec),
+            (Some(DEFAULT_KEEPALIVE_INTERVAL), DEFAULT_KEEPALIVE_MAX)
+        );
+
+        spec.keepalive_interval_s = Some(60);
+        spec.keepalive_count_max = Some(5);
+        assert_eq!(keepalive(&spec), (Some(Duration::from_secs(60)), 5));
+
+        spec.keepalive_interval_s = Some(0);
+        assert_eq!(keepalive(&spec).0, None);
+    }
 
     #[test]
     fn proxy_command_substitutes_h_p_r_tokens() {
@@ -601,6 +642,142 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// What the zlib session test's server sends back for an `exec`: text that
+    /// inflates far past 2x its compressed size, then bytes that barely
+    /// compress at all — the two shapes russh's zlib once cut short.
+    fn zlib_payload() -> Vec<u8> {
+        let mut out = b"total 0\n".repeat(8 * 1024);
+        let mut x: u32 = 0x9e37_79b9;
+        out.extend((0..200 * 1024).map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        }));
+        out
+    }
+
+    struct ZlibSshd;
+
+    impl russh::server::Handler for ZlibSshd {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _user: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _command: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            for chunk in zlib_payload().chunks(16 * 1024) {
+                session.data(channel, chunk.to_vec())?;
+            }
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    struct TrustingClient;
+
+    impl russh::client::Handler for TrustingClient {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _key: &russh::keys::PublicKey,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// #997: a host imported with `Compression yes` negotiates zlib, and the
+    /// russh we pinned truncated every packet that inflated past 2x — the
+    /// stream desynced right after auth and the pane never printed a byte.
+    #[tokio::test]
+    async fn a_zlib_session_delivers_every_byte() {
+        use russh::keys::PrivateKey;
+        use russh::keys::ssh_key::private::Ed25519Keypair;
+
+        let zlib = SshAlgorithms {
+            compression: vec!["zlib@openssh.com".into()],
+            ..Default::default()
+        };
+        let preferred = build_preferred(&zlib, &[]);
+        assert_eq!(
+            preferred.compression.as_ref(),
+            &[russh::compression::ZLIB_LEGACY]
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("bound address");
+        let mut server_config = russh::server::Config::default();
+        server_config.inactivity_timeout = None;
+        server_config.preferred = preferred.clone();
+        server_config
+            .keys
+            .push(PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32])));
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept the test client");
+            let running = russh::server::run_stream(Arc::new(server_config), socket, ZlibSshd)
+                .await
+                .expect("server handshake");
+            let _ = running.await;
+        });
+
+        let received = tokio::time::timeout(Duration::from_secs(10), async {
+            let client_config = russh::client::Config {
+                preferred,
+                ..Default::default()
+            };
+            let mut handle = russh::client::connect(Arc::new(client_config), addr, TrustingClient)
+                .await
+                .expect("client handshake");
+            let auth = handle
+                .authenticate_none("tester")
+                .await
+                .expect("auth round trip");
+            assert!(auth.success());
+            let mut channel = handle
+                .channel_open_session()
+                .await
+                .expect("session open is confirmed");
+            channel.exec(true, "ls").await.expect("exec request");
+            let mut received = Vec::new();
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { data } => received.extend_from_slice(&data),
+                    russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            received
+        })
+        .await
+        .expect("a zlib session must not stall after auth");
+        server.abort();
+
+        let expected = zlib_payload();
+        assert_eq!(received.len(), expected.len());
+        assert!(received == expected, "the payload arrived corrupted");
     }
 }
 

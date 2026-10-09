@@ -11,6 +11,11 @@ description: "The diff overlay: side-by-side or unified, from the sidebar or the
 | Source Control | **Open Changes** on a file, or click the row |
 | History | Click a file inside a commit's detail view |
 
+**Settings → General → Allow clicks to open diff preview** (`sidebar_diff_preview`)
+controls count-click shortcuts in the sidebar and Info panel. It is independent
+of **Sidebar git display**, so hiding branches or counts does not change your
+saved click preference. Source Control and History keep their own file actions.
+
 A diff docks beside the terminal, in the same column an open file uses, so the
 pane you were reading stays on screen. <kbd>Esc</kbd> closes it, and its header
 right-clicks to a menu that fills the window with it if you prefer that —
@@ -22,7 +27,7 @@ right-clicks to a menu that fills the window with it if you prefer that —
 
 ## Side-by-side or unified
 
-**Toggle Unified / Side-by-Side Diff** in the command palette switches between
+**Toggle Unified / Side-by-Side Diff** in Search Everywhere switches between
 the two. The choice is global — one setting for every diff, the same call VS
 Code's `diffEditor.renderSideBySide` makes — and persists as `diff_view` in
 `config.json`.
@@ -42,14 +47,3 @@ Two limits keep a huge diff from becoming a huge wait:
 | Lines before auto-collapse | 400 per file | Big files start collapsed; expand the ones you care about |
 
 Both are stated in the overlay when they apply — nothing is dropped silently.
-
-## Turning the sidebar shortcut off
-
-Turn off **Settings → Window & Tabs → Sidebar git display → Allow clicks to open
-diff preview** (`sidebar_diff_preview: false`) to disable count clicks in both
-the sidebar and Info panel.
-
-The separate **Sidebar git display** setting (`sidebar_git_display`) chooses
-**Full** (`full`), **Only +N −N** (`counts`), or **Hidden** (`hidden`) for sidebar
-rows and group headers. Switching modes preserves the click preference. These
-settings do not disable opening diffs from Source Control or History.

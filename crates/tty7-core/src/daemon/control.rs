@@ -53,7 +53,15 @@ use super::protocol::{MAX_FRAME, read_frame, write_frame};
 /// half (#857) — would have stayed on this machine and never reached a remote
 /// one. A new filename is what gets them uploaded, at the price of one Update
 /// Server per host, which ends the sessions on it.
-pub const CONTROL_VERSION: u32 = 10;
+///
+/// v11 replaces the sidebar's hand-made groups. A tab now names a pinned group
+/// by id (`TabSetGroup` carries a `GroupId`, not a string), the groups
+/// themselves live on the workspace and move as `WorkspaceSetGroups` and
+/// `LayoutDelta::GroupsChanged`, and a v10 peer can decode none of that.
+///
+/// v12 adds `AgentSessions`: the search's Sessions tab in a remote workspace
+/// lists the coding-agent sessions of the machine the workspace is on.
+pub const CONTROL_VERSION: u32 = 12;
 
 const DIALECT_MARKER: &str = "speaks control v";
 
@@ -141,13 +149,33 @@ pub mod feature {
     /// simply unknown here: the pane lives in the peer's registry, and the
     /// local daemon this client would otherwise ask has never heard of it.
     pub const PANE_PROCS: &str = "pane-procs";
+    /// The peer can put a tab to sleep: mark it in the tree and stop its panes
+    /// while keeping their screens (#762). Needs both a tree and panes, so a
+    /// peer serving either alone does not say it.
+    pub const TAB_HIBERNATE: &str = "tab-hibernate";
+    /// The peer answers [`ControlRequest::SearchContent`] — find in files for
+    /// the right panel's Search tab. A peer without it has never heard of the
+    /// request, and sending it would take the link down, so a client asks for
+    /// the name first and tells the user the server needs updating instead.
+    pub const CONTENT_SEARCH: &str = "content-search";
+    /// The peer keeps each workspace's recently closed tabs in its tree and
+    /// answers [`ControlRequest::TabCloseRemembered`] and
+    /// [`ControlRequest::TabReopen`] (#1021). Like [`TAB_HIBERNATE`] it needs
+    /// a tree and panes both — the entry and the screens it restores from.
+    /// Without it a client closes and reopens tabs the way it always did, from
+    /// a list of its own that ends with the window.
+    pub const CLOSED_TABS: &str = "closed-tabs";
 }
 
-pub use crate::host::{Entry, MTime, Meta, Output, SearchHit};
+pub use crate::host::{
+    ContentLimits, ContentQuery, ContentResults, Entry, MTime, Meta, Output, SearchHit,
+};
 
 pub use crate::core::shells::{DetectedShell, ShellInventory};
 
-pub use crate::core::machine::{Axis, LayoutDelta, Machine, PaneSeed, Side, Tab, TabId};
+pub use crate::core::machine::{
+    Axis, LayoutDelta, Machine, PaneSeed, ReopenedTab, Side, Tab, TabId,
+};
 pub use crate::core::session::WorkspaceId;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -178,6 +206,12 @@ pub enum ControlRequest {
         limit: u64,
         max_dirs: u64,
         show_hidden: bool,
+    },
+    /// Find in files. Gated on [`feature::CONTENT_SEARCH`].
+    SearchContent {
+        roots: Vec<String>,
+        query: ContentQuery,
+        limits: ContentLimits,
     },
 
     WriteFile {
@@ -213,6 +247,12 @@ pub enum ControlRequest {
     },
 
     Shells,
+
+    /// Past coding-agent sessions on this machine. `known_dirs` are the
+    /// client's open directories there, which place Cursor's chats.
+    AgentSessions {
+        known_dirs: Vec<String>,
+    },
 
     WatchOpen {
         dirs: Vec<String>,
@@ -277,6 +317,27 @@ pub enum ControlRequest {
         workspace: WorkspaceId,
         tab: TabId,
     },
+    /// Close a tab into the workspace's recently-closed list rather than for
+    /// good: the peer stops its panes keeping their screens, so a later
+    /// [`Self::TabReopen`] — from any client, after any restart — can put it
+    /// back. `panes` is every pane the client held in the tab; any the tree
+    /// never recorded there are ended outright. Answers the panes stopped.
+    /// Gated on [`feature::CLOSED_TABS`].
+    TabCloseRemembered {
+        workspace: WorkspaceId,
+        tab: TabId,
+        #[serde(default)]
+        panes: Vec<u64>,
+    },
+    /// Take the named closed tab, or the most recently closed one, off the
+    /// workspace's list and answer it with its panes' records, for the client
+    /// to rebuild. Answers [`ReplyOk::ReopenedTab`]. Gated on
+    /// [`feature::CLOSED_TABS`].
+    TabReopen {
+        workspace: WorkspaceId,
+        #[serde(default)]
+        tab: Option<TabId>,
+    },
     TabRename {
         workspace: WorkspaceId,
         tab: TabId,
@@ -290,7 +351,25 @@ pub enum ControlRequest {
     TabSetGroup {
         workspace: WorkspaceId,
         tab: TabId,
-        group: Option<String>,
+        group: Option<crate::core::group_key::GroupId>,
+        /// The auto group the tab last resolved to — see `Tab::last_auto`.
+        #[serde(default)]
+        last_auto: Option<crate::core::group_key::AutoKey>,
+    },
+    /// The workspace's pinned sidebar groups and folds, replaced whole.
+    WorkspaceSetGroups {
+        workspace: WorkspaceId,
+        groups: crate::core::group_key::WorkspaceGroups,
+    },
+    /// Put a tab to sleep or mark it awake. Going to sleep, the peer also
+    /// stops every pane the tab holds, keeping each one's screen on disk for
+    /// the wake to restore; waking only clears the mark, because the panes a
+    /// wake brings up are spawned by the client like any restored pane.
+    /// Answers the tab's panes. Gated on [`feature::TAB_HIBERNATE`].
+    TabSetHibernated {
+        workspace: WorkspaceId,
+        tab: TabId,
+        hibernated: bool,
     },
     PaneSplit {
         workspace: WorkspaceId,
@@ -349,6 +428,52 @@ pub struct RouteInfo {
     pub connected: bool,
 }
 
+impl RouteInfo {
+    /// The host a link reaches: `build-box` in `me@build-box:22`. `None` for a
+    /// key of another shape.
+    pub fn host(&self) -> Option<&str> {
+        let first = self.key.split('|').next()?;
+        let after_user = first.split('@').nth(1)?;
+        after_user.split(':').next()
+    }
+
+    /// Rebuilds the target to route to this link over the local server, from
+    /// its key.
+    ///
+    /// Routing over a link the server already holds only needs the key's
+    /// `user@host:port` — the link is found by it and its credentials are
+    /// never used again — so an `auto` auth mode stands in for the profile's.
+    /// A jump/proxy chain would need the whole chain rebuilt, which the key
+    /// alone cannot do yet.
+    pub fn target(&self) -> Result<crate::daemon::router::RouteTarget, String> {
+        let unrecognized = || format!("unrecognized machine key '{}'", self.key);
+        if self.kind != "ssh" {
+            return Err(format!(
+                "machine '{}' is a {} link — tty7 can only route over ssh links yet",
+                self.key, self.kind
+            ));
+        }
+        if self.key.contains('|') {
+            return Err(format!(
+                "machine '{}' is reached through a jump/proxy chain, which cannot be rebuilt \
+                 from the link key yet — use the GUI for this machine",
+                self.key
+            ));
+        }
+        let (user, rest) = self.key.split_once('@').ok_or_else(unrecognized)?;
+        let (host, port) = rest.rsplit_once(':').ok_or_else(unrecognized)?;
+        let port: u16 = port.parse().map_err(|_| unrecognized())?;
+        let spec = serde_json::from_value(serde_json::json!({
+            "user": user,
+            "host": host,
+            "port": port,
+            "auth_mode": "auto",
+        }))
+        .map_err(|e| e.to_string())?;
+        Ok(crate::daemon::router::RouteTarget::Ssh(Box::new(spec)))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerStatus {
     pub pid: u32,
@@ -384,7 +509,10 @@ impl ControlRequest {
                 Duration::from_secs(10)
             }
             Git { .. } | GitStream { .. } | Search { .. } => Duration::from_secs(20),
-            Shells => Duration::from_secs(20),
+            // Past the host's own time budget (`ContentLimits::max_millis`),
+            // so a search that ran long still gets to say what it found.
+            SearchContent { .. } => Duration::from_secs(30),
+            Shells | AgentSessions { .. } => Duration::from_secs(20),
             WorkspaceAttach { .. } | WorkspaceDetach { .. } => Duration::from_secs(10),
             GuiOpen { .. } => Duration::from_secs(5),
             MachineGet
@@ -396,9 +524,13 @@ impl ControlRequest {
             | WorkspaceSetActiveTab { .. }
             | TabCreate { .. }
             | TabClose { .. }
+            | TabCloseRemembered { .. }
+            | TabReopen { .. }
             | TabRename { .. }
             | TabMove { .. }
             | TabSetGroup { .. }
+            | WorkspaceSetGroups { .. }
+            | TabSetHibernated { .. }
             | PaneSplit { .. }
             | PaneClose { .. }
             | PaneSetRatio { .. }
@@ -444,15 +576,24 @@ pub enum ReplyOk {
     Bool(bool),
     Path(String),
     OptPath(Option<String>),
-    FileMeta { meta: Meta },
+    FileMeta {
+        meta: Meta,
+    },
     Hits(Vec<SearchHit>),
+    ContentHits(ContentResults),
     Output(Output),
     WatchId(u64),
     Shells(ShellInventory),
-    Attached { took_over_from: Option<String> },
+    AgentSessions(Vec<crate::core::agent_history::PastSession>),
+    Attached {
+        took_over_from: Option<String>,
+    },
     MachineTree(Box<Machine>),
     WorkspaceTree(Box<crate::core::machine::Workspace>),
     TabTree(Box<Tab>),
+    /// The answer to [`ControlRequest::TabReopen`]; `None` when the workspace
+    /// has nothing left to reopen.
+    ReopenedTab(Option<Box<ReopenedTab>>),
     Panes(Vec<u64>),
     AgentStates(Vec<PaneAgentState>),
     PaneProcs(crate::daemon::protocol::PaneProcs),
@@ -1538,6 +1679,17 @@ mod tests {
                 max_dirs: 2000,
                 show_hidden: false,
             },
+            ControlRequest::SearchContent {
+                roots: vec!["/home/me/proj".into()],
+                query: ContentQuery {
+                    pattern: r"fn \w+".into(),
+                    case_sensitive: true,
+                    whole_word: false,
+                    regex: true,
+                    show_hidden: false,
+                },
+                limits: ContentLimits::default(),
+            },
             ControlRequest::WriteFile {
                 path: "/home/me/proj/src/main.rs".into(),
             },
@@ -1619,6 +1771,17 @@ mod tests {
                 is_dir: false,
                 ignored: false,
             }])),
+            ControlReply::Ok(ReplyOk::ContentHits(ContentResults {
+                hits: vec![crate::host::ContentHit {
+                    path: PathBuf::from("/home/me/proj/src/widget.rs"),
+                    line: 12,
+                    column: 5,
+                    text: "fn widget() {".into(),
+                    ranges: vec![crate::host::ContentRange { start: 3, end: 9 }],
+                }],
+                truncated: true,
+                files_searched: 40,
+            })),
             ControlReply::Ok(ReplyOk::Output(Output {
                 status: Some(1),
                 stdout: b"?? src/new.rs\n".to_vec(),
@@ -1638,6 +1801,8 @@ mod tests {
                     project_cwd: Some("/work/api".into()),
                     activity: 3,
                     turns: 1,
+                    inferred: false,
+                    readout: Default::default(),
                 },
             }])),
             ControlReply::Ok(ReplyOk::AgentStates(Vec::new())),
@@ -2300,6 +2465,14 @@ mod tests {
                     show_hidden: true,
                 },
                 s(20),
+            ),
+            (
+                R::SearchContent {
+                    roots: vec![],
+                    query: ContentQuery::default(),
+                    limits: ContentLimits::default(),
+                },
+                s(30),
             ),
             (
                 R::GuiOpen {
