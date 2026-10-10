@@ -1612,6 +1612,17 @@ pub(crate) fn key_chords(spec: &str) -> Vec<Vec<String>> {
     spec.split_whitespace().map(key_tokens).collect()
 }
 
+/// Inline shortcut text has no separate keycaps to distinguish modifiers.
+/// Preserve spaces between successive chords, and native macOS glyph order.
+pub(crate) fn key_text(spec: &str) -> String {
+    let separator = if cfg!(target_os = "macos") { "" } else { "+" };
+    key_chords(spec)
+        .iter()
+        .map(|chord| chord.join(separator))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// How to write the "secondary" modifier for this platform — ⌘ on macOS, Ctrl
 /// everywhere else. Anything spelling a shortcut out in the UI needs this
 /// rather than a literal ⌘.
@@ -2116,6 +2127,16 @@ mod tests {
             ]
         );
         assert_eq!(key_chords("secondary-t"), vec![vec![SECONDARY, "T"]]);
+    }
+
+    #[test]
+    fn inline_keys_distinguish_simultaneous_keys_from_successive_chords() {
+        assert_eq!(
+            key_text("secondary-shift-p"),
+            per_platform("⇧⌘P", "Ctrl+Shift+P")
+        );
+        assert_eq!(key_text("ctrl-b n"), per_platform("⌃B N", "Ctrl+B N"));
+        assert_eq!(key_text("secondary--"), per_platform("⌘−", "Ctrl+−"));
     }
 
     #[test]

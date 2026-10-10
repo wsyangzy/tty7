@@ -15,9 +15,10 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::core::actions::{
     CloseActiveTab, CloseOtherTabs, CloseTabsToTheRight, CopyAgentSessionId, CopyWorkingDirectory,
-    ForkAgentSession, HibernateTab, MarkTabUnread, NewWorktreeTab, RenameTab, SelectWorkspace1,
-    SelectWorkspace2, SelectWorkspace3, SelectWorkspace4, SelectWorkspace5, SelectWorkspace6,
-    SelectWorkspace7, SelectWorkspace8, SelectWorkspace9, SplitDown, SplitRight,
+    ForkAgentSession, HibernateTab, MarkTabUnread, NewWorktreeTab, OpenSettings, RenameTab,
+    SelectWorkspace1, SelectWorkspace2, SelectWorkspace3, SelectWorkspace4, SelectWorkspace5,
+    SelectWorkspace6, SelectWorkspace7, SelectWorkspace8, SelectWorkspace9, SplitDown, SplitRight,
+    TogglePalette,
 };
 use crate::core::cli_agent::CLIAgent;
 use crate::core::config::{Config, RightPanelTab};
@@ -748,15 +749,15 @@ pub(crate) const TAB_OUTER_PAD: f32 = 2.;
 /// A label's hover target reaches this far past its word.
 const TAB_INNER_PAD: f32 = 4.;
 
-/// The panel toggle and its trailing inset. The open panel uses this same
-/// reservation so the title bar never budgets for a second, absent control.
+/// The panel toggle, application menu and trailing inset. The open panel and
+/// the search field reserve the same width as the controls they draw.
 pub(crate) fn trailing_chrome_tiles_w() -> f32 {
     let trailing_pad = if cfg!(target_os = "macos") {
         tile_trailing_inset()
     } else {
         4.
     };
-    trailing_pad + crate::ui::app::TILE_SIZE
+    trailing_pad + 2. * crate::ui::app::TILE_SIZE + 2.
 }
 
 /// The whole trailing cluster: those tiles and the OS window buttons beyond
@@ -1499,8 +1500,44 @@ impl Tty7App {
             .into_any_element()
     }
 
+    fn app_menu_tile(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let action_ctx = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.pane.focused_or_first(window, cx))
+            .map(|leaf| leaf.read(cx).focus_handle.clone())
+            .unwrap_or_else(|| self.home_focus.clone());
+        div()
+            .occlude()
+            .flex_shrink_0()
+            .debug_selector(|| "titlebar-app-menu".into())
+            .child(
+                chrome_tile(
+                    Button::new("titlebar-app-menu").icon(Icon::empty().path("icons/ellipsis.svg")),
+                    false,
+                    cx,
+                )
+                .rounded_lg()
+                .accessible_label(t(L10nKey::TabTooltipMore))
+                .tooltip(t(L10nKey::TabTooltipMore))
+                .dropdown_menu_with_anchor(
+                    gpui::Anchor::TopRight,
+                    move |menu, _window, _cx| {
+                        menu.min_w(px(200.))
+                            .action_context(action_ctx.clone())
+                            .menu(t(L10nKey::AppMenuSearchEverywhere), Box::new(TogglePalette))
+                            .menu(t(L10nKey::AppMenuSettings), Box::new(OpenSettings))
+                    },
+                ),
+            )
+    }
+
     /// Persistent window controls, including when either sidebar is collapsed.
-    pub(crate) fn window_chrome(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    pub(crate) fn window_chrome(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let trailing = match cfg!(target_os = "macos") {
             true => tile_trailing_inset(),
             false => 4.,
@@ -1512,6 +1549,7 @@ impl Tty7App {
         h_flex()
             .flex_shrink_0()
             .items_center()
+            .gap(px(2.))
             .pr(px(trailing))
             .child(
                 div().occlude().flex_shrink_0().child(
@@ -1554,6 +1592,7 @@ impl Tty7App {
                     })),
                 ),
             )
+            .child(self.app_menu_tile(window, cx))
     }
 
     /// The right panel's tabs: words, the current one in body ink and medium
@@ -2750,7 +2789,7 @@ impl Tty7App {
         let right_chrome_shown = strip_chrome_shown || self.right_panel_open(cx);
         let right_chrome = strip_chrome.then(|| {
             crate::ui::app::resting_chrome(div().flex_shrink_0(), right_chrome_shown)
-                .child(self.window_chrome(cx))
+                .child(self.window_chrome(window, cx))
         });
 
         // With the tabs in the rail, the middle of the bar over the terminal
@@ -2780,7 +2819,7 @@ impl Tty7App {
             // The chord as text, not caps: a cap's fill is this box's own
             // grey, so on it a cap is only a gap between two letters.
             let chord = crate::ui::keymap::effective_key("TogglePalette", cx)
-                .map(|spec| crate::ui::keymap::key_tokens(&spec).join(""));
+                .map(|spec| crate::ui::keymap::key_text(&spec));
             // Two equal springs either side keep the box centred; each stops
             // at the band's `clear`, and past that it is the box that gives.
             let spring = || div().flex_1().min_w(px(band.clear));
@@ -2918,13 +2957,18 @@ fn avatar_disc(
     let base = div().id(id).flex_shrink_0().relative().size(px(size));
     // Fill, hairline and mark all live here, so the radius only ever clips
     // the disc's own paint.
-    let disc = || {
-        div()
+    let disc = || div().size(px(size)).rounded_full();
+    // Rasterize the padded SVG on the disc's full square. A separate 8.64px
+    // box is snapped independently by gpui and can move a 16px avatar's mark
+    // up and left. Scaling the texture afterwards also loses fine strokes.
+    // The disc's optional border must not change the mark's layout either.
+    let mark = |path: &'static str| {
+        gpui::svg()
+            .path(crate::ui::assets::avatar_icon_path(path))
+            .absolute()
+            .top_0()
+            .left_0()
             .size(px(size))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_full()
     };
     match agent {
         Some(agent) => {
@@ -2973,18 +3017,9 @@ fn avatar_disc(
                     // in any theme.
                     .when(crate::ui::presets::needs_edge(accent, surface), |d| {
                         d.border_1().border_color(cx.theme().border)
-                    })
-                    .child(
-                        gpui::svg()
-                            .path(agent.icon_path())
-                            .size(px(size * 0.54))
-                            // SVG assets render as a single-colour mask, so
-                            // the mark's colour comes from the agent rather
-                            // than from the file. The tray icon reads the
-                            // same answer.
-                            .text_color(gpui::rgb(agent.icon_rgb())),
-                    ),
+                    }),
             )
+            .child(mark(agent.icon_path()).text_color(gpui::rgb(agent.icon_rgb())))
             .when_some(dot, |b, dot| b.child(dot))
             .tooltip(move |window, cx| {
                 gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
@@ -2992,14 +3027,8 @@ fn avatar_disc(
             .into_any_element()
         }
         None => base
-            .child(
-                disc().bg(cx.theme().muted).child(
-                    gpui::svg()
-                        .path("icons/terminal.svg")
-                        .size(px(size * 0.56))
-                        .text_color(cx.theme().foreground.opacity(0.65)),
-                ),
-            )
+            .child(disc().bg(cx.theme().muted))
+            .child(mark("icons/terminal.svg").text_color(cx.theme().foreground.opacity(0.65)))
             .when_some(ssh, |b, rgb| {
                 b.child(Tty7App::status_dot(
                     rgb,

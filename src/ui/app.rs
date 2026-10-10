@@ -3946,8 +3946,8 @@ impl Tty7App {
         self.update_config(cx, |cfg| cfg.show_tray_icon = on);
     }
 
-    /// Saved only: gpui reads the preference this drives once per process, so
-    /// it takes hold at the next launch (see `apply_font_thicken` in main.rs).
+    /// Saved only: it is handed to gpui once, at launch, so it takes hold at
+    /// the next one (see `apply_font_thicken` in main.rs).
     pub(crate) fn set_font_thicken(&mut self, on: bool, cx: &mut Context<Self>) {
         self.update_config(cx, |cfg| cfg.font_thicken = on);
     }
@@ -6839,6 +6839,11 @@ impl Tty7App {
                     });
                 }
             }
+            CopyRaw => {
+                if let Some(leaf) = self.focused_leaf(window, cx) {
+                    leaf.update(cx, |view, cx| view.copy_raw(cx));
+                }
+            }
             CutText => {
                 if let Some(leaf) = self.focused_leaf(window, cx) {
                     leaf.update(cx, |view, cx| {
@@ -7178,6 +7183,9 @@ impl Tty7App {
             }
             L10nKey::SettingsTrimTrailingSpaces => {
                 self.set_clipboard_trim(defaults.clipboard_trim_trailing_spaces, cx)
+            }
+            L10nKey::SettingsCopyJoinWrapped => {
+                self.update_config(cx, |c| c.copy_join_wrapped = defaults.copy_join_wrapped)
             }
             L10nKey::SettingsCopyOnSelect => self.set_copy_on_select(defaults.copy_on_select, cx),
             L10nKey::SettingsSmartSelection => self.set_smart_select(defaults.smart_select, cx),
@@ -12648,6 +12656,29 @@ pub(crate) mod test_window {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+}
+
+#[cfg(test)]
+mod app_menu_tests {
+    use super::test_window::harness_with_tabs;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn restored_menu_opens_settings_from_an_active_terminal(cx: &mut TestAppContext) {
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 1);
+        app.update_in(&mut vcx, |app, window, cx| {
+            app.focus_active(window, cx);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        let menu = vcx
+            .debug_bounds("titlebar-app-menu")
+            .expect("application menu is visible");
+        vcx.simulate_click(menu.center(), Default::default());
+        vcx.simulate_keystrokes("down down enter");
+        vcx.run_until_parked();
+        assert!(app.read_with(&vcx, |app, _| app.settings.is_some()));
     }
 }
 

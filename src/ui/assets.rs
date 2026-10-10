@@ -5,9 +5,20 @@ use gpui::{AssetSource, Result, SharedString};
 pub struct Assets;
 
 const STOCK_PREFIX: &str = "stock/";
+const AVATAR_PREFIX: &str = "avatars/";
+
+pub(crate) fn avatar_icon_path(path: &str) -> SharedString {
+    format!("{AVATAR_PREFIX}{path}").into()
+}
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(icon_path) = path.strip_prefix(AVATAR_PREFIX) {
+            return self
+                .load(icon_path)?
+                .map(|bytes| avatar_svg(icon_path, &bytes))
+                .transpose();
+        }
         if let Some(downstream) = path.strip_prefix(STOCK_PREFIX) {
             return gpui_component_assets::Assets.load(downstream);
         }
@@ -20,6 +31,33 @@ impl AssetSource for Assets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         gpui_component_assets::Assets.list(path)
     }
+}
+
+fn avatar_svg(path: &str, bytes: &[u8]) -> Result<Cow<'static, [u8]>> {
+    let source = std::str::from_utf8(bytes)?;
+    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default())?;
+    let size = tree.size();
+    let fraction = if path == "icons/terminal.svg" {
+        0.56
+    } else {
+        0.54
+    };
+    let scale = 24. * fraction / size.width().max(size.height());
+    let x = (24. - size.width() * scale) / 2.;
+    let y = (24. - size.height() * scale) / 2.;
+    // Bundled marks have different intrinsic sizes and some carry an XML
+    // prolog, which cannot be nested inside the avatar's SVG. Keep their own
+    // viewport and artwork intact; only add padding on the disc's canvas.
+    let start = source
+        .find("<svg")
+        .ok_or_else(|| anyhow::anyhow!("avatar asset is not an SVG: {path}"))?;
+    let svg = &source[start..];
+    Ok(Cow::Owned(
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><g transform="translate({x} {y}) scale({scale})">{svg}</g></svg>"#
+        )
+        .into_bytes(),
+    ))
 }
 
 fn agent_icon(path: &str) -> Option<&'static [u8]> {
@@ -174,6 +212,85 @@ mod tests {
                 "{} points at {path}, which nothing serves",
                 agent.display_name()
             );
+        }
+    }
+
+    fn rasterized_avatar(path: &str, diameter: u32) -> resvg::tiny_skia::Pixmap {
+        let bytes = Assets.load(&avatar_icon_path(path)).unwrap().unwrap();
+        let tree = resvg::usvg::Tree::from_data(&bytes, &resvg::usvg::Options::default())
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
+        assert_eq!((tree.size().width(), tree.size().height()), (24., 24.));
+        let mut pixels = resvg::tiny_skia::Pixmap::new(diameter, diameter).unwrap();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(diameter as f32 / 24., diameter as f32 / 24.),
+            &mut pixels.as_mut(),
+        );
+        pixels
+    }
+
+    fn ink_bounds(pixels: &resvg::tiny_skia::Pixmap) -> [u32; 4] {
+        let mut bounds = [pixels.width(), pixels.height(), 0, 0];
+        for (index, pixel) in pixels.pixels().iter().enumerate() {
+            if pixel.alpha() == 0 {
+                continue;
+            }
+            let x = index as u32 % pixels.width();
+            let y = index as u32 / pixels.width();
+            bounds[0] = bounds[0].min(x);
+            bounds[1] = bounds[1].min(y);
+            bounds[2] = bounds[2].max(x + 1);
+            bounds[3] = bounds[3].max(y + 1);
+        }
+        bounds
+    }
+
+    #[test]
+    fn every_avatar_renders_inside_its_disc_at_common_display_scales() {
+        let icons = crate::core::cli_agent::CLIAgent::ALL
+            .into_iter()
+            .map(|agent| agent.icon_path())
+            .chain(["icons/terminal.svg"]);
+        for path in icons {
+            // Sidebar, strip and switcher sizes at 100%, 125%, 150% and 200%.
+            for diameter in [16, 18, 20, 24, 27, 30, 32, 36, 40, 48] {
+                let pixels = rasterized_avatar(path, diameter);
+                let [left, top, right, bottom] = ink_bounds(&pixels);
+                assert!(
+                    left < right && top < bottom,
+                    "{path} is empty at {diameter}px"
+                );
+                let inset = (diameter as f32 * 0.2).floor() as u32;
+                assert!(
+                    left >= inset
+                        && top >= inset
+                        && right <= diameter - inset
+                        && bottom <= diameter - inset,
+                    "{path} loses its disc padding at {diameter}px: {:?}",
+                    [left, top, right, bottom]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_and_codex_keep_balanced_pixel_padding() {
+        for agent in [
+            crate::core::cli_agent::CLIAgent::Claude,
+            crate::core::cli_agent::CLIAgent::Codex,
+        ] {
+            for diameter in [16, 18, 20, 24, 27, 30, 32, 36, 40, 48] {
+                let pixels = rasterized_avatar(agent.icon_path(), diameter);
+                let [left, top, right, bottom] = ink_bounds(&pixels);
+                // An odd number of physical pixels can leave one more on a
+                // side; the mark must not drift a whole pixel up or left.
+                assert!(
+                    left.abs_diff(diameter - right) <= 1 && top.abs_diff(diameter - bottom) <= 1,
+                    "{} is off-centre at {diameter}px: {:?}",
+                    agent.display_name(),
+                    [left, top, right, bottom]
+                );
+            }
         }
     }
 

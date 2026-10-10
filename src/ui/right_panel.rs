@@ -589,7 +589,7 @@ impl Tty7App {
                     // The toggle keeps its title-bar size and trailing inset
                     // when it moves into this row, so opening the panel does
                     // not shift the glyph or change its hover target.
-                    .child(self.window_chrome(cx))
+                    .child(self.window_chrome(window, cx))
                 }))
                 // Only the Files and Search tabs step down 8px. Their first row
                 // is a filled search well whose top edge is the first thing you

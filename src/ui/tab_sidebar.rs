@@ -58,6 +58,20 @@ const GROUP_GAP: f32 = 16.;
 /// A group heading's line.
 const HEADER_HEIGHT: f32 = 22.;
 
+const HEADER_ACTION_SIZE: f32 = 16.;
+const HEADER_ACTION_GAP: f32 = 2.;
+
+fn header_actions_width(key: Option<&GroupKey>) -> f32 {
+    match key {
+        None => 0.,
+        Some(GroupKey::Pinned(_))
+        | Some(GroupKey::Auto(AutoKey::SshHost(_) | AutoKey::SshDirectory(..))) => {
+            HEADER_ACTION_SIZE
+        }
+        Some(GroupKey::Auto(_)) => 2. * HEADER_ACTION_SIZE + HEADER_ACTION_GAP,
+    }
+}
+
 /// The group heading and the row's branch line: 11.5px at the default size.
 const META_REM: f32 = 11.5 / 16.;
 
@@ -1339,6 +1353,10 @@ impl Tty7App {
                 // row already elides its own.
                 let ts = window.text_system();
                 let mut avail = row_metrics::header_budget(width);
+                let actions_width = header_actions_width(group_key.as_ref());
+                if actions_width > 0. {
+                    avail -= actions_width + row_metrics::META_GAP;
+                }
                 if folded {
                     avail -= row_metrics::HEADER_ICON + row_metrics::META_GAP;
                 }
@@ -1350,7 +1368,20 @@ impl Tty7App {
                     avail -= measure_text(&ts, &meta_font, header_size, &count_label)
                         + row_metrics::META_GAP;
                 }
-                let avail = avail.max(HEADER_NAME_FLOOR);
+                let avail = avail.max(0.);
+                let counts = shared_git.as_ref().map_or(0., |shared| {
+                    counts_width(&ts, &font, header_size, &shared.status)
+                });
+                // Keep both numbers beside the buttons. At narrow widths a
+                // branch icon and an ellipsis would consume the space the
+                // counts need, so omit that optional branch fragment first.
+                let show_branch = show_branch
+                    && avail
+                        >= HEADER_NAME_FLOOR
+                            + counts
+                            + row_metrics::BRANCH_ICON
+                            + 4. * row_metrics::META_GAP
+                            + measure_text(&ts, &font, header_size, "…");
                 // What the shared branch would take if nothing were in its
                 // way: the branch itself, the `·` before its counts, the
                 // counts, and the gaps the spacer between the name and the
@@ -1368,12 +1399,22 @@ impl Tty7App {
                         counts + row_metrics::META_GAP
                     }
                 });
-                let name_avail = header_name_avail(avail, git_want);
+                let name_avail = header_name_avail(avail, git_want).min(
+                    (avail
+                        - counts
+                        - if counts > 0. {
+                            row_metrics::META_GAP
+                        } else {
+                            0.
+                        })
+                    .max(0.),
+                );
                 let label = elide_label(&ts, &header_font, header_size, &name, name_avail);
                 let name_w = measure_text(&ts, &header_font, header_size, &label);
                 let hover_group = SharedString::from(format!("sidebar-group-{group_ix}"));
                 let bar = h_flex()
                     .id(("sidebar-group", group_ix))
+                    .debug_selector(|| format!("sidebar-group-{group_ix}"))
                     .group(hover_group.clone())
                     .relative()
                     .w_full()
@@ -1550,6 +1591,7 @@ impl Tty7App {
                             });
                             let mut counts = h_flex()
                                 .id(("sidebar-group-diff", group_ix))
+                                .debug_selector(|| format!("sidebar-group-diff-{group_ix}"))
                                 .flex_shrink_0()
                                 .items_center()
                                 .gap_1p5()
@@ -1605,13 +1647,7 @@ impl Tty7App {
                     .when(folded, |bar| {
                         bar.child(div().flex_shrink_0().child(count_label))
                     })
-                    .children(self.header_actions(
-                        group_ix,
-                        group_key.clone(),
-                        hover_group,
-                        rail_fill,
-                        cx,
-                    ));
+                    .children(self.header_actions(group_ix, group_key.clone(), hover_group, cx));
                 // Renaming is offered on a menu rather than a double click:
                 // the first click of a double would fold the group, so the
                 // name would be edited on a box that just shut. An auto group
@@ -2105,9 +2141,8 @@ impl Tty7App {
     /// an auto group, and "+" to open a tab in the group. `None` for
     /// Ungrouped, which has neither.
     ///
-    /// Laid over the branch rather than beside it, the way a row's close
-    /// button covers its badge, so a header does not give up width it would
-    /// only use while the pointer is on it. Acted on at the press, as a row's
+    /// The buttons keep their own space while hidden so hovering never covers
+    /// the diff counts or moves the text. Acted on at the press, as a row's
     /// diff counts are: the header folds on click and picks itself up on a
     /// drag, and swallowing the press is what keeps both from happening too.
     fn header_actions(
@@ -2115,20 +2150,17 @@ impl Tty7App {
         group_ix: usize,
         key: Option<GroupKey>,
         hover: SharedString,
-        // The rail's own fill, so the buttons cover what they sit over
-        // without a patch of another grey around them.
-        backing: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let width = header_actions_width(key.as_ref());
         let key = key?;
-        let mut fade = backing;
-        fade.a = 0.;
         let muted = cx.theme().muted_foreground;
         let ink = cx.theme().foreground;
         let button = |id: &'static str, glyph: AnyElement, tip: L10nKey| {
             div()
                 .id((id, group_ix))
                 .flex_shrink_0()
+                .size(px(HEADER_ACTION_SIZE))
                 .p(px(2.))
                 .rounded_sm()
                 .cursor_pointer()
@@ -2139,7 +2171,7 @@ impl Tty7App {
                     gpui_component::tooltip::Tooltip::new(t(tip)).build(window, cx)
                 })
         };
-        let mut buttons = h_flex().gap_0p5().bg(backing);
+        let mut buttons = h_flex().gap(px(HEADER_ACTION_GAP));
         if let Some(auto) = key.auto().cloned() {
             buttons = buttons.child(
                 button(
@@ -2182,17 +2214,14 @@ impl Tty7App {
         }
         Some(
             h_flex()
-                .absolute()
-                .right(px(4.))
-                // Centred on the heading's line: 16px of buttons in `HEADER_HEIGHT`.
-                .top(px((HEADER_HEIGHT - 16.) / 2.))
+                .id(("sidebar-group-actions", group_ix))
+                .debug_selector(|| format!("sidebar-group-actions-{group_ix}"))
+                .flex_shrink_0()
+                .ml_auto()
+                .w(px(width))
+                .h(px(HEADER_ACTION_SIZE))
                 .opacity(0.)
                 .group_hover(hover, |s| s.opacity(1.))
-                .child(div().w(px(10.)).h(px(16.)).bg(linear_gradient(
-                    90.,
-                    linear_color_stop(fade, 0.),
-                    linear_color_stop(backing, 1.),
-                )))
                 .child(buttons)
                 .into_any_element(),
         )
@@ -3434,6 +3463,76 @@ mod fold_tests {
 
     fn repo(s: &str) -> Option<GroupKey> {
         Some(GroupKey::Auto(AutoKey::Repo(PathBuf::from(s))))
+    }
+
+    #[gpui::test]
+    fn header_buttons_never_cover_diff_counts_on_hover(cx: &mut TestAppContext) {
+        use crate::terminal::git_status::RepoSnapshot;
+        use crate::ui::host_ops::HostId;
+
+        let (app, mut vcx, _streams) = harness_with_tabs(cx, 1);
+        app.update(&mut vcx, |app, cx| {
+            plant_repo(app, 0, "/w/long-project-name", "/w/long-project-name", cx);
+            cx.update_global::<GitStatusCache, _>(|cache, _| {
+                cache.finish_probe(
+                    HostId::LOCAL,
+                    Path::new("/w/long-project-name"),
+                    Some(RepoSnapshot {
+                        root: PathBuf::from("/w/long-project-name"),
+                        home: PathBuf::from("/w/long-project-name"),
+                        branch: "feature/a-long-branch-with-changes".into(),
+                        counts: Some((12, 8)),
+                    }),
+                );
+            });
+            cx.notify();
+        });
+
+        for pinned in [false, true] {
+            if pinned {
+                app.update(&mut vcx, |app, cx| {
+                    app.pin_auto_group(AutoKey::Repo(PathBuf::from("/w/long-project-name")), cx)
+                });
+            }
+            for display in [SidebarGitDisplay::Full, SidebarGitDisplay::Counts] {
+                for width in [MIN_SIDEBAR_WIDTH, 240., 360.] {
+                    app.update(&mut vcx, |_, cx| {
+                        cx.update_global::<Config, _>(|config, _| {
+                            config.sidebar_width = width;
+                            config.sidebar_git_display = display;
+                        });
+                        cx.notify();
+                    });
+                    vcx.simulate_mouse_move(
+                        gpui::point(px(900.), px(700.)),
+                        None,
+                        Default::default(),
+                    );
+                    vcx.run_until_parked();
+                    let header = vcx
+                        .debug_bounds("sidebar-group-0")
+                        .expect("group header drawn");
+                    let counts = vcx
+                        .debug_bounds("sidebar-group-diff-0")
+                        .expect("both diff counts drawn");
+                    let actions = vcx
+                        .debug_bounds("sidebar-group-actions-0")
+                        .expect("group buttons laid out");
+                    assert!(
+                        counts.right() <= actions.left(),
+                        "counts {counts:?}, buttons {actions:?}"
+                    );
+                    assert!(
+                        actions.right() <= header.right(),
+                        "buttons stay inside the {width}px header"
+                    );
+                    vcx.simulate_mouse_move(header.center(), None, Default::default());
+                    vcx.run_until_parked();
+                    assert_eq!(vcx.debug_bounds("sidebar-group-diff-0"), Some(counts));
+                    assert_eq!(vcx.debug_bounds("sidebar-group-actions-0"), Some(actions));
+                }
+            }
+        }
     }
 
     /// Pin a label group called `name`, answering its id.
