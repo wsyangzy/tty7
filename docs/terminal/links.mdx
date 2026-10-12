@@ -21,6 +21,12 @@ opens in tty7's own editor, on the line the link named, and the Files panel
 selects it if it is open. A path to a directory opens the Files panel on it
 instead.
 
+Hold <kbd>⌘</kbd> (<kbd>Ctrl</kbd> on Windows and Linux) and right-click a
+file path for **Open**, **Open with Default App**, **Reveal in Folder**, and
+**Copy Path**. This also works inside coding agents and other applications
+that enable terminal mouse reporting; the click goes to tty7's menu.
+<kbd>Shift</kbd>-right-click also opens the menu inside those applications.
+
 Both absolute and relative paths are detected. A relative one is measured
 against the directory the pane is working in, and then against the repository
 around it — which is what makes a path a build tool printed from the workspace

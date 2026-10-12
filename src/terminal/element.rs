@@ -2099,22 +2099,25 @@ impl TerminalElement {
             let clicks = ev.click_count;
             view.update(cx, |v, cx| {
                 v.begin_link_click(button);
+                let link_modifier = mods.secondary() || v.link_modifier_down();
                 if button == MouseButton::Right {
                     // Before anything else: gpui-component builds the popup
                     // from a deferred callback, and by then the pointer is
                     // only a memory. Reading the grid now is what lets the
                     // menu name the file that was actually under the click.
-                    match should_show_context_menu(v.mouse_mode(), mods.shift) {
-                        true => v.record_menu_link(col, row, cx),
-                        false => v.forget_menu_link(),
+                    v.context_menu_allowed =
+                        should_show_context_menu(v.mouse_mode(), mods.shift, link_modifier);
+                    if v.context_menu_allowed {
+                        v.record_menu_link(col, row, cx);
+                        return;
                     }
+                    v.forget_menu_link();
                 }
-                let link_modifier = mods.secondary() || v.link_modifier_down();
                 if link_modifier
                     && button == MouseButton::Left
                     && (v.open_link_at(col, row, window, cx)
                         || v.defer_file_click(col, row, window, cx, move |v, cx| {
-                            if !should_show_context_menu(v.mouse_mode(), mods.shift) {
+                            if v.mouse_mode() && !mods.shift {
                                 v.mouse_press(MouseButton::Left, col, row, &mods);
                                 if !v.link_mouse_is_down() {
                                     v.mouse_release(MouseButton::Left, col, row, &mods);
@@ -2135,7 +2138,7 @@ impl TerminalElement {
                 // The mirror image of the context-menu gate in
                 // `TerminalView::render`: a click the application gets is never
                 // also a click tty7 acts on, and vice versa.
-                if !should_show_context_menu(v.mouse_mode(), mods.shift) {
+                if v.mouse_mode() && !mods.shift {
                     v.mouse_press(button, col, row, &mods);
                     return;
                 }
@@ -2177,6 +2180,9 @@ impl TerminalElement {
                 return;
             };
             view.update(cx, |v, cx| {
+                if button == MouseButton::Right && v.context_menu_allowed {
+                    return;
+                }
                 // Dragging is an immediate selection/application gesture. Stop
                 // waiting for an ambiguous file and give its mouse-down back.
                 v.resume_deferred_link_click(cx);
@@ -2205,6 +2211,11 @@ impl TerminalElement {
             let button = ev.button;
             view.update(cx, |v, cx| {
                 if button == MouseButton::Left && v.finish_link_mouse_up() {
+                    return;
+                }
+                // Keep the press's routing even if Ctrl/Shift was released
+                // before the button, so the TUI never sees an orphan release.
+                if button == MouseButton::Right && v.context_menu_allowed {
                     return;
                 }
                 if v.mouse_mode() && !mods.shift {

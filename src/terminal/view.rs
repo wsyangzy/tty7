@@ -8589,8 +8589,11 @@ impl Render for TerminalView {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, ev: &MouseDownEvent, _window, _cx| {
-                    this.context_menu_allowed =
-                        should_show_context_menu(this.mouse_mode(), ev.modifiers.shift);
+                    this.context_menu_allowed = should_show_context_menu(
+                        this.mouse_mode(),
+                        ev.modifiers.shift,
+                        ev.modifiers.secondary() || this.link_modifier_down(),
+                    );
                 }),
             )
             .drag_over::<ExternalPaths>(|s, _, _, cx| s.bg(cx.theme().drag_border.opacity(0.12)))
@@ -9037,16 +9040,15 @@ enum SelectEndCopy {
 /// A TUI that has turned mouse reporting on (vim with `set mouse=a`, lazygit,
 /// tmux, …) draws its own right-button menus, so popping the host menu on top
 /// of the application's is a double delivery of one click — #251. While
-/// reporting is active the unmodified click is the application's alone; Shift
-/// is the escape hatch that reaches tty7, matching how Shift already overrides
-/// mouse reporting for selection (`register_mouse_handlers`) and for the wheel
-/// (`wheel_route`).
+/// reporting is active the unmodified click is the application's alone. Shift
+/// or the link modifier (Cmd on macOS, Ctrl elsewhere) reaches tty7's menu,
+/// so a file can still offer its actions inside a mouse-reporting coding agent.
 ///
 /// This is the exact complement of the "forward the press to the app" branch in
 /// `TerminalElement::register_mouse_handlers`, which is why both call it: one
 /// click must never feed both consumers.
-pub(super) fn should_show_context_menu(mouse_mode: bool, shift: bool) -> bool {
-    !mouse_mode || shift
+pub(super) fn should_show_context_menu(mouse_mode: bool, shift: bool, link_modifier: bool) -> bool {
+    !mouse_mode || shift || link_modifier
 }
 
 fn select_end_copy(enabled: bool, grid: bool, editor: bool) -> SelectEndCopy {
@@ -10919,14 +10921,14 @@ mod tests {
 
     #[test]
     fn right_click_opens_the_host_menu_when_the_app_is_not_reporting_mouse() {
-        assert!(should_show_context_menu(false, false));
-        assert!(should_show_context_menu(false, true));
+        assert!(should_show_context_menu(false, false, false));
+        assert!(should_show_context_menu(false, true, false));
     }
 
     #[test]
     fn right_click_belongs_to_the_app_while_mouse_reporting_is_active() {
         assert!(
-            !should_show_context_menu(true, false),
+            !should_show_context_menu(true, false, false),
             "an unmodified right-click in mouse mode is the application's event, \
              so tty7 must not also pop its own menu over it"
         );
@@ -10935,7 +10937,7 @@ mod tests {
     #[test]
     fn shift_right_click_stays_the_escape_hatch_in_mouse_mode() {
         assert!(
-            should_show_context_menu(true, true),
+            should_show_context_menu(true, true, false),
             "Shift is the documented way to reach tty7's own menu inside a \
              mouse-reporting TUI"
         );
@@ -10945,15 +10947,17 @@ mod tests {
     fn context_menu_and_mouse_report_never_fire_for_the_same_click() {
         // The render-time menu gate and the mouse-down forwarder in
         // `TerminalElement` read the same predicate from opposite sides, so
-        // every (mouse_mode, shift) pair must land in exactly one of them.
+        // every modifier combination must land in exactly one of them.
         for mouse_mode in [false, true] {
             for shift in [false, true] {
-                let menu = should_show_context_menu(mouse_mode, shift);
-                let reported = mouse_mode && !shift;
-                assert_ne!(
-                    menu, reported,
-                    "mouse_mode={mouse_mode} shift={shift} must route to exactly one consumer"
-                );
+                for link_modifier in [false, true] {
+                    let menu = should_show_context_menu(mouse_mode, shift, link_modifier);
+                    let reported = mouse_mode && !shift && !link_modifier;
+                    assert_ne!(
+                        menu, reported,
+                        "mouse_mode={mouse_mode} shift={shift} link_modifier={link_modifier} must route to exactly one consumer"
+                    );
+                }
             }
         }
     }
@@ -13532,6 +13536,95 @@ mod gpui_tests {
         settle_link_entity_opens(&pane, cx);
         assert_eq!(returned.get(), 1);
         assert_eq!(opened.get(), 0);
+    }
+
+    #[gpui::test]
+    fn link_modifier_right_click_captures_the_file_without_reporting_mouse(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::{MouseMoveEvent, MouseUpEvent, PlatformInput};
+
+        // Exercise the grid's real event handlers without the popup wrapper,
+        // whose retained menu subscription forms a handle cycle in GPUI tests.
+        struct MouseGrid(Entity<TerminalView>);
+        impl Render for MouseGrid {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .child(TerminalElement::new(self.0.clone()))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "file menu target").unwrap();
+        let (window, pane, mut daemon) = rooted_harness(cx);
+        window
+            .update(cx, |_, window, cx| {
+                pane.update(cx, |view, cx| {
+                    view.terminal.seed_cwd(Some(dir.path().to_path_buf()));
+                    let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+                    parser.advance(
+                        &mut *view.terminal.term.lock(),
+                        b"\x1b[?1002h\x1b[?1006hnotes.md",
+                    );
+                    assert!(view.mouse_mode());
+                    view.focus_handle.focus(window, cx);
+                    cx.notify();
+                });
+            })
+            .unwrap();
+
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.update(|window, cx| {
+            window.replace_root(cx, |_, _| MouseGrid(pane.clone()));
+        });
+        vcx.run_until_parked();
+        let at = pane.read_with(&vcx, |view, _| {
+            let geom = view.cell_geom.expect("terminal grid laid out");
+            geom.origin + point(geom.cell_width * 0.5, geom.line_height * 0.5)
+        });
+        vcx.simulate_mouse_move(at, None, Modifiers::secondary_key());
+        vcx.update(|window, cx| {
+            window.dispatch_event(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Right,
+                    position: at,
+                    modifiers: Modifiers::secondary_key(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            // Release the modifier first: neither the drag nor the release
+            // belongs to the TUI once the press selected the host menu.
+            window.dispatch_event(
+                PlatformInput::MouseMove(MouseMoveEvent {
+                    position: at,
+                    pressed_button: Some(MouseButton::Right),
+                    modifiers: Modifiers::none(),
+                }),
+                cx,
+            );
+            window.dispatch_event(
+                PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Right,
+                    position: at,
+                    modifiers: Modifiers::none(),
+                    click_count: 1,
+                }),
+                cx,
+            );
+        });
+        vcx.run_until_parked();
+        vcx.update(|_, cx| {
+            let view = pane.read(cx);
+            assert!(view.context_menu_allowed);
+            assert_eq!(
+                view.menu_link_path().and_then(|p| p.file_name()),
+                Some("notes.md".as_ref())
+            );
+        });
+        assert_eq!(next_input_until_timeout(&mut daemon), None);
     }
 
     #[gpui::test]

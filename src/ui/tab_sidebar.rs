@@ -58,20 +58,6 @@ const GROUP_GAP: f32 = 16.;
 /// A group heading's line.
 const HEADER_HEIGHT: f32 = 22.;
 
-const HEADER_ACTION_SIZE: f32 = 16.;
-const HEADER_ACTION_GAP: f32 = 2.;
-
-fn header_actions_width(key: Option<&GroupKey>) -> f32 {
-    match key {
-        None => 0.,
-        Some(GroupKey::Pinned(_))
-        | Some(GroupKey::Auto(AutoKey::SshHost(_) | AutoKey::SshDirectory(..))) => {
-            HEADER_ACTION_SIZE
-        }
-        Some(GroupKey::Auto(_)) => 2. * HEADER_ACTION_SIZE + HEADER_ACTION_GAP,
-    }
-}
-
 /// The group heading and the row's branch line: 11.5px at the default size.
 const META_REM: f32 = 11.5 / 16.;
 
@@ -114,7 +100,7 @@ mod row_metrics {
     /// `gap_1p5`, between a branch and the counts after it.
     pub(super) const META_GAP: f32 = 6.;
     pub(super) const BRANCH_ICON: f32 = 11.;
-    /// `px_2` on a group header.
+    /// Explicit horizontal padding on a group header.
     pub(super) const HEADER_PAD: f32 = 8. + 8.;
     /// The chevron a header opens with, and the pin that marks a folder
     /// group: both `xsmall` icons, which resolve to 12px.
@@ -416,11 +402,9 @@ impl Tty7App {
             weight: FontWeight::MEDIUM,
             ..meta_font.clone()
         };
-        // On the rail the diff counts are metadata like the branch beside
-        // them, so they take its caption ink; the hover card, which is where
-        // someone goes to read them, keeps the resting green and red.
+        // Keep added and removed counts distinct on both the rail and its
+        // hover cards, using semantic colours adjusted for the rail's fill.
         let rail_fill: gpui::Hsla = gpui::rgb(sf.base).into();
-        let count_ink = cx.theme().muted_foreground;
         let added_ink = crate::ui::presets::resting_ink(
             cx.theme().success,
             cx.theme().muted_foreground,
@@ -819,11 +803,13 @@ impl Tty7App {
                             });
                         if g.added > 0 {
                             counts = counts
-                                .child(div().text_color(count_ink).child(format!("+{}", g.added)));
+                                .child(div().text_color(added_ink).child(format!("+{}", g.added)));
                         }
                         if g.removed > 0 {
                             counts = counts.child(
-                                div().text_color(count_ink).child(format!("−{}", g.removed)),
+                                div()
+                                    .text_color(removed_ink)
+                                    .child(format!("−{}", g.removed)),
                             );
                         }
                         line = line.child(counts);
@@ -1353,10 +1339,6 @@ impl Tty7App {
                 // row already elides its own.
                 let ts = window.text_system();
                 let mut avail = row_metrics::header_budget(width);
-                let actions_width = header_actions_width(group_key.as_ref());
-                if actions_width > 0. {
-                    avail -= actions_width + row_metrics::META_GAP;
-                }
                 if folded {
                     avail -= row_metrics::HEADER_ICON + row_metrics::META_GAP;
                 }
@@ -1370,18 +1352,17 @@ impl Tty7App {
                 }
                 let avail = avail.max(0.);
                 let counts = shared_git.as_ref().map_or(0., |shared| {
-                    counts_width(&ts, &font, header_size, &shared.status)
+                    counts_width(&ts, &meta_font, header_size, &shared.status)
                 });
-                // Keep both numbers beside the buttons. At narrow widths a
-                // branch icon and an ellipsis would consume the space the
-                // counts need, so omit that optional branch fragment first.
+                // At narrow widths a branch icon and an ellipsis would consume
+                // the space the counts need, so omit that optional fragment first.
                 let show_branch = show_branch
                     && avail
                         >= HEADER_NAME_FLOOR
                             + counts
                             + row_metrics::BRANCH_ICON
                             + 4. * row_metrics::META_GAP
-                            + measure_text(&ts, &font, header_size, "…");
+                            + measure_text(&ts, &meta_font, header_size, "…");
                 // What the shared branch would take if nothing were in its
                 // way: the branch itself, the `·` before its counts, the
                 // counts, and the gaps the spacer between the name and the
@@ -1389,11 +1370,11 @@ impl Tty7App {
                 // Drawn as a bare `·` with a gap on either side; the gap before
                 // it is the one `counts_width` already reserves.
                 let git_want = shared_git.as_ref().map(|shared| {
-                    let counts = counts_width(&ts, &font, header_size, &shared.status);
+                    let counts = counts_width(&ts, &meta_font, header_size, &shared.status);
                     if show_branch {
                         row_metrics::BRANCH_ICON
                             + 3. * row_metrics::META_GAP
-                            + measure_text(&ts, &font, header_size, &shared.status.branch)
+                            + measure_text(&ts, &meta_font, header_size, &shared.status.branch)
                             + counts
                     } else {
                         counts + row_metrics::META_GAP
@@ -1411,16 +1392,26 @@ impl Tty7App {
                 );
                 let label = elide_label(&ts, &header_font, header_size, &name, name_avail);
                 let name_w = measure_text(&ts, &header_font, header_size, &label);
-                let hover_group = SharedString::from(format!("sidebar-group-{group_ix}"));
+                // The measured name can keep more than its floor. Only draw
+                // a branch if its icon, separator and ellipsis still fit beside
+                // that name and the counts; an ellipsis cannot shrink to zero.
+                let separator_w = measure_text(&ts, &meta_font, header_size, META_SEP_TRIMMED);
+                let show_branch = show_branch
+                    && avail
+                        >= name_w
+                            + counts
+                            + row_metrics::BRANCH_ICON
+                            + 4. * row_metrics::META_GAP
+                            + separator_w
+                            + measure_text(&ts, &meta_font, header_size, "…");
                 let bar = h_flex()
                     .id(("sidebar-group", group_ix))
                     .debug_selector(|| format!("sidebar-group-{group_ix}"))
-                    .group(hover_group.clone())
                     .relative()
                     .w_full()
                     .items_center()
-                    .gap_1p5()
-                    .px_2()
+                    .gap(px(row_metrics::META_GAP))
+                    .px(px(row_metrics::HEADER_PAD / 2.))
                     // The air above a heading is the list's `GROUP_GAP`;
                     // the heading itself is one short caption line.
                     .h(px(HEADER_HEIGHT))
@@ -1555,18 +1546,19 @@ impl Tty7App {
                             .flex_shrink(1.)
                             .min_w_0()
                             .items_center()
-                            .gap_1p5()
+                            .gap(px(row_metrics::META_GAP))
                             .when(show_branch, |line| {
                                 let branch_avail = (avail
                                     - name_w
                                     - row_metrics::BRANCH_ICON
-                                    - 3. * row_metrics::META_GAP
-                                    - counts_width(&ts, &font, header_size, &status))
+                                    - 4. * row_metrics::META_GAP
+                                    - separator_w
+                                    - counts_width(&ts, &meta_font, header_size, &status))
                                 .max(0.);
                                 // Keep both ends, as on a row.
                                 let branch = elide_keep_edges(
                                     &ts,
-                                    &font,
+                                    &meta_font,
                                     header_size,
                                     &status.branch,
                                     branch_avail,
@@ -1594,7 +1586,7 @@ impl Tty7App {
                                 .debug_selector(|| format!("sidebar-group-diff-{group_ix}"))
                                 .flex_shrink_0()
                                 .items_center()
-                                .gap_1p5()
+                                .gap(px(row_metrics::META_GAP))
                                 .when_some(click, |counts, (host, cwd)| {
                                     counts
                                         .cursor_pointer()
@@ -1627,14 +1619,14 @@ impl Tty7App {
                             if status.added > 0 {
                                 counts = counts.child(
                                     div()
-                                        .text_color(count_ink)
+                                        .text_color(added_ink)
                                         .child(format!("+{}", status.added)),
                                 );
                             }
                             if status.removed > 0 {
                                 counts = counts.child(
                                     div()
-                                        .text_color(count_ink)
+                                        .text_color(removed_ink)
                                         .child(format!("−{}", status.removed)),
                                 );
                             }
@@ -1646,8 +1638,7 @@ impl Tty7App {
                     // is what a shut group has instead of them.
                     .when(folded, |bar| {
                         bar.child(div().flex_shrink_0().child(count_label))
-                    })
-                    .children(self.header_actions(group_ix, group_key.clone(), hover_group, cx));
+                    });
                 // Renaming is offered on a menu rather than a double click:
                 // the first click of a double would fold the group, so the
                 // name would be edited on a box that just shut. An auto group
@@ -2135,96 +2126,6 @@ impl Tty7App {
             )
             .child(body)
             .into_any_element()
-    }
-
-    /// The buttons a header shows on hover, laid over its right end: pin for
-    /// an auto group, and "+" to open a tab in the group. `None` for
-    /// Ungrouped, which has neither.
-    ///
-    /// The buttons keep their own space while hidden so hovering never covers
-    /// the diff counts or moves the text. Acted on at the press, as a row's
-    /// diff counts are: the header folds on click and picks itself up on a
-    /// drag, and swallowing the press is what keeps both from happening too.
-    fn header_actions(
-        &self,
-        group_ix: usize,
-        key: Option<GroupKey>,
-        hover: SharedString,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let width = header_actions_width(key.as_ref());
-        let key = key?;
-        let muted = cx.theme().muted_foreground;
-        let ink = cx.theme().foreground;
-        let button = |id: &'static str, glyph: AnyElement, tip: L10nKey| {
-            div()
-                .id((id, group_ix))
-                .flex_shrink_0()
-                .size(px(HEADER_ACTION_SIZE))
-                .p(px(2.))
-                .rounded_sm()
-                .cursor_pointer()
-                .text_color(muted)
-                .hover(move |s| s.text_color(ink))
-                .child(glyph)
-                .tooltip(move |window, cx| {
-                    gpui_component::tooltip::Tooltip::new(t(tip)).build(window, cx)
-                })
-        };
-        let mut buttons = h_flex().gap(px(HEADER_ACTION_GAP));
-        if let Some(auto) = key.auto().cloned() {
-            buttons = buttons.child(
-                button(
-                    "sidebar-group-pin",
-                    // The mark the group will carry once kept, the size of
-                    // the icon beside it so the two buttons line up.
-                    Icon::empty().path(PIN_MARK).xsmall().into_any_element(),
-                    L10nKey::SidebarPinGroup,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                        cx.stop_propagation();
-                        this.pin_auto_group(auto.clone(), cx);
-                    }),
-                ),
-            );
-        }
-        if !matches!(
-            key,
-            GroupKey::Auto(AutoKey::SshHost(_) | AutoKey::SshDirectory(..))
-        ) {
-            buttons = buttons.child(
-                button(
-                    "sidebar-group-add",
-                    Icon::empty()
-                        .path("icons/plus.svg")
-                        .xsmall()
-                        .into_any_element(),
-                    L10nKey::SidebarGroupNewTab,
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        this.new_tab_in_group(key.clone(), window, cx);
-                    }),
-                ),
-            );
-        }
-        Some(
-            h_flex()
-                .id(("sidebar-group-actions", group_ix))
-                .debug_selector(|| format!("sidebar-group-actions-{group_ix}"))
-                .flex_shrink_0()
-                .ml_auto()
-                .w(px(width))
-                .h(px(HEADER_ACTION_SIZE))
-                .opacity(0.)
-                .group_hover(hover, |s| s.opacity(1.))
-                .child(buttons)
-                .into_any_element(),
-        )
     }
 
     /// What the sidebar row hid: the full title, the full branch and diff
@@ -3466,7 +3367,7 @@ mod fold_tests {
     }
 
     #[gpui::test]
-    fn header_buttons_never_cover_diff_counts_on_hover(cx: &mut TestAppContext) {
+    fn header_diff_counts_use_the_right_edge_and_stay_put_on_hover(cx: &mut TestAppContext) {
         use crate::terminal::git_status::RepoSnapshot;
         use crate::ui::host_ops::HostId;
 
@@ -3515,21 +3416,15 @@ mod fold_tests {
                     let counts = vcx
                         .debug_bounds("sidebar-group-diff-0")
                         .expect("both diff counts drawn");
-                    let actions = vcx
-                        .debug_bounds("sidebar-group-actions-0")
-                        .expect("group buttons laid out");
                     assert!(
-                        counts.right() <= actions.left(),
-                        "counts {counts:?}, buttons {actions:?}"
+                        (header.right() - counts.right() - px(8.)).abs() <= px(1.),
+                        "counts use the {width}px header up to its right padding: {counts:?}, {header:?}"
                     );
-                    assert!(
-                        actions.right() <= header.right(),
-                        "buttons stay inside the {width}px header"
-                    );
+                    assert_eq!(vcx.debug_bounds("sidebar-group-actions-0"), None);
                     vcx.simulate_mouse_move(header.center(), None, Default::default());
                     vcx.run_until_parked();
                     assert_eq!(vcx.debug_bounds("sidebar-group-diff-0"), Some(counts));
-                    assert_eq!(vcx.debug_bounds("sidebar-group-actions-0"), Some(actions));
+                    assert_eq!(vcx.debug_bounds("sidebar-group-actions-0"), None);
                 }
             }
         }
